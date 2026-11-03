@@ -172,7 +172,7 @@ impl Desktop {
         let frame = self.window_frame(k, 0)?;
         let unit = frame.size[0] / frame.logical[0];
         let grabbed = self.companion_hover.as_deref() == Some(&format!("grab:{k}"));
-        let height = if grabbed { 12. } else { 8. };
+        let height = if grabbed { 16. } else { 12. };
         let bar_width = frame.logical[0] * 0.35;
         let bar_x = (frame.logical[0] - bar_width) / 2.;
         // Each companion is an independent world-space surface, 4cm below content.
@@ -213,7 +213,7 @@ impl Desktop {
                 }
                 if node.kind == "Slider" {
                     frame = frame.rect(
-                        [0., (frame.logical[1] - 22.) / 2., frame.logical[0], 22.],
+                        [0., (frame.logical[1] - 32.) / 2., frame.logical[0], 32.],
                         0.,
                     );
                 }
@@ -415,6 +415,12 @@ impl Desktop {
                                 &w.pixels,
                                 16.,
                             );
+                            canvas.skin(
+                                [0., 0., width as f32, height as f32],
+                                "window-rim",
+                                16.,
+                                0.35,
+                            );
                         }
                     } else {
                         paint_node(
@@ -437,6 +443,12 @@ impl Desktop {
                         &w.pixels,
                         16.,
                     );
+                    canvas.skin(
+                        [0., 0., width as f32, height as f32],
+                        "window-rim",
+                        16.,
+                        0.35,
+                    );
                 }
                 Source::Grab(k) => {
                     let hover = self.companion_hover.as_deref() == Some(&format!("grab:{k}"));
@@ -444,6 +456,22 @@ impl Desktop {
                         [0., 0., width as f32, height as f32],
                         [1., 1., 1., if hover { 1. } else { 0.85 }],
                         height as f32 / 2.,
+                    );
+                    canvas.skin(
+                        [0., 0., width as f32, height as f32],
+                        "grab-base",
+                        height as f32 / 2.,
+                        0.5,
+                    );
+                    canvas.rounded(
+                        [
+                            width as f32 * 0.3,
+                            (height as f32 - 3.) / 2.,
+                            width as f32 * 0.4,
+                            3.,
+                        ],
+                        theme.colour("accent"),
+                        1.5,
                     );
                 }
                 Source::Resize(k, left) => {
@@ -471,7 +499,7 @@ impl Desktop {
                         if hover {
                             [0.216, 0.565, 0.98, 1.]
                         } else {
-                            [18. / 255., 24. / 255., 38. / 255., 0.72]
+                            theme.colour("card")
                         },
                         14.,
                     );
@@ -482,7 +510,16 @@ impl Desktop {
                         Source::Curve(_) => "⌒",
                         _ => "",
                     };
-                    canvas.text([3., 1., 24., 27.], text, [1.; 4], 20.);
+                    canvas.text(
+                        [3., 1., 24., 27.],
+                        text,
+                        if hover {
+                            [1.; 4]
+                        } else {
+                            theme.colour("foreground")
+                        },
+                        20.,
+                    );
                 }
             }
             panels.push(Panel {
@@ -576,7 +613,7 @@ impl Desktop {
     }
     pub fn layout(&self, offset: usize, limit: usize) -> Value {
         let draws = self.draws();
-        let items:Vec<_>=draws.iter().skip(offset).take(limit.min(32)).map(|d|json!({"id":d.id,"position_m":d.frame.position,"right":d.frame.right,"down":d.frame.down,"normal":d.frame.normal(),"size_m":d.frame.size,"logical_size":d.frame.logical,"curve_radius_m":d.frame.curve,"corner_radius_px":d.radius,"rim_width_px":d.rim,"rim_alpha":d.border,"material":d.material,"rim_alpha_top_left":if d.material==1. {0.45}else{d.border},"rim_alpha_bottom_right":if d.material==1. {0.12}else{d.border},"extrusion_depth_m":match d.material as u32 {1=>0.006,2=>0.003,3=>0.002,_=>0.},"shadow_spread_px":if d.material==4. {24}else{0}})).collect();
+        let items:Vec<_>=draws.iter().skip(offset).take(limit.min(32)).map(|d|json!({"id":d.id,"position_m":d.frame.position,"right":d.frame.right,"down":d.frame.down,"normal":d.frame.normal(),"size_m":d.frame.size,"logical_size":d.frame.logical,"curve_radius_m":d.frame.curve,"corner_radius_px":d.radius,"rim_width_px":d.rim,"rim_alpha":d.border,"material":d.material,"rim_alpha_top_left":if d.material==1. {0.68}else{d.border},"rim_alpha_bottom_right":if d.material==1. {0.22}else{d.border},"extrusion_depth_m":match d.material as u32 {1=>0.006,2=>0.003,3=>0.002,_=>0.},"shadow_spread_px":if d.material==4. {24}else{0}})).collect();
         json!({"total":draws.len(),"offset":offset,"items":items})
     }
     fn target(draw: &Draw) -> Option<Target> {

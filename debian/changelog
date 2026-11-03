@@ -1,6 +1,7 @@
 xr-shell (0.2.2) unstable; urgency=medium
 
   * Render taskbar-sized application icons and independent information typography.
+  * Consume sliced art textures, preserve optical corners and render the light Qingkong theme.
 
  -- bits <bigbits@hackx.cc>  Wed, 04 Nov 2026 03:51:23 +0800
 

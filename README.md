@@ -161,3 +161,12 @@ centred, slightly raised labels and a 1 px quarter-opacity white rim.
 These changes must be built and captured on the selected native target before
 new visual or interaction acceptance is recorded. Earlier 0.2.0 captures describe
 that earlier candidate only.
+
+The Qingkong component art is drawn before implementation in the Spatial Kit
+`design/qingkong-controls/` reference library. The style package provides original
+RGBA atlases and verified crop/inset metadata in `/usr/share/xr/art/qingkong`.
+Shell separates crops into premultiplied images with transparent sampling gutters,
+uses nine-slice scaling for optical edges, and keeps glyphs and live state separate.
+`XR_SPATIAL_ART_DIR` can select a development art directory; the executable prefix
+is checked before the system path. `XR_ART_LIBRARY` and `XR_ART_RESOURCE` report
+loaded art; explicit fallback logs identify missing or invalid resources.

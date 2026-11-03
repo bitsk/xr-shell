@@ -26,6 +26,7 @@ unsafe extern "C" {
     fn cairo_rectangle(cr: Ptr, x: c_double, y: c_double, w: c_double, h: c_double);
     fn cairo_fill(cr: Ptr);
     fn cairo_paint(cr: Ptr);
+    fn cairo_paint_with_alpha(cr: Ptr, alpha: c_double);
     fn cairo_move_to(cr: Ptr, x: c_double, y: c_double);
     fn cairo_close_path(cr: Ptr);
     fn cairo_new_path(cr: Ptr);
@@ -235,6 +236,74 @@ impl Canvas {
             cairo_surface_destroy(image);
         }
     }
+    /// Stretch only the texture's middle; optical corners keep a fixed size.
+    pub fn skin(&self, rect: [f32; 4], name: &str, radius: f32, opacity: f32) -> bool {
+        let Some(bitmap) = crate::art::material(name) else {
+            return false;
+        };
+        self.bitmap(rect, bitmap, Some(radius), opacity);
+        true
+    }
+    fn bitmap(
+        &self,
+        rect: [f32; 4],
+        bitmap: &crate::art::Bitmap,
+        radius: Option<f32>,
+        opacity: f32,
+    ) {
+        let [x, y, w, h] = rect;
+        if w <= 0. || h <= 0. || opacity <= 0. {
+            return;
+        }
+        let [l, t, r, b] = bitmap.insets.map(|v| v as f32);
+        let (sx, sy, dx, dy) = if let Some(radius) = radius {
+            let cap = radius.min(w / 2.).min(h / 2.).max(0.);
+            (
+                vec![0., l, bitmap.width as f32 - r, bitmap.width as f32],
+                vec![0., t, bitmap.height as f32 - b, bitmap.height as f32],
+                vec![x, x + cap, x + w - cap, x + w],
+                vec![y, y + cap, y + h - cap, y + h],
+            )
+        } else {
+            (
+                vec![0., bitmap.width as f32],
+                vec![0., bitmap.height as f32],
+                vec![x, x + w],
+                vec![y, y + h],
+            )
+        };
+        unsafe {
+            let image = cairo_image_surface_create_for_data(
+                bitmap.bgra.as_ptr() as *mut _,
+                0,
+                bitmap.width as _,
+                bitmap.height as _,
+                (bitmap.width * 4) as _,
+            );
+            if cairo_surface_status(image) == 0 {
+                for row in 0..sy.len() - 1 {
+                    for col in 0..sx.len() - 1 {
+                        let sw = sx[col + 1] - sx[col];
+                        let sh = sy[row + 1] - sy[row];
+                        let dw = dx[col + 1] - dx[col];
+                        let dh = dy[row + 1] - dy[row];
+                        if sw <= 0. || sh <= 0. || dw <= 0. || dh <= 0. {
+                            continue;
+                        }
+                        cairo_save(self.cr);
+                        cairo_translate(self.cr, dx[col] as _, dy[row] as _);
+                        cairo_scale(self.cr, (dw / sw) as _, (dh / sh) as _);
+                        cairo_rectangle(self.cr, 0., 0., sw as _, sh as _);
+                        cairo_clip(self.cr);
+                        cairo_set_source_surface(self.cr, image, -sx[col] as f64, -sy[row] as f64);
+                        cairo_paint_with_alpha(self.cr, opacity.clamp(0., 1.) as _);
+                        cairo_restore(self.cr);
+                    }
+                }
+            }
+            cairo_surface_destroy(image);
+        }
+    }
     fn rounded_path(&self, rect: [f32; 4], radius: f32) {
         let [x, y, w, h] = rect.map(|n| n as f64);
         let r = (radius as f64).min(w / 2.).min(h / 2.).max(0.);
@@ -405,24 +474,32 @@ pub fn paint_node(
     let ink = if node.enabled { primary } else { secondary };
     match node.kind.as_str() {
         "Group" => {}
-        "Card" => canvas.rounded(
-            rect,
-            theme.colour(&node.style_id),
-            if node.style_id == "dock.background" {
-                h / 2.
-            } else {
-                20.
-            },
-        ),
+        "Card" => {
+            let capsule = node.style_id == "dock.background";
+            let radius = if capsule { h / 2. } else { 20. };
+            canvas.rounded(rect, theme.colour(&node.style_id), radius);
+            if capsule || node.style_id == "panel.background" {
+                canvas.skin(
+                    rect,
+                    if capsule {
+                        "island-applications"
+                    } else {
+                        "panel-normal"
+                    },
+                    radius,
+                    0.4,
+                );
+            }
+        }
         "Button" => {
             let active = ["button.primary", "dock.active", "dock.active-icon"]
                 .contains(&node.style_id.as_str());
             let app_icon = ["dock.app-icon", "dock.active-icon"].contains(&node.style_id.as_str());
             let status_icon = node.style_id == "dock.status-icon";
-            let colour = if pressed {
-                [55. / 255., 144. / 255., 250. / 255., 1.]
-            } else if hovered {
-                [1., 1., 1., 0.24]
+            let colour = if pressed && !active {
+                theme.colour("pressed")
+            } else if hovered && !active {
+                theme.colour("hover")
             } else {
                 theme.colour(&node.style_id)
             };
@@ -436,6 +513,20 @@ pub fn paint_node(
                 12.
             };
             canvas.rounded(rect, colour, radius);
+            let key = node.style_id == "keyboard.key";
+            if !app_icon && !status_icon && w >= 24. && h >= 24. {
+                let skin = match (key, active, pressed, hovered) {
+                    (true, true, _, _) => "key-selected",
+                    (true, _, true, _) => "key-pressed",
+                    (true, _, _, true) => "key-hover",
+                    (true, _, _, _) => "key-normal",
+                    (_, true, _, _) => "panel-selected",
+                    (_, _, true, _) => "panel-pressed",
+                    (_, _, _, true) => "panel-hover",
+                    _ => "panel-normal",
+                };
+                canvas.skin(rect, skin, radius, if active { 0.12 } else { 0.35 });
+            }
             let has_icon = !node.icon_id.is_empty();
             let icon_size = (h - 12.).min(if app_icon { 44. } else { 32. }).max(16.);
             let icon_x = if node.text.is_empty() {
@@ -457,7 +548,6 @@ pub fn paint_node(
                 10.
             };
             if !node.text.is_empty() {
-                let key = node.style_id == "keyboard.key";
                 canvas.text_styled(
                     if key {
                         [x + 4., y + (h - 31.).max(0.) * 0.30, w - 8., h.min(36.)]
@@ -470,7 +560,7 @@ pub fn paint_node(
                         ]
                     },
                     &node.text,
-                    if active || key { [1.; 4] } else { primary },
+                    if active { [1.; 4] } else { ink },
                     if key { 26. } else { 25.3 },
                     600,
                     key,
@@ -479,7 +569,7 @@ pub fn paint_node(
         }
         "Slider" => {
             let track = [x, y + (h - 22.) / 2., w, 22.];
-            canvas.rounded(track, [1., 1., 1., 0.12], 11.);
+            canvas.rounded(track, [0.75, 0.82, 0.92, 1.], 11.);
             let value = ((node.value - node.min) / (node.max - node.min).max(0.0001)).clamp(0., 1.);
             canvas.gradient_pill(
                 [track[0], track[1], w * value, 22.],
@@ -488,6 +578,17 @@ pub fn paint_node(
                 11.,
             );
             canvas.speaker(x + 7., track[1]);
+            let cx = (x + w * value).clamp(x + 14., (x + w - 14.).max(x + 14.));
+            canvas.rounded(
+                [cx - 15., y + (h - 28.) / 2. + 2., 30., 28.],
+                [0.14, 0.22, 0.36, 0.18],
+                14.,
+            );
+            canvas.rounded(
+                [cx - 14., y + (h - 28.) / 2., 28., 28.],
+                [0.98, 0.99, 1., 1.],
+                14.,
+            );
         }
         "Text" => {
             let (size, weight) = match node.style_id.as_str() {
@@ -632,6 +733,10 @@ fn icon_path(name: &str) -> Option<std::path::PathBuf> {
 }
 impl Canvas {
     pub fn icon(&self, rect: [f32; 4], id: &str) -> bool {
+        if let Some(bitmap) = crate::art::icon(id) {
+            self.bitmap(rect, bitmap, None, 1.);
+            return true;
+        }
         let Some(path) = icon_path(id) else {
             return false;
         };
@@ -655,7 +760,7 @@ impl Canvas {
                     ]
                     .contains(&id)
                 {
-                    let css = b"svg {color:#F2F6FC} path {fill:currentColor}";
+                    let css = b"svg {color:#233047} path {fill:currentColor}";
                     rsvg_handle_set_stylesheet(h, css.as_ptr(), css.len(), std::ptr::null_mut());
                 }
                 let viewport = SvgRectangle {
