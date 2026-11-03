@@ -1,3 +1,9 @@
+xr-shell (0.2.2) unstable; urgency=medium
+
+  * Render taskbar-sized application icons and independent information typography.
+
+ -- bits <bigbits@hackx.cc>  Wed, 04 Nov 2026 03:51:23 +0800
+
 xr-shell (0.2.1) unstable; urgency=medium
 
   * Add optical glass lighting, extruded edges, soft shadows and client clipping.

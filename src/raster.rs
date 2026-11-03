@@ -415,7 +415,10 @@ pub fn paint_node(
             },
         ),
         "Button" => {
-            let active = ["button.primary", "dock.active"].contains(&node.style_id.as_str());
+            let active = ["button.primary", "dock.active", "dock.active-icon"]
+                .contains(&node.style_id.as_str());
+            let app_icon = ["dock.app-icon", "dock.active-icon"].contains(&node.style_id.as_str());
+            let status_icon = node.style_id == "dock.status-icon";
             let colour = if pressed {
                 [55. / 255., 144. / 255., 250. / 255., 1.]
             } else if hovered {
@@ -423,7 +426,9 @@ pub fn paint_node(
             } else {
                 theme.colour(&node.style_id)
             };
-            let radius = if node.style_id.starts_with("dock.") {
+            let radius = if app_icon || status_icon {
+                12.
+            } else if node.style_id.starts_with("dock.") {
                 h / 2.
             } else if node.style_id == "keyboard.key" {
                 12.
@@ -432,7 +437,7 @@ pub fn paint_node(
             };
             canvas.rounded(rect, colour, radius);
             let has_icon = !node.icon_id.is_empty();
-            let icon_size = (h - 12.).min(32.).max(16.);
+            let icon_size = (h - 12.).min(if app_icon { 44. } else { 32. }).max(16.);
             let icon_x = if node.text.is_empty() {
                 x + (w - icon_size) / 2.
             } else {
@@ -484,20 +489,27 @@ pub fn paint_node(
             );
             canvas.speaker(x + 7., track[1]);
         }
-        "Text" => canvas.text(
-            rect,
-            &node.text,
-            if node.style_id == "text.secondary" {
-                secondary
-            } else {
-                primary
-            },
-            if node.node_id.contains("title") {
-                28.
-            } else {
-                22.
-            },
-        ),
+        "Text" => {
+            let (size, weight) = match node.style_id.as_str() {
+                "taskbar.clock" => (32., 500),
+                "taskbar.caption" => (16., 400),
+                "taskbar.status" => (20., 500),
+                _ if node.node_id.contains("title") => (28., 400),
+                _ => (22., 400),
+            };
+            canvas.text_styled(
+                rect,
+                &node.text,
+                if ["text.secondary", "taskbar.caption"].contains(&node.style_id.as_str()) {
+                    secondary
+                } else {
+                    primary
+                },
+                size,
+                weight,
+                false,
+            );
+        }
         "Icon" => {
             if !canvas.icon(rect, &node.icon_id) {
                 canvas.text(rect, "◈", primary, 24.);

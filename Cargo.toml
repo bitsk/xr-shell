@@ -1,6 +1,6 @@
 [package]
 name = "xr-shell"
-version = "0.2.1"
+version = "0.2.2"
 edition = "2024"
 license = "GPL-3.0-or-later"
 description = "Rust OpenXR spatial shell for UKUI XR"

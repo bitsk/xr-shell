@@ -218,6 +218,9 @@ impl Desktop {
                     );
                 }
                 let button = node.kind == "Button";
+                let icon_button = button
+                    && ["dock.app-icon", "dock.active-icon", "dock.status-icon"]
+                        .contains(&node.style_id.as_str());
                 let glass = node.kind == "Card"
                     && ["dock.background", "panel.background"].contains(&node.style_id.as_str());
                 let radius = if node.kind == "Text" || node.kind == "Icon" {
@@ -226,6 +229,8 @@ impl Desktop {
                     11.
                 } else if node.style_id == "dock.background" {
                     node.rect[3] / 2.
+                } else if icon_button {
+                    12.
                 } else if node.style_id.starts_with("dock.") {
                     node.rect[3] / 2.
                 } else if node.kind == "SurfaceReference" {
@@ -240,14 +245,18 @@ impl Desktop {
                     frame,
                     source: Source::Node(p.id, node.node_id.clone()),
                     radius,
-                    rim: if node.kind == "SurfaceReference" {
+                    rim: if icon_button {
+                        0.
+                    } else if node.kind == "SurfaceReference" {
                         2.
                     } else if button || glass {
                         1.
                     } else {
                         0.
                     },
-                    border: if node.style_id == "keyboard.key" {
+                    border: if icon_button {
+                        0.
+                    } else if node.style_id == "keyboard.key" {
                         0.25
                     } else if node.kind == "SurfaceReference" {
                         0.5
@@ -262,6 +271,8 @@ impl Desktop {
                         1.
                     } else if node.kind == "SurfaceReference" {
                         2.
+                    } else if icon_button {
+                        0.
                     } else if button || node.kind == "Card" || node.kind == "Slider" {
                         3.
                     } else {
