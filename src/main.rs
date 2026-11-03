@@ -293,7 +293,8 @@ fn frame_loop(
                             summary.cleanup.session_ended = true;
                             return Ok(());
                         }
-                        xr::SessionState::EXITING | xr::SessionState::LOSS_PENDING => return Ok(()),
+                        xr::SessionState::EXITING => return Ok(()),
+                        xr::SessionState::LOSS_PENDING => bail!("OpenXR session loss pending"),
                         _ => {}
                     }
                 }
