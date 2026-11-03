@@ -1345,6 +1345,12 @@ impl Desktop {
     fn cancel(&mut self, reason: &str) {
         self.pending_pointer = None;
         if let Some(c) = self.capture.take() {
+            if let Target::Resize(key, _) = &c.target {
+                if let Some(w) = self.windows.get_mut(key) {
+                    w.size = c.size;
+                    w.position = c.position;
+                }
+            }
             self.release_capture_surface(&c);
             if let Target::Node(id, node) = c.target {
                 if let Some(p) = self.peers.get(&id) {
@@ -1669,11 +1675,22 @@ impl Desktop {
                             ];
                             let w = self.windows.get_mut(&k).context("window disappeared")?;
                             w.size = size;
+                            let half_arc = 15f32.to_radians();
+                            let arc_x = if w.curved {
+                                half_arc.sin() / half_arc
+                            } else {
+                                1.
+                            };
+                            let arc_z = if w.curved {
+                                (1. - half_arc.cos()) / (2. * half_arc)
+                            } else {
+                                0.
+                            };
                             w.position = [
                                 c.position[0]
-                                    + (size[0] - c.size[0]) * if left { -0.5 } else { 0.5 },
-                                c.position[1] - (size[1] - c.size[1]) * 0.5,
-                                c.position[2],
+                                    + (c.size[0] - size[0]) * if left { 0.5 } else { -0.5 } * arc_x,
+                                c.position[1] + (c.size[1] - size[1]) * 0.5,
+                                c.position[2] + (c.size[0] - size[0]) * arc_z,
                             ];
                             self.dirty = true;
                             if phase == "release" {
