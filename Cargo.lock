@@ -398,7 +398,7 @@ dependencies = [
 
 [[package]]
 name = "xr-shell"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "anyhow",
  "ash",
@@ -425,7 +425,7 @@ dependencies = [
 
 [[package]]
 name = "xr-spatial-kit"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "anyhow",
  "serde",

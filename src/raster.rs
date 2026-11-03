@@ -28,6 +28,31 @@ unsafe extern "C" {
     fn cairo_paint(cr: Ptr);
     fn cairo_move_to(cr: Ptr, x: c_double, y: c_double);
     fn cairo_close_path(cr: Ptr);
+    fn cairo_new_path(cr: Ptr);
+    fn cairo_line_to(cr: Ptr, x: c_double, y: c_double);
+    fn cairo_curve_to(
+        cr: Ptr,
+        x1: c_double,
+        y1: c_double,
+        x2: c_double,
+        y2: c_double,
+        x3: c_double,
+        y3: c_double,
+    );
+    fn cairo_set_line_width(cr: Ptr, width: c_double);
+    fn cairo_set_line_cap(cr: Ptr, cap: c_int);
+    fn cairo_stroke(cr: Ptr);
+    fn cairo_pattern_create_linear(x0: c_double, y0: c_double, x1: c_double, y1: c_double) -> Ptr;
+    fn cairo_pattern_add_color_stop_rgba(
+        pattern: Ptr,
+        offset: c_double,
+        r: c_double,
+        g: c_double,
+        b: c_double,
+        a: c_double,
+    );
+    fn cairo_pattern_destroy(pattern: Ptr);
+    fn cairo_set_source(cr: Ptr, source: Ptr);
     fn cairo_arc(cr: Ptr, x: c_double, y: c_double, r: c_double, a1: c_double, a2: c_double);
     fn cairo_save(cr: Ptr);
     fn cairo_restore(cr: Ptr);
@@ -49,6 +74,8 @@ unsafe extern "C" {
 unsafe extern "C" {
     fn pango_layout_set_text(layout: Ptr, text: *const c_char, length: c_int);
     fn pango_layout_set_width(layout: Ptr, width: c_int);
+    fn pango_layout_set_alignment(layout: Ptr, alignment: c_int);
+    fn pango_font_description_set_weight(desc: Ptr, weight: c_int);
     fn pango_layout_set_height(layout: Ptr, height: c_int);
     fn pango_layout_set_ellipsize(layout: Ptr, mode: c_int);
     fn pango_font_description_from_string(text: *const c_char) -> Ptr;
@@ -140,13 +167,26 @@ impl Canvas {
         }
     }
     pub fn text(&self, rect: [f32; 4], text: &str, colour: [f32; 4], size: f32) {
+        self.text_styled(rect, text, colour, size, 400, false);
+    }
+    pub fn text_styled(
+        &self,
+        rect: [f32; 4],
+        text: &str,
+        colour: [f32; 4],
+        size: f32,
+        weight: i32,
+        center: bool,
+    ) {
         unsafe {
             let text = text.replace('\0', " ");
             let c = self.cr;
             let layout = pango_cairo_create_layout(c);
             let desc = pango_font_description_from_string(c"Noto Sans CJK SC, sans".as_ptr());
             pango_font_description_set_absolute_size(desc, size as f64 * 1024.);
+            pango_font_description_set_weight(desc, weight);
             pango_layout_set_font_description(layout, desc);
+            pango_layout_set_alignment(layout, if center { 1 } else { 0 });
             pango_layout_set_text(layout, text.as_ptr() as _, text.len() as _);
             pango_layout_set_width(layout, (rect[2] * 1024.) as _);
             pango_layout_set_height(layout, (rect[3] * 1024.) as _);
@@ -193,6 +233,129 @@ impl Canvas {
             cairo_paint(self.cr);
             cairo_restore(self.cr);
             cairo_surface_destroy(image);
+        }
+    }
+    fn rounded_path(&self, rect: [f32; 4], radius: f32) {
+        let [x, y, w, h] = rect.map(|n| n as f64);
+        let r = (radius as f64).min(w / 2.).min(h / 2.).max(0.);
+        unsafe {
+            cairo_new_path(self.cr);
+            cairo_move_to(self.cr, x + r, y);
+            cairo_arc(
+                self.cr,
+                x + w - r,
+                y + r,
+                r,
+                -std::f64::consts::FRAC_PI_2,
+                0.,
+            );
+            cairo_arc(
+                self.cr,
+                x + w - r,
+                y + h - r,
+                r,
+                0.,
+                std::f64::consts::FRAC_PI_2,
+            );
+            cairo_arc(
+                self.cr,
+                x + r,
+                y + h - r,
+                r,
+                std::f64::consts::FRAC_PI_2,
+                std::f64::consts::PI,
+            );
+            cairo_arc(
+                self.cr,
+                x + r,
+                y + r,
+                r,
+                std::f64::consts::PI,
+                3. * std::f64::consts::FRAC_PI_2,
+            );
+            cairo_close_path(self.cr);
+        }
+    }
+    pub fn rounded_image(&self, rect: [f32; 4], w: u32, h: u32, pixels: &[u8], radius: f32) {
+        unsafe {
+            cairo_save(self.cr);
+        }
+        self.rounded_path(rect, radius);
+        unsafe {
+            cairo_clip(self.cr);
+        }
+        self.image(rect, w, h, pixels);
+        unsafe {
+            cairo_restore(self.cr);
+        }
+    }
+    pub fn gradient_pill(&self, rect: [f32; 4], left: [f32; 4], right: [f32; 4], radius: f32) {
+        if rect[2] <= 0. {
+            return;
+        }
+        unsafe {
+            cairo_save(self.cr);
+            self.rounded_path(rect, radius);
+            cairo_clip(self.cr);
+            let p = cairo_pattern_create_linear(rect[0] as _, 0., (rect[0] + rect[2]) as _, 0.);
+            for (offset, c) in [(0., left), (1., right)] {
+                cairo_pattern_add_color_stop_rgba(
+                    p, offset, c[0] as _, c[1] as _, c[2] as _, c[3] as _,
+                );
+            }
+            cairo_set_source(self.cr, p);
+            cairo_paint(self.cr);
+            cairo_pattern_destroy(p);
+            cairo_restore(self.cr);
+        }
+    }
+    pub fn speaker(&self, x: f32, y: f32) {
+        unsafe {
+            let c = self.cr;
+            let (x, y) = (x as f64, y as f64);
+            cairo_save(c);
+            cairo_set_source_rgba(c, 1., 1., 1., 1.);
+            cairo_move_to(c, x + 2., y + 7.);
+            cairo_line_to(c, x + 6., y + 7.);
+            cairo_line_to(c, x + 12., y + 3.);
+            cairo_line_to(c, x + 12., y + 19.);
+            cairo_line_to(c, x + 6., y + 15.);
+            cairo_line_to(c, x + 2., y + 15.);
+            cairo_close_path(c);
+            cairo_fill(c);
+            cairo_set_line_width(c, 1.7);
+            for r in [4., 7.] {
+                cairo_new_path(c);
+                cairo_arc(c, x + 12., y + 11., r, -0.85, 0.85);
+                cairo_stroke(c);
+            }
+            cairo_restore(c);
+        }
+    }
+    pub fn resize_handle(&self, left: bool, hover: bool) {
+        unsafe {
+            let c = self.cr;
+            cairo_save(c);
+            cairo_set_line_cap(c, 1);
+            for (width, alpha) in [(7., 0.06), (4., 0.14), (2., if hover { 1. } else { 0.65 })] {
+                cairo_new_path(c);
+                let x = if left { 4. } else { 20. };
+                let sign = if left { 1. } else { -1. };
+                cairo_move_to(c, x, 2.);
+                cairo_line_to(c, x, 14.);
+                cairo_curve_to(c, x, 19., x, 20., x + sign * 6., 20.);
+                cairo_line_to(c, x + sign * 18., 20.);
+                cairo_set_line_width(c, width);
+                cairo_set_source_rgba(
+                    c,
+                    if hover { 0.30 } else { 1. },
+                    if hover { 0.64 } else { 1. },
+                    1.,
+                    alpha,
+                );
+                cairo_stroke(c);
+            }
+            cairo_restore(c);
         }
     }
     pub fn rgba(&self) -> Vec<u8> {
@@ -246,9 +409,9 @@ pub fn paint_node(
             rect,
             theme.colour(&node.style_id),
             if node.style_id == "dock.background" {
-                32.
+                h / 2.
             } else {
-                16.
+                20.
             },
         ),
         "Button" => {
@@ -263,7 +426,7 @@ pub fn paint_node(
             let radius = if node.style_id.starts_with("dock.") {
                 h / 2.
             } else if node.style_id == "keyboard.key" {
-                8.
+                12.
             } else {
                 12.
             };
@@ -289,40 +452,37 @@ pub fn paint_node(
                 10.
             };
             if !node.text.is_empty() {
-                canvas.text(
-                    [
-                        x + left,
-                        y + (h - 30.).max(0.) / 2.,
-                        (w - left - 8.).max(1.),
-                        h.min(36.),
-                    ],
+                let key = node.style_id == "keyboard.key";
+                canvas.text_styled(
+                    if key {
+                        [x + 4., y + (h - 31.).max(0.) * 0.30, w - 8., h.min(36.)]
+                    } else {
+                        [
+                            x + left,
+                            y + (h - 31.).max(0.) / 2.,
+                            (w - left - 8.).max(1.),
+                            h.min(38.),
+                        ]
+                    },
                     &node.text,
-                    if active || node.style_id == "keyboard.key" {
-                        [1.; 4]
-                    } else {
-                        ink
-                    },
-                    if node.style_id == "keyboard.key" {
-                        26.
-                    } else {
-                        22.
-                    },
+                    if active || key { [1.; 4] } else { primary },
+                    if key { 26. } else { 25.3 },
+                    600,
+                    key,
                 );
             }
         }
         "Slider" => {
-            canvas.rounded([x, y + h / 2. - 3., w, 6.], [1., 1., 1., 0.15], 3.);
+            let track = [x, y + (h - 22.) / 2., w, 22.];
+            canvas.rounded(track, [1., 1., 1., 0.12], 11.);
             let value = ((node.value - node.min) / (node.max - node.min).max(0.0001)).clamp(0., 1.);
-            canvas.rounded(
-                [x, y + h / 2. - 3., w * value, 6.],
-                [55. / 255., 144. / 255., 250. / 255., 1.],
-                3.,
+            canvas.gradient_pill(
+                [track[0], track[1], w * value, 22.],
+                [43. / 255., 125. / 255., 233. / 255., 1.],
+                [76. / 255., 161. / 255., 1., 1.],
+                11.,
             );
-            canvas.rounded(
-                [x + (w - 20.) * value, y + h / 2. - 10., 20., 20.],
-                [1.; 4],
-                10.,
-            );
+            canvas.speaker(x + 7., track[1]);
         }
         "Text" => canvas.text(
             rect,

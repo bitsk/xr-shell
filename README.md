@@ -136,3 +136,28 @@ Application snapshots larger than the raster budget are scaled in full to a
 maximum texture edge of 2048 pixels. Their logical dimensions and ray/input
 coordinates stay unchanged; no client content is cropped. This CPU-copy path
 does not establish a DMA-BUF or zero-copy implementation.
+
+
+## Optical glass candidate
+
+Version 0.2.1 adds rounded 6 mm panel sidewalls (3 mm client edges and 2 mm
+control relief), back-face rejection, a diagonal 14%–2% display-value highlight,
+cool environment transmission and a directional 45%/12% rim. Soft SDF shadows
+extend 24 logical pixels at a 10 mm rear offset, retaining curved-window geometry.
+These are deliberately bounded UI materials; the frost samples the environment,
+not a general blur of arbitrary overlapping scene content.
+
+Client alpha is clipped twice: the complete surface is rounded in its Cairo
+snapshot and the Vulkan fragment shader applies the same 16 px SDF boundary.
+A 2 px rim, independent bright grab capsule and two lower resize handles complete
+the content plane. Resize capture uses the frozen handle frame, keeps the opposite
+upper corner anchored and sends a real client configure on release. The expanded
+control-orb strip collapses when the ray leaves its complete menu region.
+
+The system volume rail is a 22 px blue gradient capsule inside a larger scene
+hit region. Buttons use semibold labels at 115% of the prior size; keycaps have
+centred, slightly raised labels and a 1 px quarter-opacity white rim.
+
+These changes must be built and captured on the selected native target before
+new visual or interaction acceptance is recorded. Earlier 0.2.0 captures describe
+that earlier candidate only.

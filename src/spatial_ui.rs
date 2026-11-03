@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 use super::*;
-use crate::spatial::{Frame, add, dot, sub};
+use crate::spatial::{Frame, add, dot, scale, sub};
 #[derive(Clone)]
 enum Source {
     Node(u64, String),
@@ -10,6 +10,8 @@ enum Source {
     Close(String),
     Minimize(String),
     Curve(String),
+    Resize(String, bool),
+    Shadow(Box<Source>),
 }
 struct Draw {
     id: String,
@@ -162,7 +164,7 @@ impl Desktop {
             && w.state["workspace"].as_u64().unwrap_or(0) == self.workspace as u64
             && !w.pixels.is_empty()
     }
-    fn companion_frame(&self, k: &str, kind: &str) -> Option<Frame> {
+    pub(super) fn companion_frame(&self, k: &str, kind: &str) -> Option<Frame> {
         let w = self.windows.get(k)?;
         if !self.visible_window(w) || w.state["role"].as_str().is_some_and(|r| r != "toplevel") {
             return None;
@@ -177,12 +179,17 @@ impl Desktop {
         let y = frame.logical[1] + 0.04 / (frame.size[1] / frame.logical[1]) + 4.;
         let rect = match kind {
             "grab" => [bar_x, y - height / 2., bar_width, height],
-            "orb" => [bar_x - 12. - 28., y - 14., 28., 28.],
-            "close" => [bar_x - 12. - 28. - 40., y - 14., 28., 28.],
-            "minimize" => [bar_x - 12. - 28. - 80., y - 14., 28., 28.],
-            "curve" => [bar_x - 12. - 28. - 120., y - 14., 28., 28.],
+            "orb" => [bar_x - 10. - 28., y - 14., 28., 28.],
+            "close" => [bar_x - 10. - 28. - 40., y - 14., 28., 28.],
+            "minimize" => [bar_x - 10. - 28. - 80., y - 14., 28., 28.],
+            "curve" => [bar_x - 10. - 28. - 120., y - 14., 28., 28.],
+            "resize-left" => [-30., frame.logical[1] - 12., 24., 24.],
+            "resize-right" => [frame.logical[0] + 6., frame.logical[1] - 12., 24., 24.],
             _ => return None,
         };
+        if kind.starts_with("resize-") {
+            return Some(frame.rect(rect, 0.006));
+        }
         let mut plane = frame;
         plane.curve = 0.;
         let mut out = plane.rect(rect, 0.005);
@@ -193,7 +200,7 @@ impl Desktop {
         let mut out = Vec::new();
         for p in self.peers.values() {
             for node in Self::ordered_nodes(p) {
-                let Some(frame) = self.node_frame(p, node) else {
+                let Some(mut frame) = self.node_frame(p, node) else {
                     continue;
                 };
                 if node.kind == "SurfaceReference"
@@ -204,35 +211,62 @@ impl Desktop {
                 {
                     continue;
                 }
+                if node.kind == "Slider" {
+                    frame = frame.rect(
+                        [0., (frame.logical[1] - 22.) / 2., frame.logical[0], 22.],
+                        0.,
+                    );
+                }
                 let button = node.kind == "Button";
                 let glass = node.kind == "Card"
                     && ["dock.background", "panel.background"].contains(&node.style_id.as_str());
-                let radius = if node.kind == "Text" || node.kind == "Icon" || node.kind == "Slider"
-                {
+                let radius = if node.kind == "Text" || node.kind == "Icon" {
                     0.
+                } else if node.kind == "Slider" {
+                    11.
                 } else if node.style_id == "dock.background" {
-                    32.
+                    node.rect[3] / 2.
                 } else if node.style_id.starts_with("dock.") {
                     node.rect[3] / 2.
-                } else if node.style_id == "keyboard.key" {
-                    8.
-                } else {
+                } else if node.kind == "SurfaceReference" {
                     16.
+                } else if glass {
+                    20.
+                } else {
+                    12.
                 };
                 out.push(Draw {
                     id: format!("node:{}:{}", p.id, node.node_id),
                     frame,
                     source: Source::Node(p.id, node.node_id.clone()),
                     radius,
-                    rim: if button || glass { 1. } else { 0. },
-                    border: if button {
+                    rim: if node.kind == "SurfaceReference" {
+                        2.
+                    } else if button || glass {
+                        1.
+                    } else {
+                        0.
+                    },
+                    border: if node.style_id == "keyboard.key" {
+                        0.25
+                    } else if node.kind == "SurfaceReference" {
+                        0.5
+                    } else if button {
                         0.18
                     } else if glass {
                         0.22
                     } else {
                         0.
                     },
-                    material: if glass { 1. } else { 0. },
+                    material: if glass {
+                        1.
+                    } else if node.kind == "SurfaceReference" {
+                        2.
+                    } else if button || node.kind == "Card" || node.kind == "Slider" {
+                        3.
+                    } else {
+                        0.
+                    },
                 });
             }
         }
@@ -245,8 +279,8 @@ impl Desktop {
                 frame,
                 source: Source::Window(k.clone()),
                 radius: 16.,
-                rim: 1.5,
-                border: 0.35,
+                rim: 2.,
+                border: 0.5,
                 material: 2.,
             });
             for (kind, source) in [
@@ -266,6 +300,20 @@ impl Desktop {
                         rim: if kind == "grab" { 0. } else { 1. },
                         border: 0.22,
                         material: if kind == "grab" { 0. } else { 1. },
+                    });
+                }
+            }
+            for left in [true, false] {
+                let kind = if left { "resize-left" } else { "resize-right" };
+                if let Some(frame) = self.companion_frame(k, kind) {
+                    out.push(Draw {
+                        id: format!("{kind}:{k}"),
+                        frame,
+                        source: Source::Resize(k.clone(), left),
+                        radius: 0.,
+                        rim: 0.,
+                        border: 0.,
+                        material: 0.,
                     });
                 }
             }
@@ -289,7 +337,34 @@ impl Desktop {
                 }
             }
         }
-        out
+        let mut decorated = Vec::with_capacity(out.len() * 2);
+        for d in out {
+            if matches!(d.source, Source::Node(..) | Source::Window(..))
+                && [1., 2.].contains(&d.material)
+            {
+                let w = d.frame.logical[0];
+                let h = d.frame.logical[1];
+                decorated.push(Draw {
+                    id: format!("shadow:{}", d.id),
+                    frame: Frame {
+                        position: add(d.frame.position, scale(d.frame.normal(), -0.01)),
+                        size: [
+                            d.frame.size[0] * (w + 48.) / w,
+                            d.frame.size[1] * (h + 48.) / h,
+                        ],
+                        logical: [w + 48., h + 48.],
+                        ..d.frame
+                    },
+                    source: Source::Shadow(Box::new(d.source.clone())),
+                    radius: d.radius,
+                    rim: 0.,
+                    border: 0.,
+                    material: 4.,
+                });
+            }
+            decorated.push(d);
+        }
+        decorated
     }
     pub fn panels(&mut self) -> Result<Option<Vec<Panel>>> {
         if !self.dirty {
@@ -301,7 +376,11 @@ impl Desktop {
         for draw in self.draws() {
             let width = draw.frame.logical[0].round().max(1.) as u32;
             let height = draw.frame.logical[1].round().max(1.) as u32;
-            let canvas = Canvas::for_logical(width, height)?;
+            let canvas = if matches!(draw.source, Source::Shadow(_)) {
+                Canvas::new(1, 1)?
+            } else {
+                Canvas::for_logical(width, height)?
+            };
             match &draw.source {
                 Source::Node(id, node) => {
                     let p = &self.peers[id];
@@ -318,11 +397,12 @@ impl Desktop {
                             .windows
                             .get(&format!("{}:{}", n.window_server_generation, n.surface_id))
                         {
-                            canvas.image(
+                            canvas.rounded_image(
                                 [0., 0., width as f32, height as f32],
                                 w.width,
                                 w.height,
                                 &w.pixels,
+                                16.,
                             );
                         }
                     } else {
@@ -339,21 +419,33 @@ impl Desktop {
                 }
                 Source::Window(k) => {
                     let w = &self.windows[k];
-                    canvas.image(
+                    canvas.rounded_image(
                         [0., 0., width as f32, height as f32],
                         w.width,
                         w.height,
                         &w.pixels,
+                        16.,
                     );
                 }
                 Source::Grab(k) => {
                     let hover = self.companion_hover.as_deref() == Some(&format!("grab:{k}"));
                     canvas.rounded(
                         [0., 0., width as f32, height as f32],
-                        [1., 1., 1., if hover { 1. } else { 0.65 }],
+                        [1., 1., 1., if hover { 1. } else { 0.85 }],
                         height as f32 / 2.,
                     );
                 }
+                Source::Resize(k, left) => {
+                    canvas.resize_handle(
+                        *left,
+                        self.companion_hover.as_deref()
+                            == Some(&format!(
+                                "resize-{}:{k}",
+                                if *left { "left" } else { "right" }
+                            )),
+                    );
+                }
+                Source::Shadow(_) => {}
                 source => {
                     let id = match source {
                         Source::Orb(k) => format!("orb:{k}"),
@@ -368,7 +460,7 @@ impl Desktop {
                         if hover {
                             [0.216, 0.565, 0.98, 1.]
                         } else {
-                            [22. / 255., 26. / 255., 35. / 255., 0.78]
+                            [18. / 255., 24. / 255., 38. / 255., 0.72]
                         },
                         14.,
                     );
@@ -401,7 +493,12 @@ impl Desktop {
         self.draws()
             .into_iter()
             .map(|d| {
-                let (anchor, group, layer) = match &d.source {
+                let original = if let Source::Shadow(base) = &d.source {
+                    base.as_ref()
+                } else {
+                    &d.source
+                };
+                let (anchor, group, mut layer) = match original {
                     Source::Node(id, node) => {
                         let p = &self.peers[id];
                         let (base, group) = Self::node_base(p, &p.nodes[node]);
@@ -419,11 +516,16 @@ impl Desktop {
                     | Source::Orb(k)
                     | Source::Close(k)
                     | Source::Minimize(k)
-                    | Source::Curve(k) => {
+                    | Source::Curve(k)
+                    | Source::Resize(k, _) => {
                         let (group, anchor, layer) = self.window_group(k);
                         (anchor, group, layer + 0.005)
                     }
+                    Source::Shadow(_) => unreachable!(),
                 };
+                if matches!(d.source, Source::Shadow(_)) && matches!(original, Source::Window(_)) {
+                    layer -= 0.01;
+                }
                 Geometry {
                     id: d.id,
                     frame: d.frame,
@@ -463,7 +565,7 @@ impl Desktop {
     }
     pub fn layout(&self, offset: usize, limit: usize) -> Value {
         let draws = self.draws();
-        let items:Vec<_>=draws.iter().skip(offset).take(limit.min(32)).map(|d|json!({"id":d.id,"position_m":d.frame.position,"right":d.frame.right,"down":d.frame.down,"normal":d.frame.normal(),"size_m":d.frame.size,"logical_size":d.frame.logical,"curve_radius_m":d.frame.curve,"corner_radius_px":d.radius,"rim_width_px":d.rim,"rim_alpha":d.border})).collect();
+        let items:Vec<_>=draws.iter().skip(offset).take(limit.min(32)).map(|d|json!({"id":d.id,"position_m":d.frame.position,"right":d.frame.right,"down":d.frame.down,"normal":d.frame.normal(),"size_m":d.frame.size,"logical_size":d.frame.logical,"curve_radius_m":d.frame.curve,"corner_radius_px":d.radius,"rim_width_px":d.rim,"rim_alpha":d.border,"material":d.material,"rim_alpha_top_left":if d.material==1. {0.45}else{d.border},"rim_alpha_bottom_right":if d.material==1. {0.12}else{d.border},"extrusion_depth_m":match d.material as u32 {1=>0.006,2=>0.003,3=>0.002,_=>0.},"shadow_spread_px":if d.material==4. {24}else{0}})).collect();
         json!({"total":draws.len(),"offset":offset,"items":items})
     }
     fn target(draw: &Draw) -> Option<Target> {
@@ -475,6 +577,8 @@ impl Desktop {
             Source::Close(k) => Some(Target::Close(k.clone())),
             Source::Minimize(k) => Some(Target::Minimize(k.clone())),
             Source::Curve(k) => Some(Target::Curve(k.clone())),
+            Source::Resize(k, left) => Some(Target::Resize(k.clone(), *left)),
+            Source::Shadow(_) => None,
         }
     }
     fn capture_frame(&self, c: &Capture) -> Option<Frame> {
@@ -494,7 +598,7 @@ impl Desktop {
                 f.position = add(f.position, sub(c.position, w.position));
                 Some(f)
             }
-            Target::Resize(k) => self.window_frame(k, 0),
+            Target::Resize(_, _) => c.resize_frame,
         }
     }
     pub fn ray(
@@ -520,6 +624,9 @@ impl Desktop {
         let mut nearest = f32::MAX;
         let mut hover_companion = None;
         for draw in self.draws() {
+            if matches!(draw.source, Source::Shadow(_)) {
+                continue;
+            }
             let target = match &draw.source {
                 Source::Node(id, node) => {
                     let n = &self.peers[id].nodes[node];
@@ -537,8 +644,18 @@ impl Desktop {
                 }
                 _ => Self::target(&draw),
             };
-            if let Some((xy, t)) = draw.frame.project(origin, direction) {
-                if t < nearest && draw.frame.inside_rounded(xy, draw.radius) {
+            let hit_frame = if let Source::Node(id, node) = &draw.source {
+                let p = &self.peers[id];
+                if p.nodes[node].kind == "Slider" {
+                    self.node_frame(p, &p.nodes[node]).unwrap_or(draw.frame)
+                } else {
+                    draw.frame
+                }
+            } else {
+                draw.frame
+            };
+            if let Some((xy, t)) = hit_frame.project(origin, direction) {
+                if t < nearest && hit_frame.inside_rounded(xy, draw.radius) {
                     nearest = t;
                     hit = target.map(|t| (t, xy));
                     if !matches!(draw.source, Source::Node(_, _) | Source::Window(_)) {
@@ -548,6 +665,18 @@ impl Desktop {
             }
         }
         if phase == "hover" {
+            if let Some(k) = self.expanded_orb.clone() {
+                let within = self.companion_frame(&k, "orb").is_some_and(|f| {
+                    let region = f.rect([-124., -6., 156., 40.], 0.);
+                    region
+                        .project(origin, direction)
+                        .is_some_and(|(xy, _)| region.inside(xy))
+                });
+                if !within {
+                    self.expanded_orb = None;
+                    self.dirty = true;
+                }
+            }
             if self.companion_hover != hover_companion {
                 self.companion_hover = hover_companion;
                 self.dirty = true;

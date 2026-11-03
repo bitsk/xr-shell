@@ -121,7 +121,7 @@ enum Target {
     Window(String),
     Close(String),
     Move(String),
-    Resize(String),
+    Resize(String, bool),
     Orb(String),
     Minimize(String),
     Curve(String),
@@ -131,6 +131,9 @@ struct Capture {
     target: Target,
     /// Real application surface bound at press, even when a UI node embeds it.
     surface: Option<String>,
+    resize_frame: Option<crate::spatial::Frame>,
+    size: [f32; 2],
+    logical: [f32; 2],
     id: String,
     interaction: String,
     source: String,
@@ -1075,7 +1078,13 @@ impl Desktop {
                 w.frame = frame;
                 let logical_width = w.state["width"].as_f64().unwrap_or(width as f64) as f32;
                 let logical_height = w.state["height"].as_f64().unwrap_or(height as f64) as f32;
-                w.size[1] = w.size[0] * logical_height / logical_width.max(1.);
+                if !self
+                    .capture
+                    .as_ref()
+                    .is_some_and(|c| matches!(&c.target,Target::Resize(key,_) if key==&k))
+                {
+                    w.size[1] = w.size[0] * logical_height / logical_width.max(1.);
+                }
                 self.dirty = true;
                 self.count("shm_commits");
             }
@@ -1218,7 +1227,7 @@ impl Desktop {
         {
             self.cancel("target removed");
         }
-        self.cancel_if(|t|matches!(t,Target::Window(key)|Target::Close(key)|Target::Move(key)|Target::Resize(key)|Target::Orb(key)|Target::Minimize(key)|Target::Curve(key) if key==k),"target removed");
+        self.cancel_if(|t|matches!(t,Target::Window(key)|Target::Close(key)|Target::Move(key)|Target::Resize(key,_)|Target::Orb(key)|Target::Minimize(key)|Target::Curve(key) if key==k),"target removed");
         if self.focus.as_deref() == Some(k) {
             let _ = self.set_focus(None);
         }
@@ -1527,7 +1536,7 @@ impl Desktop {
             if let Some((target, xy)) = &hit {
                 self.event += 1;
                 let pos = match target {
-                    Target::Move(k) | Target::Resize(k) => self.windows[k].position,
+                    Target::Move(k) | Target::Resize(k, _) => self.windows[k].position,
                     _ => [0.; 3],
                 };
                 let surface = match target {
@@ -1542,6 +1551,19 @@ impl Desktop {
                 };
                 self.capture = Some(Capture {
                     target: target.clone(),
+                    resize_frame: match target {
+                        Target::Resize(k, left) => self
+                            .companion_frame(k, if *left { "resize-left" } else { "resize-right" }),
+                        _ => None,
+                    },
+                    size: match target {
+                        Target::Resize(k, _) => self.windows[k].size,
+                        _ => [0.; 2],
+                    },
+                    logical: match target {
+                        Target::Resize(k, _) => Self::logical(&self.windows[k]),
+                        _ => [0.; 2],
+                    },
                     surface,
                     id: self.event.to_string(),
                     interaction: self.event.to_string(),
@@ -1631,15 +1653,33 @@ impl Desktop {
                         }
                     }
                 }
-                Target::Resize(k) => {
-                    if phase == "release" {
-                        if let Some(c) = &self.capture {
-                            let w = &self.windows[&k];
-                            let width =
-                                (w.width as f32 + xy[0] - c.start[0]).clamp(160., 1920.) as u32;
-                            let height =
-                                (w.height as f32 + xy[1] - c.start[1]).clamp(120., 1080.) as u32;
-                            self.window_intent(json!({"intent":"resize","surface_id":w.state["surface_id"],"window_server_generation":w.state["window_server_generation"],"width":width,"height":height}))?;
+                Target::Resize(k, left) => {
+                    if phase == "drag" || phase == "release" {
+                        if let Some(c) = self.capture.clone() {
+                            let width = (c.logical[0]
+                                + (xy[0] - c.start[0]) * if left { -1. } else { 1. })
+                            .clamp(160., 2048.)
+                            .round();
+                            let height = (c.logical[1] + xy[1] - c.start[1])
+                                .clamp(120., 1536.)
+                                .round();
+                            let size = [
+                                c.size[0] * width / c.logical[0],
+                                c.size[1] * height / c.logical[1],
+                            ];
+                            let w = self.windows.get_mut(&k).context("window disappeared")?;
+                            w.size = size;
+                            w.position = [
+                                c.position[0]
+                                    + (size[0] - c.size[0]) * if left { -0.5 } else { 0.5 },
+                                c.position[1] - (size[1] - c.size[1]) * 0.5,
+                                c.position[2],
+                            ];
+                            self.dirty = true;
+                            if phase == "release" {
+                                self.window_intent(json!({"intent":"resize","surface_id":self.windows[&k].state["surface_id"],"window_server_generation":self.windows[&k].state["window_server_generation"],"width":width as u32,"height":height as u32}))?;
+                                self.changed();
+                            }
                         }
                     }
                 }

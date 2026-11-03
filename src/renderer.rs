@@ -583,7 +583,7 @@ impl Renderer {
                     vk::PipelineBindPoint::GRAPHICS,
                     self.spatial_pipeline,
                 );
-                d.cmd_draw(self.cmd, 6 * 32, self.draw_count, 0, 0);
+                d.cmd_draw(self.cmd, 192 + 36 * 6, self.draw_count, 0, 0);
             }
             d.cmd_end_render_pass(self.cmd);
             if let Some(buffer) = &readback {
@@ -1015,7 +1015,12 @@ impl Renderer {
                 p.rim,
                 p.border,
                 f.curve,
-                0.,
+                match p.material as u32 {
+                    1 => 0.006,
+                    2 => 0.003,
+                    3 => 0.002,
+                    _ => 0.,
+                },
                 0.,
             ]);
         }
