@@ -10,7 +10,10 @@ fn main() {
         println!("cargo:rerun-if-changed={}", input.display());
         let status = Command::new(&compiler)
             .args(["-V", "--target-env", "vulkan1.1", "-o"])
-            .arg(output).arg(input).status().expect("run glslangValidator");
+            .arg(output)
+            .arg(input)
+            .status()
+            .expect("run glslangValidator");
         assert!(status.success(), "shader compilation failed");
     }
 }
