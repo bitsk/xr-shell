@@ -1,5 +1,10 @@
 #!/usr/bin/make -f
 
+export RUSTFLAGS := $(RUSTFLAGS) --remap-path-prefix=$(CURDIR)=/usr/src/xr-shell
+ifneq ($(strip $(CARGO_HOME)),)
+export RUSTFLAGS += --remap-path-prefix=$(CARGO_HOME)=/usr/src/cargo
+endif
+
 %:
 	dh $@ --buildsystem=none
 
