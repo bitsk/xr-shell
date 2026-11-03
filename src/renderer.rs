@@ -955,7 +955,9 @@ impl Renderer {
                 rim: p.rim,
                 border: p.border,
                 material: p.material,
-                anchor:p.frame.position,group:p.id.clone(),layer:0.,
+                anchor: p.frame.position,
+                group: p.id.clone(),
+                layer: 0.,
             })
             .collect();
         self.update_panel_poses(&poses, [0., 1.6, 0.])
@@ -974,7 +976,13 @@ impl Renderer {
                     .map(|(a, b)| (a - b) * (a - b))
                     .sum::<f32>()
             };
-            if a.group==b.group {a.layer.total_cmp(&b.layer)}else{distance(b).total_cmp(&distance(a)).then(a.group.cmp(&b.group))}
+            if a.group == b.group {
+                a.layer.total_cmp(&b.layer)
+            } else {
+                distance(b)
+                    .total_cmp(&distance(a))
+                    .then(a.group.cmp(&b.group))
+            }
         });
         self.draw_count = order.len() as u32;
         let mut values = Vec::with_capacity(order.len() * 24);

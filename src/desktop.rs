@@ -97,6 +97,8 @@ enum Target {
 #[derive(Clone)]
 struct Capture {
     target: Target,
+    /// Real application surface bound at press, even when a UI node embeds it.
+    surface: Option<String>,
     id: String,
     interaction: String,
     source: String,
@@ -707,6 +709,28 @@ impl Desktop {
                                     || (node.kind == "Group" && node.style_id.is_empty()),
                                 "unregistered style id"
                             );
+                            if node.spatial_panel {
+                                ensure!(
+                                    node.kind == "Group"
+                                        && node
+                                            .logical_size
+                                            .iter()
+                                            .all(|v| v.is_finite() && *v >= 1. && *v <= 2048.)
+                                        && node
+                                            .size_m
+                                            .iter()
+                                            .all(|v| v.is_finite() && *v > 0. && *v <= 4.)
+                                        && node
+                                            .position_m
+                                            .iter()
+                                            .all(|v| v.is_finite() && v.abs() <= 10.)
+                                        && node
+                                            .rotation_degrees
+                                            .iter()
+                                            .all(|v| v.is_finite() && v.abs() <= 360.),
+                                    "invalid spatial group geometry"
+                                );
+                            }
                             if node.kind == "Slider" {
                                 ensure!(node.max > node.min, "invalid slider range");
                             }
@@ -769,12 +793,42 @@ impl Desktop {
                         parent = &nodes.get(parent).context("parent missing")?.parent_id;
                     }
                 }
-                let cancelled = self.capture.as_ref().is_some_and(
-                    |c| matches!(&c.target,Target::Node(id,n) if *id==p.id&&!nodes.contains_key(n)),
-                );
+                let cancelled = self.capture.as_ref().is_some_and(|c| {
+                    let Target::Node(id, n) = &c.target else {
+                        return false;
+                    };
+                    if *id != p.id {
+                        return false;
+                    }
+                    let Some(node) = nodes.get(n) else {
+                        return true;
+                    };
+                    let reference = (node.kind == "SurfaceReference")
+                        .then(|| format!("{}:{}", node.window_server_generation, node.surface_id));
+                    if reference != c.surface {
+                        return true;
+                    }
+                    if reference.is_some() {
+                        let mut current = node;
+                        loop {
+                            if !current.visible || !current.enabled {
+                                return true;
+                            }
+                            if current.parent_id == "root" {
+                                break;
+                            }
+                            current = &nodes[&current.parent_id];
+                        }
+                        if node.rect[2] <= 0. || node.rect[3] <= 0. {
+                            return true;
+                        }
+                    }
+                    false
+                });
                 if cancelled {
                     self.pending_pointer = None;
                     if let Some(c) = self.capture.take() {
+                        self.release_capture_surface(&c);
                         p.send(&self.session,"Cancel","0",json!({"capture_id":c.id,"interaction_id":c.interaction,"reason":"target removed"}))?;
                         self.count("cancellations");
                     }
@@ -835,7 +889,7 @@ impl Desktop {
                                 1.6,
                                 -1.8 - (count % 3) as f32 * 0.1,
                             ],
-                            size: [1.65, 1.1],
+                            size: [1.59, 1.1],
                             frame: 0,
                             minimized: false,
                             curved: false,
@@ -992,7 +1046,7 @@ impl Desktop {
                 w.frame = frame;
                 let logical_width = w.state["width"].as_f64().unwrap_or(width as f64) as f32;
                 let logical_height = w.state["height"].as_f64().unwrap_or(height as f64) as f32;
-                w.size[1] = w.size[0] * (logical_height + 36.) / logical_width.max(1.);
+                w.size[1] = w.size[0] * logical_height / logical_width.max(1.);
                 self.dirty = true;
                 self.count("shm_commits");
             }
@@ -1128,6 +1182,13 @@ impl Desktop {
         Ok(())
     }
     fn remove_window(&mut self, k: &str) {
+        if self
+            .capture
+            .as_ref()
+            .is_some_and(|c| c.surface.as_deref() == Some(k))
+        {
+            self.cancel("target removed");
+        }
         self.cancel_if(|t|matches!(t,Target::Window(key)|Target::Close(key)|Target::Move(key)|Target::Resize(key)|Target::Orb(key)|Target::Minimize(key)|Target::Curve(key) if key==k),"target removed");
         if self.focus.as_deref() == Some(k) {
             let _ = self.set_focus(None);
@@ -1246,16 +1307,23 @@ impl Desktop {
     fn cancel(&mut self, reason: &str) {
         self.pending_pointer = None;
         if let Some(c) = self.capture.take() {
+            self.release_capture_surface(&c);
             if let Target::Node(id, node) = c.target {
                 if let Some(p) = self.peers.get(&id) {
                     let _=p.send(&self.session,"Cancel","0",json!({"target_node_id":node,"capture_id":c.id,"interaction_id":c.interaction,"reason":reason}));
                 }
-            } else {
+            } else if c.surface.is_none() {
                 let _ = self
                     .surface_input(json!({"kind":"pointer_button","button":272,"pressed":false}));
             }
             self.count("cancellations");
             self.dirty = true;
+        }
+    }
+    fn release_capture_surface(&self, capture: &Capture) {
+        if capture.surface.is_some() && capture.surface == self.focus && self.focus_applied {
+            let _ =
+                self.surface_input(json!({"kind":"pointer_button","button":272,"pressed":false}));
         }
     }
     fn node_rect(p: &Peer, node: &Node) -> [f32; 4] {
@@ -1432,8 +1500,19 @@ impl Desktop {
                     Target::Move(k) | Target::Resize(k) => self.windows[k].position,
                     _ => [0.; 3],
                 };
+                let surface = match target {
+                    Target::Window(k) => Some(k.clone()),
+                    Target::Node(id, n) => self
+                        .peers
+                        .get(id)
+                        .and_then(|p| p.nodes.get(n))
+                        .filter(|n| n.kind == "SurfaceReference")
+                        .map(|n| format!("{}:{}", n.window_server_generation, n.surface_id)),
+                    _ => None,
+                };
                 self.capture = Some(Capture {
                     target: target.clone(),
+                    surface,
                     id: self.event.to_string(),
                     interaction: self.event.to_string(),
                     source: source.into(),
@@ -1458,24 +1537,31 @@ impl Desktop {
                             self.dirty = true;
                         }
                     }
-                    self.emit_node(id, &n, phase, xy, source)?;
+                    let node = self
+                        .peers
+                        .get(&id)
+                        .and_then(|p| p.nodes.get(&n))
+                        .context("target gone")?;
+                    if node.kind == "SurfaceReference" {
+                        let key = format!("{}:{}", node.window_server_generation, node.surface_id);
+                        let w = self.windows.get(&key).context("referenced window gone")?;
+                        let logical = Self::logical(w);
+                        let local = [
+                            xy[0] * logical[0] / node.rect[2],
+                            xy[1] * logical[1] / node.rect[3],
+                        ];
+                        self.pointer_surface(&key, local, phase)?;
+                    } else {
+                        self.emit_node(id, &n, phase, xy, source)?;
+                    }
                 }
                 Target::Window(k) => {
-                    if phase == "press" {
-                        self.set_focus(Some(k.clone()))?;
-                        if !self.focus_applied {
-                            self.pending_pointer = Some(json!({"x":xy[0],"y":xy[1]}));
-                        }
-                    }
-                    if self.focus.as_ref() == Some(&k) && self.focus_applied {
-                        self.surface_input(json!({"kind":"pointer_motion","x":xy[0],"y":xy[1]}))?;
-                        if phase == "press" || phase == "release" {
-                            self.surface_input(json!({"kind":"pointer_button","button":272,"pressed":phase=="press"}))?;
-                        }
-                    }
+                    self.pointer_surface(&k, xy, phase)?;
                 }
                 Target::Orb(k) => {
-                    if phase == "hover" || phase == "press" {
+                    if (phase == "hover" || phase == "press")
+                        && self.expanded_orb.as_ref() != Some(&k)
+                    {
                         self.expanded_orb = Some(k);
                         self.dirty = true;
                     }
@@ -1510,7 +1596,7 @@ impl Desktop {
                             w.position[0] = c.position[0]
                                 + (xy[0] - c.start[0]) * w.size[0] / Self::logical(w)[0];
                             w.position[1] = c.position[1]
-                                - (xy[1] - c.start[1]) * w.size[1] / (Self::logical(w)[1] + 36.);
+                                - (xy[1] - c.start[1]) * w.size[1] / Self::logical(w)[1].max(1.);
                             self.dirty = true;
                         }
                     }
@@ -1534,6 +1620,23 @@ impl Desktop {
         }
         if phase != "hover" {
             self.dirty = true;
+        }
+        Ok(())
+    }
+    fn pointer_surface(&mut self, key: &str, local: [f32; 2], phase: &str) -> Result<()> {
+        if phase == "press" {
+            self.set_focus(Some(key.to_owned()))?;
+            if !self.focus_applied {
+                self.pending_pointer = Some(json!({"x":local[0],"y":local[1]}));
+            }
+        }
+        if self.focus.as_deref() == Some(key) && self.focus_applied {
+            self.surface_input(json!({"kind":"pointer_motion","x":local[0],"y":local[1]}))?;
+            if phase == "press" || phase == "release" {
+                self.surface_input(
+                    json!({"kind":"pointer_button","button":272,"pressed":phase=="press"}),
+                )?;
+            }
         }
         Ok(())
     }

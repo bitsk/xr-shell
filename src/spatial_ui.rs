@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 use super::*;
-use crate::spatial::{Frame, add, sub, dot};
+use crate::spatial::{Frame, add, dot, sub};
 #[derive(Clone)]
 enum Source {
     Node(u64, String),
@@ -36,10 +36,17 @@ impl Desktop {
     fn node_base(p: &Peer, node: &Node) -> (Frame, String) {
         let mut parent = node.parent_id.as_str();
         for _ in 0..512 {
-            if parent == "root" { break; }
-            let Some(n) = p.nodes.get(parent) else { break; };
+            if parent == "root" {
+                break;
+            }
+            let Some(n) = p.nodes.get(parent) else {
+                break;
+            };
             if n.spatial_panel {
-                return (Frame::new(n.position_m, n.size_m, n.logical_size, n.rotation_degrees), format!("component:{}:{}", p.id, n.node_id));
+                return (
+                    Frame::new(n.position_m, n.size_m, n.logical_size, n.rotation_degrees),
+                    format!("component:{}:{}", p.id, n.node_id),
+                );
             }
             parent = &n.parent_id;
         }
@@ -50,14 +57,29 @@ impl Desktop {
         let mut depth = 0;
         for _ in 0..16 {
             let w = &self.windows[&root];
-            if w.state["role"].as_str().is_none_or(|r| r == "toplevel") { break; }
-            let Some(parent) = w.state["parent_surface_id"].as_str() else { break; };
-            let key = format!("{}:{parent}", w.state["window_server_generation"].as_str().unwrap_or(""));
-            if !self.windows.contains_key(&key) { break; }
+            if w.state["role"].as_str().is_none_or(|r| r == "toplevel") {
+                break;
+            }
+            let Some(parent) = w.state["parent_surface_id"].as_str() else {
+                break;
+            };
+            let key = format!(
+                "{}:{parent}",
+                w.state["window_server_generation"].as_str().unwrap_or("")
+            );
+            if !self.windows.contains_key(&key) {
+                break;
+            }
             root = key;
             depth += 1;
         }
-        (format!("window:{root}"), self.window_frame(&root, 0).map(|f| f.position).unwrap_or([0.; 3]), depth as f32 * 0.004)
+        (
+            format!("window:{root}"),
+            self.window_frame(&root, 0)
+                .map(|f| f.position)
+                .unwrap_or([0.; 3]),
+            depth as f32 * 0.004,
+        )
     }
     fn root_frame(p: &Peer) -> Frame {
         let mut rotation = p.root.rotation;
@@ -279,7 +301,7 @@ impl Desktop {
         for draw in self.draws() {
             let width = draw.frame.logical[0].round().max(1.) as u32;
             let height = draw.frame.logical[1].round().max(1.) as u32;
-            let canvas = Canvas::new(width, height)?;
+            let canvas = Canvas::for_logical(width, height)?;
             match &draw.source {
                 Source::Node(id, node) => {
                     let p = &self.peers[id];
@@ -363,8 +385,8 @@ impl Desktop {
             panels.push(Panel {
                 id: draw.id,
                 frame: draw.frame,
-                width,
-                height,
+                width: canvas.width,
+                height: canvas.height,
                 rgba: canvas.rgba(),
                 radius: draw.radius,
                 rim: draw.rim,
@@ -375,14 +397,47 @@ impl Desktop {
         ensure!(panels.len() <= 2048, "draw limit exceeded");
         Ok(Some(panels))
     }
-    pub fn panel_poses(&self)->Vec<Geometry>{self.draws().into_iter().map(|d|{
-        let(anchor,group,layer)=match &d.source {
-            Source::Node(id,node)=>{let p=&self.peers[id];let(base,group)=Self::node_base(p,&p.nodes[node]);(base.position,group,dot(sub(d.frame.position,base.position),base.normal()))},
-            Source::Window(k)=>{let(group,anchor,layer)=self.window_group(k);(anchor,group,layer)},
-            Source::Grab(k)|Source::Orb(k)|Source::Close(k)|Source::Minimize(k)|Source::Curve(k)=>{let(group,anchor,layer)=self.window_group(k);(anchor,group,layer+0.005)}
-        };
-        Geometry{id:d.id,frame:d.frame,radius:d.radius,rim:d.rim,border:d.border,material:d.material,anchor,group,layer}
-    }).collect()}
+    pub fn panel_poses(&self) -> Vec<Geometry> {
+        self.draws()
+            .into_iter()
+            .map(|d| {
+                let (anchor, group, layer) = match &d.source {
+                    Source::Node(id, node) => {
+                        let p = &self.peers[id];
+                        let (base, group) = Self::node_base(p, &p.nodes[node]);
+                        (
+                            base.position,
+                            group,
+                            dot(sub(d.frame.position, base.position), base.normal()),
+                        )
+                    }
+                    Source::Window(k) => {
+                        let (group, anchor, layer) = self.window_group(k);
+                        (anchor, group, layer)
+                    }
+                    Source::Grab(k)
+                    | Source::Orb(k)
+                    | Source::Close(k)
+                    | Source::Minimize(k)
+                    | Source::Curve(k) => {
+                        let (group, anchor, layer) = self.window_group(k);
+                        (anchor, group, layer + 0.005)
+                    }
+                };
+                Geometry {
+                    id: d.id,
+                    frame: d.frame,
+                    radius: d.radius,
+                    rim: d.rim,
+                    border: d.border,
+                    material: d.material,
+                    anchor,
+                    group,
+                    layer,
+                }
+            })
+            .collect()
+    }
     pub fn animate(&mut self, dt: f32) -> bool {
         let mut changed = false;
         for p in self.peers.values() {
@@ -468,26 +523,22 @@ impl Desktop {
             let target = match &draw.source {
                 Source::Node(id, node) => {
                     let n = &self.peers[id].nodes[node];
-                    if !n.enabled
-                        || !["Button", "Slider", "SurfaceReference"].contains(&n.kind.as_str())
-                    {
+                    if ["Text", "Icon"].contains(&n.kind.as_str()) {
                         continue;
                     }
-                    Self::target(&draw)
+                    if n.enabled
+                        && ["Button", "Slider", "SurfaceReference"].contains(&n.kind.as_str())
+                    {
+                        Self::target(&draw)
+                    } else {
+                        // Glass cards and disabled controls occlude pointer input too.
+                        None
+                    }
                 }
                 _ => Self::target(&draw),
             };
             if let Some((xy, t)) = draw.frame.project(origin, direction) {
-                if t < nearest && draw.frame.inside(xy) {
-                    if draw.radius >= draw.frame.logical[1] / 2. - 0.1
-                        && draw.frame.logical[0] <= draw.frame.logical[1] + 0.1
-                    {
-                        let dx = xy[0] - draw.frame.logical[0] / 2.;
-                        let dy = xy[1] - draw.frame.logical[1] / 2.;
-                        if dx * dx + dy * dy > (draw.frame.logical[0] / 2.).powi(2) {
-                            continue;
-                        }
-                    }
+                if t < nearest && draw.frame.inside_rounded(xy, draw.radius) {
                     nearest = t;
                     hit = target.map(|t| (t, xy));
                     if !matches!(draw.source, Source::Node(_, _) | Source::Window(_)) {

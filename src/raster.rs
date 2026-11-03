@@ -68,6 +68,22 @@ pub struct Canvas {
     pub height: u32,
 }
 impl Canvas {
+    pub fn for_logical(w: u32, h: u32) -> Result<Self> {
+        ensure!(w > 0 && h > 0, "invalid logical canvas size");
+        let scale = (2048. / w.max(h) as f64).min(1.);
+        let canvas = Self::new(
+            (w as f64 * scale).round().max(1.) as u32,
+            (h as f64 * scale).round().max(1.) as u32,
+        )?;
+        unsafe {
+            cairo_scale(
+                canvas.cr,
+                canvas.width as f64 / w as f64,
+                canvas.height as f64 / h as f64,
+            );
+        }
+        Ok(canvas)
+    }
     pub fn new(w: u32, h: u32) -> Result<Self> {
         ensure!(
             w > 0 && h > 0 && w <= 2048 && h <= 2048,
@@ -281,7 +297,11 @@ pub fn paint_node(
                         h.min(36.),
                     ],
                     &node.text,
-                    if active || node.style_id=="keyboard.key" { [1.; 4] } else { ink },
+                    if active || node.style_id == "keyboard.key" {
+                        [1.; 4]
+                    } else {
+                        ink
+                    },
                     if node.style_id == "keyboard.key" {
                         26.
                     } else {

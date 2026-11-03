@@ -6,16 +6,19 @@ swapchain, and submits one projection layer containing both views. It uses
 `openxr` and `ash` directly; environment artwork is supplied by the independent
 `xr-environments` package.
 
-This milestone supplies the background and frame lifecycle. Dock, spatial
-widgets, Linux application windows and the component protocol remain separate
-implementation work. Build, QEMU runtime, browser observation and physical
-headset acceptance are recorded independently by the integration project.
+Version 0.2 adds the component protocol and spatial window composition.
+Dock, spatial widgets, Linux window serving and system controls are independent
+components. Builds, historical QEMU runs, native ARM64 development runs and
+physical headset acceptance are recorded independently by the integration project.
 
 ## Build
 
 Use Rust 2024, Cargo, glslangValidator and the checked-in Cargo.lock. Shader
 sources are compiled into SPIR-V at build time; a deployed executable does not
 need the shader compiler, Cargo or a network connection.
+
+The native build also links Cairo, Pango/PangoCairo and librsvg. Install their
+development packages and check out the matching xr-spatial-kit sibling repository.
 
 ```sh
 cargo fetch --locked
@@ -105,8 +108,8 @@ have separate CPU-copy and video-encoding costs.
 Version 0.2 supplies the Shell-owned local protocol SDK, independent scene
 clients, immutable SHM window snapshots and a spatial Vulkan sprite renderer.
 Use `--components` to expose the local same-user scene socket; `--debug-input`
-adds the explicit developer input channel used by `xr-shellctl`. The QEMU
-composition profile is maintained by xr-image-tools; installing Shell does not
+adds the explicit developer input channel used by `xr-shellctl`. Native ARM64
+and historical QEMU development profiles are maintained by xr-image-tools; installing Shell does not
 launch services. Runtime acceptance remains in the integration records.
 
 World coordinates remain +Y up and -Z forward. UI-local +Y is down. Positive
@@ -128,3 +131,8 @@ registered freedesktop icon IDs resolve installed UKUI theme SVG/PNG assets.
 Environment-only frost sampling is a bounded visual baseline; general scene
 backdrop filtering, retained rendering, DMA-BUF and target build closure remain
 separate work. Normal frame rendering does not read the eye buffers back.
+
+Application snapshots larger than the raster budget are scaled in full to a
+maximum texture edge of 2048 pixels. Their logical dimensions and ray/input
+coordinates stay unchanged; no client content is cropped. This CPU-copy path
+does not establish a DMA-BUF or zero-copy implementation.

@@ -12,7 +12,7 @@ override_dh_auto_build:
 	CARGO_TARGET_DIR="$(CURDIR)/target" cargo build --offline --locked --release
 
 override_dh_auto_test:
-	@echo "OpenXR rendering acceptance is performed in the development guest."
+	@echo "OpenXR rendering acceptance is recorded separately on the selected development target."
 
 override_dh_auto_clean:
 	CARGO_TARGET_DIR="$(CURDIR)/target" cargo clean

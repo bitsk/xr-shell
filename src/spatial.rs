@@ -149,4 +149,15 @@ impl Frame {
     pub fn inside(&self, xy: [f32; 2]) -> bool {
         xy[0] >= 0. && xy[1] >= 0. && xy[0] <= self.logical[0] && xy[1] <= self.logical[1]
     }
+    pub fn inside_rounded(&self, xy: [f32; 2], radius: f32) -> bool {
+        if !self.inside(xy) {
+            return false;
+        }
+        let radius = radius
+            .max(0.)
+            .min(self.logical[0].min(self.logical[1]) / 2.);
+        let dx = (xy[0] - self.logical[0] / 2.).abs() - (self.logical[0] / 2. - radius);
+        let dy = (xy[1] - self.logical[1] / 2.).abs() - (self.logical[1] / 2. - radius);
+        dx.max(0.).hypot(dy.max(0.)) + dx.max(dy).min(0.) <= radius
+    }
 }
