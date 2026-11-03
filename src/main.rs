@@ -453,14 +453,15 @@ fn write_capture(
         encoder.set_color(png::ColorType::Rgba);
         encoder.set_depth(png::BitDepth::Eight);
         encoder.set_source_srgb(png::SrgbRenderingIntent::Perceptual);
-        encoder
-            .write_header()?
-            .write_image_data(&bytes.context("missing GPU readback")?)?;
+        let mut writer = encoder.write_header()?;
+        writer.write_image_data(&bytes.context("missing GPU readback")?)?;
+        writer.finish()?;
         let p = view.pose.position;
         let q = view.pose.orientation;
         let f = view.fov;
         eyes.push(json!({"eye": eye, "png": name, "width": target.extent.width, "height": target.extent.height,
             "swapchain": format!("{:?}", target.swapchain.as_raw()), "image_index": indices[eye], "array_index": 0,
+            "swapchain_format": format!("{:?}", renderer.format),
             "position_m": [p.x,p.y,p.z], "orientation_xyzw": [q.x,q.y,q.z,q.w],
             "fov_radians": {"left":f.angle_left,"right":f.angle_right,"up":f.angle_up,"down":f.angle_down}}));
     }
