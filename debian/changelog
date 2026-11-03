@@ -1,3 +1,10 @@
+xr-shell (0.2.0) unstable; urgency=medium
+
+  * Add independent component scenes, immutable SHM windows and spatial input.
+  * Package the Shell-owned protocol SDK and local development control client.
+
+ -- openKylin XR SIG <xr@lists.openkylin.top>  Wed, 04 Nov 2026 00:28:51 +0800
+
 xr-shell (0.1.0) unstable; urgency=medium
 
   * Package the Rust OpenXR panorama client with offline locked build inputs.

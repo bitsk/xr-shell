@@ -36,6 +36,9 @@ pub struct Renderer {
     pub format: vk::Format,
     pass: vk::RenderPass,
     pipeline: vk::Pipeline,
+    spatial_pipeline: vk::Pipeline,
+    draw_count: u32,
+    uv_map: std::collections::BTreeMap<String, [f32; 4]>,
     layout: vk::PipelineLayout,
     descriptor_layout: vk::DescriptorSetLayout,
     descriptor_pool: vk::DescriptorPool,
@@ -49,6 +52,9 @@ pub struct Renderer {
     fence: vk::Fence,
     shaders: Vec<vk::ShaderModule>,
     yaw: f32,
+    atlas: Option<Atlas>,
+    ui_uniform: Option<Buffer>,
+    panel_uniforms: Vec<f32>,
 }
 
 impl Renderer {
@@ -70,6 +76,9 @@ impl Renderer {
             format,
             pass: vk::RenderPass::null(),
             pipeline: vk::Pipeline::null(),
+            spatial_pipeline: vk::Pipeline::null(),
+            draw_count: 0,
+            uv_map: std::collections::BTreeMap::new(),
             layout: vk::PipelineLayout::null(),
             descriptor_layout: vk::DescriptorSetLayout::null(),
             descriptor_pool: vk::DescriptorPool::null(),
@@ -83,6 +92,9 @@ impl Renderer {
             fence: vk::Fence::null(),
             shaders: Vec::new(),
             yaw: environment.yaw,
+            atlas: None,
+            ui_uniform: None,
+            panel_uniforms: Vec::new(),
         };
         // Everything allocated below is already owned by r, including on error.
         unsafe {
@@ -105,7 +117,9 @@ impl Renderer {
             )?;
         }
         r.upload(environment)?;
+        r.init_panels()?;
         r.pipeline()?;
+        r.create_spatial_pipeline()?;
         for (index, v) in views.iter().enumerate() {
             let extent = vk::Extent2D {
                 width: ((v.recommended_image_rect_width as f32 * scale).round() as u32)
@@ -311,17 +325,33 @@ impl Renderer {
                         .binding(0)
                         .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
                         .descriptor_count(1)
-                        .stage_flags(vk::ShaderStageFlags::FRAGMENT),
+                        .stage_flags(vk::ShaderStageFlags::FRAGMENT | vk::ShaderStageFlags::VERTEX),
+                    vk::DescriptorSetLayoutBinding::default()
+                        .binding(1)
+                        .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+                        .descriptor_count(1)
+                        .stage_flags(vk::ShaderStageFlags::FRAGMENT | vk::ShaderStageFlags::VERTEX),
+                    vk::DescriptorSetLayoutBinding::default()
+                        .binding(2)
+                        .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                        .descriptor_count(1)
+                        .stage_flags(vk::ShaderStageFlags::FRAGMENT | vk::ShaderStageFlags::VERTEX),
                 ]),
                 None,
             )?;
             self.descriptor_pool = d.create_descriptor_pool(
                 &vk::DescriptorPoolCreateInfo::default()
                     .max_sets(1)
-                    .pool_sizes(&[vk::DescriptorPoolSize {
-                        ty: vk::DescriptorType::COMBINED_IMAGE_SAMPLER,
-                        descriptor_count: 1,
-                    }]),
+                    .pool_sizes(&[
+                        vk::DescriptorPoolSize {
+                            ty: vk::DescriptorType::COMBINED_IMAGE_SAMPLER,
+                            descriptor_count: 2,
+                        },
+                        vk::DescriptorPoolSize {
+                            ty: vk::DescriptorType::STORAGE_BUFFER,
+                            descriptor_count: 1,
+                        },
+                    ]),
                 None,
             )?;
             self.descriptor = d.allocate_descriptor_sets(
@@ -401,9 +431,9 @@ impl Renderer {
                 &vk::PipelineLayoutCreateInfo::default()
                     .set_layouts(&[self.descriptor_layout])
                     .push_constant_ranges(&[vk::PushConstantRange {
-                        stage_flags: vk::ShaderStageFlags::FRAGMENT,
+                        stage_flags: vk::ShaderStageFlags::FRAGMENT | vk::ShaderStageFlags::VERTEX,
                         offset: 0,
-                        size: 48,
+                        size: 64,
                     }]),
                 None,
             )?;
@@ -533,16 +563,28 @@ impl Renderer {
                 self.yaw.sin(),
                 0.0,
                 0.0,
+                view.pose.position.x,
+                view.pose.position.y,
+                view.pose.position.z,
+                0.0,
             ];
-            let bytes = std::slice::from_raw_parts(constants.as_ptr() as *const u8, 48);
+            let bytes = std::slice::from_raw_parts(constants.as_ptr() as *const u8, 64);
             d.cmd_push_constants(
                 self.cmd,
                 self.layout,
-                vk::ShaderStageFlags::FRAGMENT,
+                vk::ShaderStageFlags::FRAGMENT | vk::ShaderStageFlags::VERTEX,
                 0,
                 bytes,
             );
             d.cmd_draw(self.cmd, 3, 1, 0, 0);
+            if self.draw_count > 0 {
+                d.cmd_bind_pipeline(
+                    self.cmd,
+                    vk::PipelineBindPoint::GRAPHICS,
+                    self.spatial_pipeline,
+                );
+                d.cmd_draw(self.cmd, 6 * 32, self.draw_count, 0, 0);
+            }
             d.cmd_end_render_pass(self.cmd);
             if let Some(buffer) = &readback {
                 d.cmd_pipeline_barrier(
@@ -627,6 +669,7 @@ impl Drop for Renderer {
             let _ = self.gpu.device.device_wait_idle();
             self.eyes.clear();
             let d = &self.gpu.device;
+            d.destroy_pipeline(self.spatial_pipeline, None);
             d.destroy_pipeline(self.pipeline, None);
             d.destroy_pipeline_layout(self.layout, None);
             for shader in self.shaders.drain(..) {
@@ -672,4 +715,375 @@ fn image_barrier(
         .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
         .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
         .subresource_range(colour_range())
+}
+
+struct Atlas {
+    gpu: Rc<Gpu>,
+    image: vk::Image,
+    memory: vk::DeviceMemory,
+    view: vk::ImageView,
+    width: u32,
+    height: u32,
+    initialized: bool,
+}
+impl Atlas {
+    fn new(gpu: Rc<Gpu>, width: u32, height: u32) -> Result<Self> {
+        let mut a = Self {
+            gpu,
+            image: vk::Image::null(),
+            memory: vk::DeviceMemory::null(),
+            view: vk::ImageView::null(),
+            width,
+            height,
+            initialized: false,
+        };
+        unsafe {
+            let d = &a.gpu.device;
+            a.image = d.create_image(
+                &vk::ImageCreateInfo::default()
+                    .image_type(vk::ImageType::TYPE_2D)
+                    .format(vk::Format::R8G8B8A8_SRGB)
+                    .extent(vk::Extent3D {
+                        width,
+                        height,
+                        depth: 1,
+                    })
+                    .mip_levels(1)
+                    .array_layers(1)
+                    .samples(vk::SampleCountFlags::TYPE_1)
+                    .tiling(vk::ImageTiling::OPTIMAL)
+                    .usage(vk::ImageUsageFlags::TRANSFER_DST | vk::ImageUsageFlags::SAMPLED)
+                    .sharing_mode(vk::SharingMode::EXCLUSIVE),
+                None,
+            )?;
+            let req = d.get_image_memory_requirements(a.image);
+            a.memory = d.allocate_memory(
+                &vk::MemoryAllocateInfo::default()
+                    .allocation_size(req.size)
+                    .memory_type_index(a.gpu.memory_type(
+                        req.memory_type_bits,
+                        vk::MemoryPropertyFlags::DEVICE_LOCAL,
+                    )?),
+                None,
+            )?;
+            d.bind_image_memory(a.image, a.memory, 0)?;
+            a.view = d.create_image_view(
+                &vk::ImageViewCreateInfo::default()
+                    .image(a.image)
+                    .view_type(vk::ImageViewType::TYPE_2D)
+                    .format(vk::Format::R8G8B8A8_SRGB)
+                    .subresource_range(colour_range()),
+                None,
+            )?;
+        }
+        Ok(a)
+    }
+}
+impl Drop for Atlas {
+    fn drop(&mut self) {
+        unsafe {
+            let d = &self.gpu.device;
+            d.destroy_image_view(self.view, None);
+            d.destroy_image(self.image, None);
+            d.free_memory(self.memory, None);
+        }
+    }
+}
+const UI_UNIFORM_BYTES: u64 = 2048 * 96;
+impl Renderer {
+    fn init_panels(&mut self) -> Result<()> {
+        self.ui_uniform = Some(Buffer::host(
+            self.gpu.clone(),
+            UI_UNIFORM_BYTES,
+            vk::BufferUsageFlags::STORAGE_BUFFER,
+        )?);
+        self.update_panels(&[])
+    }
+    pub fn update_panels(&mut self, panels: &[crate::desktop::Panel]) -> Result<()> {
+        ensure!(panels.len() <= 2048, "draw item limit");
+        let width = panels
+            .iter()
+            .map(|p| p.width + 4)
+            .max()
+            .unwrap_or(4)
+            .max(512)
+            .next_power_of_two()
+            .min(4096);
+        let mut packing = Vec::new();
+        let (mut x, mut y, mut row) = (2u32, 2u32, 0u32);
+        for p in panels {
+            if x + p.width + 2 > width {
+                x = 2;
+                y += row + 4;
+                row = 0;
+            }
+            packing.push((x, y));
+            x += p.width + 4;
+            row = row.max(p.height);
+        }
+        let height = (y + row + 2).max(4).next_power_of_two();
+        ensure!(height <= 8192, "spatial atlas capacity");
+        let mut pixels = vec![0u8; width as usize * height as usize * 4];
+        self.uv_map.clear();
+        for (p, (x, y)) in panels.iter().zip(packing) {
+            for row in 0..p.height as usize {
+                let dst = ((y as usize + row) * width as usize + x as usize) * 4;
+                let src = row * p.width as usize * 4;
+                pixels[dst..dst + p.width as usize * 4]
+                    .copy_from_slice(&p.rgba[src..src + p.width as usize * 4]);
+            }
+            self.uv_map.insert(
+                p.id.clone(),
+                [
+                    (x as f32 + 0.5) / width as f32,
+                    (y as f32 + 0.5) / height as f32,
+                    (p.width - 1) as f32 / width as f32,
+                    (p.height - 1) as f32 / height as f32,
+                ],
+            );
+        }
+        unsafe {
+            self.gpu.device.device_wait_idle()?;
+        }
+        let staging = Buffer::host(
+            self.gpu.clone(),
+            pixels.len() as u64,
+            vk::BufferUsageFlags::TRANSFER_SRC,
+        )?;
+        staging.write(&pixels)?;
+        if self
+            .atlas
+            .as_ref()
+            .is_none_or(|a| a.width != width || a.height != height)
+        {
+            self.atlas = Some(Atlas::new(self.gpu.clone(), width, height)?);
+        }
+        self.begin()?;
+        {
+            let a = self.atlas.as_ref().unwrap();
+            unsafe {
+                let d = &self.gpu.device;
+                d.cmd_pipeline_barrier(
+                    self.cmd,
+                    if a.initialized {
+                        vk::PipelineStageFlags::FRAGMENT_SHADER
+                    } else {
+                        vk::PipelineStageFlags::TOP_OF_PIPE
+                    },
+                    vk::PipelineStageFlags::TRANSFER,
+                    vk::DependencyFlags::empty(),
+                    &[],
+                    &[],
+                    &[image_barrier(
+                        a.image,
+                        if a.initialized {
+                            vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL
+                        } else {
+                            vk::ImageLayout::UNDEFINED
+                        },
+                        vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                        if a.initialized {
+                            vk::AccessFlags::SHADER_READ
+                        } else {
+                            vk::AccessFlags::empty()
+                        },
+                        vk::AccessFlags::TRANSFER_WRITE,
+                    )],
+                );
+                d.cmd_copy_buffer_to_image(
+                    self.cmd,
+                    staging.handle,
+                    a.image,
+                    vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                    &[vk::BufferImageCopy::default()
+                        .image_subresource(colour_layers())
+                        .image_extent(vk::Extent3D {
+                            width,
+                            height,
+                            depth: 1,
+                        })],
+                );
+                d.cmd_pipeline_barrier(
+                    self.cmd,
+                    vk::PipelineStageFlags::TRANSFER,
+                    vk::PipelineStageFlags::FRAGMENT_SHADER,
+                    vk::DependencyFlags::empty(),
+                    &[],
+                    &[],
+                    &[image_barrier(
+                        a.image,
+                        vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                        vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+                        vk::AccessFlags::TRANSFER_WRITE,
+                        vk::AccessFlags::SHADER_READ,
+                    )],
+                );
+            }
+        }
+        self.submit()?;
+        self.atlas.as_mut().unwrap().initialized = true;
+        unsafe {
+            let images = [vk::DescriptorImageInfo::default()
+                .sampler(self.sampler)
+                .image_view(self.atlas.as_ref().unwrap().view)
+                .image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)];
+            let buffer = [vk::DescriptorBufferInfo::default()
+                .buffer(self.ui_uniform.as_ref().unwrap().handle)
+                .range(UI_UNIFORM_BYTES)];
+            self.gpu.device.update_descriptor_sets(
+                &[
+                    vk::WriteDescriptorSet::default()
+                        .dst_set(self.descriptor)
+                        .dst_binding(1)
+                        .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+                        .image_info(&images),
+                    vk::WriteDescriptorSet::default()
+                        .dst_set(self.descriptor)
+                        .dst_binding(2)
+                        .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                        .buffer_info(&buffer),
+                ],
+                &[],
+            );
+        }
+        let poses: Vec<_> = panels
+            .iter()
+            .map(|p| crate::desktop::spatial_ui::Geometry {
+                id: p.id.clone(),
+                frame: p.frame,
+                radius: p.radius,
+                rim: p.rim,
+                border: p.border,
+                material: p.material,
+                anchor:p.frame.position,group:p.id.clone(),layer:0.,
+            })
+            .collect();
+        self.update_panel_poses(&poses, [0., 1.6, 0.])
+    }
+    pub fn update_panel_poses(
+        &mut self,
+        poses: &[crate::desktop::spatial_ui::Geometry],
+        origin: [f32; 3],
+    ) -> Result<()> {
+        let mut order: Vec<_> = poses.iter().collect();
+        order.sort_by(|a, b| {
+            let distance = |p: &crate::desktop::spatial_ui::Geometry| {
+                p.anchor
+                    .iter()
+                    .zip(origin)
+                    .map(|(a, b)| (a - b) * (a - b))
+                    .sum::<f32>()
+            };
+            if a.group==b.group {a.layer.total_cmp(&b.layer)}else{distance(b).total_cmp(&distance(a)).then(a.group.cmp(&b.group))}
+        });
+        self.draw_count = order.len() as u32;
+        let mut values = Vec::with_capacity(order.len() * 24);
+        for p in order {
+            let f = p.frame;
+            let uv = self
+                .uv_map
+                .get(&p.id)
+                .ok_or_else(|| anyhow::anyhow!("draw image missing for {}", p.id))?;
+            values.extend_from_slice(&[
+                f.position[0],
+                f.position[1],
+                f.position[2],
+                p.material,
+                f.right[0],
+                f.right[1],
+                f.right[2],
+                f.size[0],
+                f.down[0],
+                f.down[1],
+                f.down[2],
+                f.size[1],
+                uv[0],
+                uv[1],
+                uv[2],
+                uv[3],
+                f.logical[0],
+                f.logical[1],
+                p.radius,
+                p.rim,
+                p.border,
+                f.curve,
+                0.,
+                0.,
+            ]);
+        }
+        self.panel_uniforms = values;
+        self.ui_uniform.as_ref().unwrap().write(unsafe {
+            std::slice::from_raw_parts(
+                self.panel_uniforms.as_ptr() as *const u8,
+                self.panel_uniforms.len() * 4,
+            )
+        })
+    }
+    fn create_spatial_pipeline(&mut self) -> Result<()> {
+        unsafe {
+            let d = &self.gpu.device;
+            let mut modules = Vec::new();
+            for bytes in [
+                include_bytes!(concat!(env!("OUT_DIR"), "/spatial.vert.spv")).as_slice(),
+                include_bytes!(concat!(env!("OUT_DIR"), "/spatial.frag.spv")).as_slice(),
+            ] {
+                let code = ash::util::read_spv(&mut Cursor::new(bytes))?;
+                modules.push(d.create_shader_module(
+                    &vk::ShaderModuleCreateInfo::default().code(&code),
+                    None,
+                )?);
+            }
+            let stages = [
+                vk::PipelineShaderStageCreateInfo::default()
+                    .stage(vk::ShaderStageFlags::VERTEX)
+                    .module(modules[0])
+                    .name(c"main"),
+                vk::PipelineShaderStageCreateInfo::default()
+                    .stage(vk::ShaderStageFlags::FRAGMENT)
+                    .module(modules[1])
+                    .name(c"main"),
+            ];
+            let vertices = vk::PipelineVertexInputStateCreateInfo::default();
+            let assembly = vk::PipelineInputAssemblyStateCreateInfo::default()
+                .topology(vk::PrimitiveTopology::TRIANGLE_LIST);
+            let viewport = vk::PipelineViewportStateCreateInfo::default()
+                .viewport_count(1)
+                .scissor_count(1);
+            let raster = vk::PipelineRasterizationStateCreateInfo::default()
+                .polygon_mode(vk::PolygonMode::FILL)
+                .cull_mode(vk::CullModeFlags::NONE)
+                .line_width(1.);
+            let multi = vk::PipelineMultisampleStateCreateInfo::default()
+                .rasterization_samples(vk::SampleCountFlags::TYPE_1);
+            let attachments = [vk::PipelineColorBlendAttachmentState::default()
+                .blend_enable(true)
+                .src_color_blend_factor(vk::BlendFactor::SRC_ALPHA)
+                .dst_color_blend_factor(vk::BlendFactor::ONE_MINUS_SRC_ALPHA)
+                .color_blend_op(vk::BlendOp::ADD)
+                .src_alpha_blend_factor(vk::BlendFactor::ONE)
+                .dst_alpha_blend_factor(vk::BlendFactor::ONE_MINUS_SRC_ALPHA)
+                .alpha_blend_op(vk::BlendOp::ADD)
+                .color_write_mask(vk::ColorComponentFlags::RGBA)];
+            let blend = vk::PipelineColorBlendStateCreateInfo::default().attachments(&attachments);
+            let states = [vk::DynamicState::VIEWPORT, vk::DynamicState::SCISSOR];
+            let dynamic = vk::PipelineDynamicStateCreateInfo::default().dynamic_states(&states);
+            let create = vk::GraphicsPipelineCreateInfo::default()
+                .stages(&stages)
+                .vertex_input_state(&vertices)
+                .input_assembly_state(&assembly)
+                .viewport_state(&viewport)
+                .rasterization_state(&raster)
+                .multisample_state(&multi)
+                .color_blend_state(&blend)
+                .dynamic_state(&dynamic)
+                .layout(self.layout)
+                .render_pass(self.pass);
+            let result = d.create_graphics_pipelines(vk::PipelineCache::null(), &[create], None);
+            for module in modules {
+                d.destroy_shader_module(module, None);
+            }
+            self.spatial_pipeline = result.map_err(|(_, e)| e)?[0];
+            Ok(())
+        }
+    }
 }

@@ -99,3 +99,32 @@ S1 deliberately waits for each eye's GPU work before releasing its XR image.
 This is a clear correctness baseline, not a claim of an optimized multi-frame
 pipeline or zero-copy display transport. Observation through a browser may
 have separate CPU-copy and video-encoding costs.
+
+## Component desktop candidate
+
+Version 0.2 supplies the Shell-owned local protocol SDK, independent scene
+clients, immutable SHM window snapshots and a spatial Vulkan sprite renderer.
+Use `--components` to expose the local same-user scene socket; `--debug-input`
+adds the explicit developer input channel used by `xr-shellctl`. The QEMU
+composition profile is maintained by xr-image-tools; installing Shell does not
+launch services. Runtime acceptance remains in the integration records.
+
+World coordinates remain +Y up and -Z forward. UI-local +Y is down. Positive
+UI Pitch tilts a panel face upward; right-side UI uses Yaw -18 degrees. The
+same `spatial::Frame` maps actual world geometry and input rays. Components
+can publish independent spatial Group subtrees. Interactive primitives have
+8mm local relief and smoothly add 12mm on hover; they are independent Vulkan
+instances, not a single flattened screenshot.
+
+Client content is an unframed, rounded surface with a thin rim. Shell adds no
+upper titlebar. A separate lower grab capsule and control orb own spatial
+manipulation, close, minimise and a real tessellated curved-surface toggle.
+Wayland decoration negotiation belongs to xr-wayland; custom application
+header widgets are application content and are not cropped by Shell.
+
+Spatial UI uses the Kit smoke-glass palette independently of application
+light/dark settings. Text is rasterised through Pango and installed fonts;
+registered freedesktop icon IDs resolve installed UKUI theme SVG/PNG assets.
+Environment-only frost sampling is a bounded visual baseline; general scene
+backdrop filtering, retained rendering, DMA-BUF and target build closure remain
+separate work. Normal frame rendering does not read the eye buffers back.

@@ -1,7 +1,11 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
+mod desktop;
 mod environment;
 mod gpu;
+mod input;
+mod raster;
 mod renderer;
+mod spatial;
 
 use anyhow::{Context, Result, bail, ensure};
 use environment::Environment;
@@ -29,6 +33,9 @@ struct Options {
     capture_dir: Option<PathBuf>,
     validation: bool,
     scale: f32,
+    components: bool,
+    debug_input: bool,
+    socket: Option<PathBuf>,
 }
 impl Options {
     fn parse() -> Result<Option<Self>> {
@@ -38,6 +45,9 @@ impl Options {
             capture_dir: None,
             validation: false,
             scale: 1.0,
+            components: false,
+            debug_input: false,
+            socket: None,
         };
         let mut args = env::args().skip(1);
         while let Some(arg) = args.next() {
@@ -57,6 +67,19 @@ impl Options {
                             .context("--capture-dir requires a directory")?
                             .into(),
                     )
+                }
+                "--components" => o.components = true,
+                "--debug-input" => {
+                    o.components = true;
+                    o.debug_input = true;
+                }
+                "--component-socket" => {
+                    o.components = true;
+                    o.socket = Some(
+                        args.next()
+                            .context("--component-socket requires path")?
+                            .into(),
+                    );
                 }
                 "--validation" => o.validation = true,
                 "--view-scale" => {
@@ -124,6 +147,7 @@ struct Summary {
     cleanup: Cleanup,
     outcome: String,
     error: Option<String>,
+    desktop: Value,
 }
 
 fn main() {
@@ -219,7 +243,21 @@ fn run(options: &Options, summary: &mut Summary) -> Result<()> {
     };
     summary.reference_space = Some(format!("{space_type:?}"));
     let space = session.create_reference_space(space_type, xr::Posef::IDENTITY)?;
+    let mut input = if options.components {
+        Some(input::Input::new(&instance, &session)?)
+    } else {
+        None
+    };
     let mut renderer = Renderer::new(gpu.clone(), &session, &config, &environment, options.scale)?;
+    let mut desktop = if options.components {
+        let path = options.socket.clone().unwrap_or_else(|| {
+            PathBuf::from(env::var_os("XDG_RUNTIME_DIR").unwrap_or_else(|| "/tmp".into()))
+                .join("xr-desktop/shell.sock")
+        });
+        Some(desktop::Desktop::new(&path, options.debug_input)?)
+    } else {
+        None
+    };
     let started = Instant::now();
     let result = frame_loop(
         options,
@@ -231,10 +269,17 @@ fn run(options: &Options, summary: &mut Summary) -> Result<()> {
         &space,
         &mut renderer,
         &quit,
+        &mut desktop,
+        &mut input,
     );
+    if let Some(d) = &desktop {
+        summary.desktop = d.snapshot();
+    }
+    drop(desktop);
     summary.elapsed_seconds = started.elapsed().as_secs_f64();
     let idle = unsafe { gpu.device.device_wait_idle() }.context("wait for final GPU work");
     // Framebuffers/views and XR swapchains are destroyed before session/device.
+    drop(input);
     drop(renderer);
     drop(space);
     drop(stream);
@@ -270,6 +315,8 @@ fn frame_loop(
     space: &xr::Space,
     renderer: &mut Renderer,
     quit: &AtomicBool,
+    desktop: &mut Option<desktop::Desktop>,
+    input: &mut Option<input::Input>,
 ) -> Result<()> {
     let mut events = xr::EventDataBuffer::new();
     let mut running = false;
@@ -281,6 +328,9 @@ fn frame_loop(
                     let state = e.state();
                     println!("XR_SESSION_STATE={state:?}");
                     summary.session_states.push(format!("{state:?}"));
+                    if let Some(d) = desktop {
+                        d.set_xr_focus(state == xr::SessionState::FOCUSED);
+                    }
                     match state {
                         xr::SessionState::READY => {
                             session.begin(VIEW_TYPE)?;
@@ -317,6 +367,12 @@ fn frame_loop(
             std::thread::sleep(Duration::from_millis(20));
             continue;
         }
+        if let Some(d) = desktop {
+            d.tick()?;
+            if let Some(panels) = d.panels()? {
+                renderer.update_panels(&panels)?;
+            }
+        }
         let state = waiter.wait()?;
         stream.begin()?;
         summary.waited_frames += 1;
@@ -339,6 +395,27 @@ fn frame_loop(
             continue;
         }
         ensure!(views.len() == 2, "runtime changed stereo view count");
+        let head_position = [
+            (views[0].pose.position.x + views[1].pose.position.x) / 2.,
+            (views[0].pose.position.y + views[1].pose.position.y) / 2.,
+            (views[0].pose.position.z + views[1].pose.position.z) / 2.,
+        ];
+        let dt = state.predicted_display_period.as_nanos() as f32 / 1e9;
+        if let Some(d) = desktop.as_mut() {
+            let q = views[0].pose.orientation;
+            d.update_head(head_position, [q.x, q.y, q.z, q.w], dt);
+        }
+        if let (Some(i), Some(d)) = (input.as_mut(), desktop.as_mut()) {
+            i.update(session, space, state.predicted_display_time, d)?;
+        }
+        if let Some(d) = desktop.as_mut() {
+            d.animate(dt);
+            if let Some(panels) = d.panels()? {
+                renderer.update_panels(&panels)?;
+            }
+            renderer.update_panel_poses(&d.panel_poses(), head_position)?;
+        }
+
         let capture = capture_request(options.capture_dir.as_deref())?;
         let mut indices = [0u32; 2];
         let mut pixels = Vec::with_capacity(2);

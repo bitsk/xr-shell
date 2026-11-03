@@ -2,7 +2,7 @@ Source: xr-shell
 Section: x11
 Priority: optional
 Maintainer: openKylin XR SIG <xr@lists.openkylin.top>
-Build-Depends: debhelper-compat (= 13), cargo (>= 1.88), rustc (>= 1.88), glslang-tools
+Build-Depends: debhelper-compat (= 13), cargo (>= 1.88), rustc (>= 1.88), glslang-tools, librust-xr-spatial-kit-dev (= 0.2.0)
 Standards-Version: 4.7.0
 Rules-Requires-Root: no
 
@@ -15,3 +15,10 @@ Description: Rust OpenXR panorama shell for UKUI XR
  session. A separately configured OpenXR loader and runtime are required;
  development profiles may provide an isolated loader. Installation does not
  launch XR or change the selected runtime.
+
+Package: librust-xr-shell-protocols-dev
+Architecture: all
+Depends: ${misc:Depends}
+Description: source SDK for local UKUI XR component IPC
+ Versioned Rust client, bounded seqpacket metadata, immutable snapshot FD
+ helpers and normative primitive types. The Shell owns this interface.

@@ -4,7 +4,7 @@ use std::{env, path::PathBuf, process::Command};
 fn main() {
     println!("cargo:rerun-if-env-changed=GLSLANG_VALIDATOR");
     let compiler = env::var_os("GLSLANG_VALIDATOR").unwrap_or_else(|| "glslangValidator".into());
-    for name in ["panorama.vert", "panorama.frag"] {
+    for name in ["panorama.vert", "panorama.frag", "spatial.vert", "spatial.frag"] {
         let input = PathBuf::from("shaders").join(name);
         let output = PathBuf::from(env::var_os("OUT_DIR").unwrap()).join(format!("{name}.spv"));
         println!("cargo:rerun-if-changed={}", input.display());

@@ -398,16 +398,38 @@ dependencies = [
 
 [[package]]
 name = "xr-shell"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "ash",
  "ctrlc",
+ "libc",
  "openxr",
  "png",
  "serde",
  "serde_json",
  "sha2",
+ "xr-shell-protocols",
+ "xr-spatial-kit",
+]
+
+[[package]]
+name = "xr-shell-protocols"
+version = "0.2.0"
+dependencies = [
+ "anyhow",
+ "libc",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "xr-spatial-kit"
+version = "0.2.0"
+dependencies = [
+ "anyhow",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]

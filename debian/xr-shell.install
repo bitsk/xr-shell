@@ -1,1 +1,2 @@
 target/release/xr-shell usr/bin/
+target/release/xr-shellctl usr/bin/
