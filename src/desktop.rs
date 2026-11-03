@@ -57,9 +57,41 @@ struct Peer {
     root: Root,
     used_buffers: BTreeSet<String>,
 }
+fn message_capability(kind: &str) -> &'static str {
+    match kind {
+        "GetSnapshot" | "Snapshot" | "StateChanged" | "WindowState" | "WindowRemoved"
+        | "WindowAccepted" => "snapshot.v1",
+        "GetScene" | "ScenePage" | "GetLayout" | "LayoutPage" | "DebugInput" => "debug.v1",
+        "SceneTransaction" | "SceneApplied" | "SceneRejected" => "scene.v1",
+        "InputEvent" => "input.v1",
+        "ShmBufferCommit" | "BufferRelease" => "shm.v1",
+        "FocusChanged" | "FocusApplied" | "SurfaceInput" => "focus.v1",
+        "WindowIntent" | "RequestResult" => "window.v1",
+        "ComponentIntent" | "ComponentCommand" | "SystemState" | "TextCommit" | "KeyIntent" => {
+            "system.v1"
+        }
+        "WorkspaceIntent" | "WorkspaceApplied" => "workspace.v1",
+        "ClipboardSet" | "ClipboardChanged" | "GetClipboard" => "clipboard.v1",
+        // Error, SessionEnding and Cancel remain core control messages. In
+        // particular, withdrawing a capture must not depend on optional input.
+        _ => "core.v1",
+    }
+}
+fn accepts_event(capabilities: &[String], kind: &str) -> bool {
+    let required = message_capability(kind);
+    required == "core.v1" || capabilities.iter().any(|cap| cap == required)
+}
 impl Peer {
+    // Replies retain their request ID, including handshake and capability errors.
     fn send(&self, session: &str, kind: &str, request: &str, payload: Value) -> Result<()> {
         self.socket.send(&json!({"type":kind,"request_id":request,"session_generation":session,"component_id":self.id.to_string(),"component_generation":self.generation,"payload":payload}),&[])
+    }
+    fn send_event(&self, session: &str, kind: &str, payload: Value) -> Result<bool> {
+        if !accepts_event(&self.capabilities, kind) {
+            return Ok(false);
+        }
+        self.send(session, kind, "0", payload)?;
+        Ok(true)
     }
     fn error(&self, session: &str, request: &str, code: &str, message: &str) -> Result<()> {
         self.send(
@@ -119,7 +151,7 @@ pub struct Panel {
 }
 pub struct Desktop {
     listener: SeqPacket,
-    active_peer: Option<(u64, String, Value)>,
+    active_peer: Option<(u64, String, Value, Vec<String>)>,
     outbox: RefCell<Vec<(u64, String, Value)>>,
     pending_requests: BTreeMap<(u64, String), String>,
     path: PathBuf,
@@ -281,7 +313,7 @@ impl Desktop {
             })
             .collect();
         let mut components:Vec<_>=self.peers.values().filter(|p|!p.role.is_empty()).map(|p|json!({"component_id":p.id.to_string(),"component_generation":p.generation,"role":p.role,"scene_revision":p.revision.to_string(),"node_count":p.nodes.len(),"root":{"logical_size":p.root.logical,"size_m":p.root.size,"position_m":p.root.position}})).collect();
-        if let Some((_, role, component)) = &self.active_peer {
+        if let Some((_, role, component, _)) = &self.active_peer {
             if !role.is_empty() {
                 components.push(component.clone());
             }
@@ -329,30 +361,39 @@ impl Desktop {
         self.forward_request(origin, request, "SurfaceInput", payload)
     }
     fn broadcast(&self, kind: &str, payload: Value) {
-        if let Some((id, role, _)) = &self.active_peer {
-            if !role.is_empty() {
+        if let Some((id, role, _, capabilities)) = &self.active_peer {
+            if !role.is_empty() && accepts_event(capabilities, kind) {
                 self.outbox
                     .borrow_mut()
                     .push((*id, kind.into(), payload.clone()));
             }
         }
         for p in self.peers.values().filter(|p| !p.role.is_empty()) {
-            let _ = p.send(&self.session, kind, "0", payload.clone());
+            let _ = p.send_event(&self.session, kind, payload.clone());
         }
     }
     fn to_role(&self, role: &str, kind: &str, payload: Value) -> Result<()> {
         let mut found = false;
+        let mut delivered = false;
         for p in self.peers.values().filter(|p| p.role == role) {
-            p.send(&self.session, kind, "0", payload.clone())?;
             found = true;
+            delivered |= p.send_event(&self.session, kind, payload.clone())?;
         }
-        if let Some((id, active_role, _)) = &self.active_peer {
+        if let Some((id, active_role, _, capabilities)) = &self.active_peer {
             if role == active_role {
-                self.outbox.borrow_mut().push((*id, kind.into(), payload));
                 found = true;
+                if accepts_event(capabilities, kind) {
+                    self.outbox.borrow_mut().push((*id, kind.into(), payload));
+                    delivered = true;
+                }
             }
         }
         ensure!(found, "{role} service unavailable");
+        ensure!(
+            delivered,
+            "missing_capability: {role} has no receiver for {}",
+            message_capability(kind)
+        );
         Ok(())
     }
     pub fn tick(&mut self) -> Result<()> {
@@ -394,13 +435,14 @@ impl Desktop {
                             peer.id,
                             peer.role.clone(),
                             json!({"component_id":peer.id.to_string(),"component_generation":peer.generation,"role":peer.role,"scene_revision":peer.revision.to_string(),"node_count":peer.nodes.len(),"root":{"logical_size":peer.root.logical,"size_m":peer.root.size,"position_m":peer.root.position}}),
+                            peer.capabilities.clone(),
                         ));
                         let handled = self.handle(&mut peer, packet);
                         self.active_peer = None;
                         let queued = std::mem::take(&mut *self.outbox.borrow_mut());
                         for (target, kind, payload) in queued {
                             if target == peer.id {
-                                if peer.send(&self.session, &kind, "0", payload).is_err() {
+                                if peer.send_event(&self.session, &kind, payload).is_err() {
                                     live = false;
                                 }
                             }
@@ -579,20 +621,7 @@ impl Desktop {
             kind == "ShmBufferCommit" || packet.fds.is_empty(),
             "non-shm message carries FDs"
         );
-        let capability = match kind {
-            "GetSnapshot" => "snapshot.v1",
-            "GetScene" | "GetLayout" | "DebugInput" => "debug.v1",
-            "SceneTransaction" => "scene.v1",
-            "WindowState" | "WindowRemoved" => "snapshot.v1",
-            "ShmBufferCommit" => "shm.v1",
-            "FocusApplied" => "focus.v1",
-            "WindowIntent" | "RequestResult" => "window.v1",
-            "ComponentIntent" => "system.v1",
-            "WorkspaceIntent" => "workspace.v1",
-            "ClipboardSet" | "ClipboardChanged" | "GetClipboard" => "clipboard.v1",
-            "SystemState" | "TextCommit" | "KeyIntent" => "system.v1",
-            _ => "core.v1",
-        };
+        let capability = message_capability(kind);
         ensure!(
             p.capabilities.iter().any(|c| c == capability),
             "missing_capability: {capability}"
@@ -1223,7 +1252,7 @@ impl Desktop {
             && self
                 .active_peer
                 .as_ref()
-                .is_none_or(|(_, r, _)| r != "window_server")
+                .is_none_or(|(_, r, _, _)| r != "window_server")
         {
             self.focus_applied = true;
             Ok(())
@@ -1398,8 +1427,9 @@ impl Desktop {
             "1"
         };
         let wire_source = source.split(':').next().unwrap_or(source);
-        p.send(&self.session,"InputEvent","0",json!({"event_id":self.event.to_string(),"pointer_id":pointer,"interaction_id":interaction,"capture_id":capture,"source":wire_source,"phase":phase,"target_node_id":node,"action_id":n.action_id,"local_x":local[0],"local_y":local[1],"value":value,"event_time_ns":monotonic().to_string(),"focus_epoch":self.focus_epoch.to_string()}))?;
-        self.count("input_events");
+        if p.send_event(&self.session,"InputEvent",json!({"event_id":self.event.to_string(),"pointer_id":pointer,"interaction_id":interaction,"capture_id":capture,"source":wire_source,"phase":phase,"target_node_id":node,"action_id":n.action_id,"local_x":local[0],"local_y":local[1],"value":value,"event_time_ns":monotonic().to_string(),"focus_epoch":self.focus_epoch.to_string()}))? {
+            self.count("input_events");
+        }
         Ok(())
     }
     fn debug_input(&mut self, payload: &Value) -> Result<()> {
