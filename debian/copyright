@@ -1,0 +1,12 @@
+Format: https://www.debian.org/doc/packaging-manuals/copyright-format/1.0/
+Upstream-Name: xr-shell
+
+Files: *
+Copyright: Project contributors; see Git history and individual source notices
+License: GPL-3.0-or-later
+ On Debian systems the complete license text is available at
+ /usr/share/common-licenses/GPL-3.
+
+Comment: Cargo dependencies retain their upstream licenses. Their source
+ distributions are prepared as separately checksummed build inputs.
+ Environment artwork is supplied by an independent environment package.

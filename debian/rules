@@ -1,0 +1,13 @@
+#!/usr/bin/make -f
+
+%:
+	dh $@ --buildsystem=none
+
+override_dh_auto_build:
+	CARGO_TARGET_DIR="$(CURDIR)/target" cargo build --offline --locked --release
+
+override_dh_auto_test:
+	@echo "OpenXR rendering acceptance is performed in the development guest."
+
+override_dh_auto_clean:
+	CARGO_TARGET_DIR="$(CURDIR)/target" cargo clean
