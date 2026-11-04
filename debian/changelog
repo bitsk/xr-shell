@@ -1,3 +1,9 @@
+xr-shell (0.2.8) unstable; urgency=medium
+
+  * Match optical glass to the current control-library board reference.
+
+ -- bits <bigbits@hackx.cc>  Wed, 04 Nov 2026 21:21:14 +0800
+
 xr-shell (0.2.7) unstable; urgency=medium
 
   * Align the optical glass tint with measured Qingkong reference samples.

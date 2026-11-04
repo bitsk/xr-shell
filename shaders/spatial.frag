@@ -42,7 +42,7 @@ void main(){
   pixel.rgb=linear_colour(mix(display_colour(pixel.rgb),vec3(1),spec));
   // Cool optical glaze, measured against the Qingkong reference over its sky.
   // Text, application icons and client content use other material branches.
-  pixel.rgb=linear_colour(clamp(display_colour(pixel.rgb)+vec3(-.018,-.003,.028),0.,1.));
+  pixel.rgb=linear_colour(clamp(display_colour(pixel.rgb)+vec3(.020,.020,.028),0.,1.));
  }
  if(material==3.&&pixel.a>.01){
   float bevel=(1.-smoothstep(0.,3.,abs(distance)))*.12;
