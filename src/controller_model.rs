@@ -101,7 +101,7 @@ impl Model {
         buffer.write(bytes(&mesh.vertices))?;
         m.vertices = Some(buffer);
         // Two crossing thin surfaces keep the beam visible from either eye.
-        let mut beam = Vec::new();
+        let mut beam: Vec<[f32; 8]> = Vec::new();
         for axis in 0..2 {
             let near = if axis == 0 {
                 [0.0008, 0., 0.]
