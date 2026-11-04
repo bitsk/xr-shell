@@ -1,3 +1,10 @@
+xr-shell (0.2.7) unstable; urgency=medium
+
+  * Align the optical glass tint with measured Qingkong reference samples.
+  * Report the actual directional rim strengths in layout diagnostics.
+
+ -- bits <bigbits@hackx.cc>  Wed, 04 Nov 2026 21:00:08 +0800
+
 xr-shell (0.2.6) unstable; urgency=medium
 
   * Render typography with real Pango metrics, tabular digits and 2x vector sampling.
