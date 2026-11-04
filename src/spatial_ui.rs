@@ -219,7 +219,7 @@ impl Desktop {
     }
     pub(super) fn companion_frame(&self, k: &str, kind: &str) -> Option<Frame> {
         let w = self.windows.get(k)?;
-        if !self.visible_window(w) || w.state["role"].as_str().is_some_and(|r| r != "toplevel") {
+        if !self.visible_window(w) || !w.has_window_controls() {
             return None;
         }
         let frame = self.window_frame(k, 0)?;

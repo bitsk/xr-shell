@@ -1,3 +1,10 @@
+xr-shell (0.2.15) unstable; urgency=medium
+
+  * Render companion controls for classified Xwayland application windows.
+  * Focus newly mapped X11 application windows without decorating popups.
+
+ -- bits <bigbits@hackx.cc>  Thu, 05 Nov 2026 02:59:23 +0800
+
 xr-shell (0.2.14) unstable; urgency=medium
 
   * Recenter the desktop with a one-second hold of either A081 Home button.

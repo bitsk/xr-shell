@@ -291,3 +291,10 @@ Recenter requires valid headset position and orientation, creates a Shell-local
 reference space, clears pointer captures and resets the taskbar anchor while
 retaining its fixed/follow mode. Sensor state and other applications' runtime
 origins are unaffected. Missing controller sockets disable this shortcut.
+
+Xwayland application windows receive the same external grab, menu, close,
+minimize, curve and resize controls as native Wayland toplevels. The window
+service (0.1.8 or later) supplies `window_controls` from X11 window type,
+override-redirect and transient metadata; menus, tooltips and splash surfaces
+remain undecorated. Mapping an eligible application also acknowledges its
+spatial focus through the normal window-service path.

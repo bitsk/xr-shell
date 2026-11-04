@@ -109,6 +109,15 @@ struct Window {
     minimized: bool,
     curved: bool,
 }
+impl Window {
+    fn has_window_controls(&self) -> bool {
+        match self.state["role"].as_str() {
+            None | Some("toplevel") => true,
+            Some("xwayland") => self.state["window_controls"] == true,
+            _ => false,
+        }
+    }
+}
 #[derive(Clone)]
 enum Target {
     Node(u64, String),
@@ -931,9 +940,7 @@ impl Desktop {
                 }
                 if !was_mapped
                     && self.windows[&k].state["mapped"] == true
-                    && self.windows[&k].state["role"]
-                        .as_str()
-                        .is_none_or(|r| r == "toplevel")
+                    && self.windows[&k].has_window_controls()
                     && self.windows[&k].state["workspace"] == self.workspace
                 {
                     self.set_focus(Some(k.clone()))?;
