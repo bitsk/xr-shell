@@ -9,7 +9,7 @@ Rules-Requires-Root: no
 Package: xr-shell
 Architecture: any
 Depends: ${shlibs:Depends}, ${misc:Depends}, libvulkan1
-Recommends: xr-environment-qingkong, xr-spatial-style-ukui (>= 0.2.2)
+Recommends: xr-environment-qingkong, xr-spatial-style-ukui (>= 0.2.3)
 Description: Rust OpenXR panorama shell for UKUI XR
  Renders a versioned panoramic environment through an OpenXR Vulkan stereo
  session. A separately configured OpenXR loader and runtime are required;
