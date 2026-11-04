@@ -834,7 +834,7 @@ impl Canvas {
                 "wired",
                 "audio",
                 "audio-muted",
-                "settings",
+                "status-settings",
                 "weather-unavailable",
                 "close",
                 "minimize",
@@ -923,7 +923,7 @@ impl Canvas {
                         cairo_stroke(c);
                     }
                 }
-                "settings" => {
+                "status-settings" => {
                     for i in 0..32 {
                         let a = i as f64 * std::f64::consts::TAU / 32.;
                         let r = if i % 4 == 0 || i % 4 == 3 { 12.5 } else { 10. };
