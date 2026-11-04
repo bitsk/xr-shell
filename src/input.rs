@@ -143,6 +143,14 @@ impl Input {
                     bindings.push(xr::Binding::new(&menu, instance.string_to_path(&path)?));
                 }
                 if profile == "/interaction_profiles/oculus/touch_controller" {
+                    let select_path = format!(
+                        "/user/hand/{hand}/input/{}/click",
+                        if hand == "left" { "x" } else { "a" }
+                    );
+                    bindings.push(xr::Binding::new(
+                        &select,
+                        instance.string_to_path(&select_path)?,
+                    ));
                     let squeeze_path = format!("/user/hand/{hand}/input/squeeze/value");
                     bindings.push(xr::Binding::new(
                         &squeeze,
