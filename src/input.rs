@@ -358,6 +358,13 @@ impl Input {
         self.require_release[hand] = true;
     }
 
+    pub fn cancel_for_recenter(&mut self, desktop: &mut Desktop) {
+        for hand in 0..2 {
+            self.cancel_hand(hand, desktop, "desktop recentered");
+        }
+        self.last_hand = None;
+    }
+
     pub fn update(
         &mut self,
         session: &xr::Session<xr::Vulkan>,

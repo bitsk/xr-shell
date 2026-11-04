@@ -275,3 +275,19 @@ UI animation in the same frame, and captures include the world endpoint and
 distance. DebugInput `ray_probe` performs a read-only hit query when debug input
 is enabled. This changes presentation only; device aim/grip parameters remain
 owned by the runtime.
+
+## Controller Home recenter
+
+On A081, hold Home on either controller for one second to bring the desktop
+center and horizontal heading to the current headset position and gaze. Floor
+height and head pitch remain unchanged. Each hold fires once; release Home
+before the next hold. A short press does not recenter. Focus loss, stale input,
+producer restart or disconnection cancels the hold and requires a fresh release.
+
+The Shell subscribes read-only to the existing `A081_CONTROLLER_POSE_SOCKET`
+wire-v2 stream owned by qiyu-controller-tracking because SteamVR reserves the
+system button. It reads fresh valid controls independently of controller pose.
+Recenter requires valid headset position and orientation, creates a Shell-local
+reference space, clears pointer captures and resets the taskbar anchor while
+retaining its fixed/follow mode. Sensor state and other applications' runtime
+origins are unaffected. Missing controller sockets disable this shortcut.

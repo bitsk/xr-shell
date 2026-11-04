@@ -1778,6 +1778,13 @@ impl Desktop {
         }
         Ok(())
     }
+    pub fn recenter_taskbar(&mut self) {
+        let follow = self.taskbar_follow.mode() == "follow";
+        self.taskbar_follow = crate::taskbar_follow::TaskbarFollow::default();
+        self.taskbar_follow.set_mode(follow);
+        self.dirty = true;
+    }
+
     pub fn set_ui_anchor(&mut self, offset: Option<[f32; 3]>) {
         self.ui_anchor_ready = offset.is_some();
         self.ui_offset = offset.unwrap_or([0.; 3]);

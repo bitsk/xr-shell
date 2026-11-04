@@ -4,8 +4,10 @@ mod controller_model;
 mod desktop;
 mod environment;
 mod gpu;
+mod home;
 mod input;
 mod raster;
+mod recenter;
 mod renderer;
 mod spatial;
 mod taskbar_follow;
@@ -236,6 +238,7 @@ struct Summary {
     session_states: Vec<String>,
     elapsed_seconds: f64,
     reference_space: Option<String>,
+    home_recenter_count: u64,
     initialization_stage: Option<&'static str>,
     ui_anchor: ui_anchor::UiAnchor,
     cleanup: Cleanup,
@@ -452,6 +455,8 @@ fn frame_loop(
     desktop: &mut Option<desktop::Desktop>,
     input: &mut Option<input::Input>,
 ) -> Result<()> {
+    let mut home = home::Home::new();
+    let mut centered_space = None;
     let mut events = xr::EventDataBuffer::new();
     let mut running = false;
     let mut started = None::<Instant>;
@@ -460,6 +465,9 @@ fn frame_loop(
             match event {
                 xr::Event::SessionStateChanged(e) => {
                     let state = e.state();
+                    if state != xr::SessionState::FOCUSED {
+                        home.cancel();
+                    }
                     println!("XR_SESSION_STATE={state:?}");
                     summary.session_states.push(format!("{state:?}"));
                     if let Some(d) = desktop {
@@ -513,6 +521,8 @@ fn frame_loop(
         // Clear visibility even while the runtime suspends scene rendering.
         renderer.update_controllers(&[input::HandState::default(); 2]);
         renderer.update_ray_feedback([None; 2]);
+        let recenter_requested =
+            home.poll(state.should_render && desktop.as_ref().is_some_and(|d| d.focused));
         if !state.should_render {
             stream.end(
                 state.predicted_display_time,
@@ -521,6 +531,43 @@ fn frame_loop(
             )?;
             continue;
         }
+        if recenter_requested {
+            let (flags, views) =
+                session.locate_views(VIEW_TYPE, state.predicted_display_time, space)?;
+            if let Some(pose) = recenter::pose(flags, &views) {
+                let kind = if summary.reference_space.as_deref() == Some("STAGE") {
+                    xr::ReferenceSpaceType::STAGE
+                } else {
+                    xr::ReferenceSpaceType::LOCAL
+                };
+                match session.create_reference_space(kind, pose) {
+                    Ok(new_space) => {
+                        centered_space = Some(new_space);
+                        summary.home_recenter_count += 1;
+                        summary.ui_anchor = ui_anchor::UiAnchor::new(options.ui_anchor);
+                        renderer.set_ui_anchor(summary.ui_anchor.offset());
+                        if let Some(d) = desktop.as_mut() {
+                            d.recenter_taskbar();
+                            d.set_ui_anchor(summary.ui_anchor.offset());
+                            if let Some(i) = input.as_mut() {
+                                i.cancel_for_recenter(d);
+                            }
+                        }
+                        eprintln!(
+                            "XR_HOME_RECENTER=applied X={} Z={} YAW_QUAT_Y={} YAW_QUAT_W={}",
+                            pose.position.x,
+                            pose.position.z,
+                            pose.orientation.y,
+                            pose.orientation.w
+                        );
+                    }
+                    Err(error) => eprintln!("XR_HOME_RECENTER=failed {error:?}"),
+                }
+            } else {
+                eprintln!("XR_HOME_RECENTER=rejected REASON=invalid_head_pose");
+            }
+        }
+        let space = centered_space.as_ref().unwrap_or(space);
         let (flags, views) =
             session.locate_views(VIEW_TYPE, state.predicted_display_time, space)?;
         summary

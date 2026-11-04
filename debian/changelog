@@ -1,3 +1,10 @@
+xr-shell (0.2.14) unstable; urgency=medium
+
+  * Recenter the desktop with a one-second hold of either A081 Home button.
+  * Keep floor height and taskbar mode, cancel captures and stale holds.
+
+ -- bits <bigbits@hackx.cc>  Thu, 05 Nov 2026 01:25:10 +0800
+
 xr-shell (0.2.13) unstable; urgency=medium
 
   * Draw controller rays to the same surface hit used for interaction.
