@@ -4,8 +4,16 @@
 use anyhow::{Result, ensure};
 use std::ffi::{c_char, c_double, c_int, c_void};
 use xr_shell_protocols::Node;
-use xr_spatial_kit::Theme;
+use xr_spatial_kit::{TextStyle, Theme};
 type Ptr = *mut c_void;
+#[repr(C)]
+#[derive(Default)]
+struct TextRectangle {
+    x: c_int,
+    y: c_int,
+    width: c_int,
+    height: c_int,
+}
 #[link(name = "libcairo.so.2", kind = "dylib", modifiers = "+verbatim")]
 unsafe extern "C" {
     fn cairo_image_surface_create(format: c_int, width: c_int, height: c_int) -> Ptr;
@@ -76,6 +84,17 @@ unsafe extern "C" {
     fn pango_layout_set_text(layout: Ptr, text: *const c_char, length: c_int);
     fn pango_layout_set_width(layout: Ptr, width: c_int);
     fn pango_layout_set_alignment(layout: Ptr, alignment: c_int);
+    fn pango_layout_get_pixel_extents(
+        layout: Ptr,
+        ink: *mut TextRectangle,
+        logical: *mut TextRectangle,
+    );
+    fn pango_layout_set_single_paragraph_mode(layout: Ptr, single: c_int);
+    fn pango_layout_set_attributes(layout: Ptr, attrs: Ptr);
+    fn pango_attr_list_new() -> Ptr;
+    fn pango_attr_font_features_new(features: *const c_char) -> Ptr;
+    fn pango_attr_list_insert(list: Ptr, attr: Ptr);
+    fn pango_attr_list_unref(list: Ptr);
     fn pango_font_description_set_weight(desc: Ptr, weight: c_int);
     fn pango_layout_set_height(layout: Ptr, height: c_int);
     fn pango_layout_set_ellipsize(layout: Ptr, mode: c_int);
@@ -98,7 +117,7 @@ pub struct Canvas {
 impl Canvas {
     pub fn for_logical(w: u32, h: u32) -> Result<Self> {
         ensure!(w > 0 && h > 0, "invalid logical canvas size");
-        let scale = (2048. / w.max(h) as f64).min(1.);
+        let scale = (2048. / w.max(h) as f64).min(2.);
         let canvas = Self::new(
             (w as f64 * scale).round().max(1.) as u32,
             (h as f64 * scale).round().max(1.) as u32,
@@ -179,23 +198,88 @@ impl Canvas {
         weight: i32,
         center: bool,
     ) {
+        self.layout_text(
+            rect,
+            text,
+            colour,
+            size,
+            weight,
+            center,
+            "Noto Sans CJK SC, Noto Sans, sans-serif",
+            false,
+        );
+    }
+    pub fn text_token(
+        &self,
+        rect: [f32; 4],
+        text: &str,
+        colour: [f32; 4],
+        theme: &Theme,
+        name: &str,
+        center: bool,
+    ) {
+        let fallback = TextStyle {
+            size: theme.font_size,
+            weight: 500,
+            tabular_numbers: false,
+        };
+        let style = theme.typography.get(name).unwrap_or(&fallback);
+        self.layout_text(
+            rect,
+            text,
+            colour,
+            style.size,
+            style.weight as i32,
+            center,
+            &theme.font_families.join(", "),
+            style.tabular_numbers,
+        );
+    }
+    fn layout_text(
+        &self,
+        rect: [f32; 4],
+        text: &str,
+        colour: [f32; 4],
+        size: f32,
+        weight: i32,
+        center: bool,
+        family: &str,
+        tabular: bool,
+    ) {
         unsafe {
             let text = text.replace('\0', " ");
             let c = self.cr;
             let layout = pango_cairo_create_layout(c);
-            let desc = pango_font_description_from_string(c"Noto Sans CJK SC, sans".as_ptr());
+            let family = std::ffi::CString::new(family.replace('\0', " ")).unwrap();
+            let desc = pango_font_description_from_string(family.as_ptr());
             pango_font_description_set_absolute_size(desc, size as f64 * 1024.);
             pango_font_description_set_weight(desc, weight);
             pango_layout_set_font_description(layout, desc);
             pango_layout_set_alignment(layout, if center { 1 } else { 0 });
             pango_layout_set_text(layout, text.as_ptr() as _, text.len() as _);
             pango_layout_set_width(layout, (rect[2] * 1024.) as _);
-            pango_layout_set_height(layout, (rect[3] * 1024.) as _);
+            pango_layout_set_single_paragraph_mode(layout, 1);
+            pango_layout_set_height(layout, -1);
             pango_layout_set_ellipsize(layout, 3);
+            if tabular {
+                let attrs = pango_attr_list_new();
+                pango_attr_list_insert(
+                    attrs,
+                    pango_attr_font_features_new(c"tnum=1,lnum=1".as_ptr()),
+                );
+                pango_layout_set_attributes(layout, attrs);
+                pango_attr_list_unref(attrs);
+            }
+            let mut logical = TextRectangle::default();
+            pango_layout_get_pixel_extents(layout, std::ptr::null_mut(), &mut logical);
             cairo_save(c);
             cairo_rectangle(c, rect[0] as _, rect[1] as _, rect[2] as _, rect[3] as _);
             cairo_clip(c);
-            cairo_move_to(c, rect[0] as _, rect[1] as _);
+            cairo_move_to(
+                c,
+                rect[0] as _,
+                (rect[1] + (rect[3] - logical.height as f32) / 2. - logical.y as f32) as _,
+            );
             cairo_set_source_rgba(
                 c,
                 colour[0] as _,
@@ -482,12 +566,12 @@ pub fn paint_node(
                 canvas.skin(
                     rect,
                     if capsule {
-                        "island-applications"
+                        "capsule-normal"
                     } else {
                         "panel-normal"
                     },
                     radius,
-                    0.4,
+                    if capsule { 0.32 } else { 0.4 },
                 );
             }
         }
@@ -528,7 +612,15 @@ pub fn paint_node(
                 canvas.skin(rect, skin, radius, if active { 0.12 } else { 0.35 });
             }
             let has_icon = !node.icon_id.is_empty();
-            let icon_size = (h - 12.).min(if app_icon { 44. } else { 32. }).max(16.);
+            let icon_size = (h - 8.)
+                .min(if app_icon {
+                    48.
+                } else if status_icon {
+                    36.
+                } else {
+                    32.
+                })
+                .max(16.);
             let icon_x = if node.text.is_empty() {
                 x + (w - icon_size) / 2.
             } else {
@@ -548,21 +640,16 @@ pub fn paint_node(
                 10.
             };
             if !node.text.is_empty() {
-                canvas.text_styled(
+                canvas.text_token(
                     if key {
                         [x + 4., y + (h - 31.).max(0.) * 0.30, w - 8., h.min(36.)]
                     } else {
-                        [
-                            x + left,
-                            y + (h - 31.).max(0.) / 2.,
-                            (w - left - 8.).max(1.),
-                            h.min(38.),
-                        ]
+                        [x + left, y, (w - left - 8.).max(1.), h]
                     },
                     &node.text,
                     if active { [1.; 4] } else { ink },
-                    if key { 26. } else { 25.3 },
-                    600,
+                    theme,
+                    if key { "key" } else { "button" },
                     key,
                 );
             }
@@ -591,14 +678,12 @@ pub fn paint_node(
             );
         }
         "Text" => {
-            let (size, weight) = match node.style_id.as_str() {
-                "taskbar.clock" => (32., 500),
-                "taskbar.caption" => (16., 400),
-                "taskbar.status" => (20., 500),
-                _ if node.node_id.contains("title") => (28., 400),
-                _ => (22., 400),
+            let token = match node.style_id.as_str() {
+                s if s.starts_with("taskbar.") => s,
+                _ if node.node_id.contains("title") => "title",
+                _ => "body",
             };
-            canvas.text_styled(
+            canvas.text_token(
                 rect,
                 &node.text,
                 if ["text.secondary", "taskbar.caption"].contains(&node.style_id.as_str()) {
@@ -606,8 +691,8 @@ pub fn paint_node(
                 } else {
                     primary
                 },
-                size,
-                weight,
+                theme,
+                token,
                 false,
             );
         }
@@ -732,7 +817,182 @@ fn icon_path(name: &str) -> Option<std::path::PathBuf> {
     found
 }
 impl Canvas {
+    /// Shared optical-size vectors for small spatial chrome and status controls.
+    /// These remain independent of application artwork and font fallback glyphs.
+    pub fn symbolic(&self, rect: [f32; 4], id: &str, ink: [f32; 4]) -> bool {
+        let Some(name) = id.strip_prefix("ukui-xr-") else {
+            return false;
+        };
+        let battery = name
+            .strip_prefix("battery-")
+            .and_then(|n| n.parse::<u8>().ok());
+        if battery.is_none()
+            && ![
+                "launcher",
+                "network",
+                "network-offline",
+                "wired",
+                "audio",
+                "audio-muted",
+                "settings",
+                "weather-unavailable",
+                "close",
+                "minimize",
+                "curve",
+                "more",
+                "battery-unknown",
+            ]
+            .contains(&name)
+        {
+            return false;
+        }
+        unsafe {
+            let c = self.cr;
+            cairo_save(c);
+            cairo_translate(c, rect[0] as _, rect[1] as _);
+            cairo_scale(c, rect[2] as f64 / 32., rect[3] as f64 / 32.);
+            cairo_set_source_rgba(c, ink[0] as _, ink[1] as _, ink[2] as _, ink[3] as _);
+            cairo_set_line_width(c, 2.1);
+            cairo_set_line_cap(c, 1);
+            cairo_new_path(c);
+            match name {
+                "launcher" | "more" => {
+                    let ys: &[f64] = if name == "more" {
+                        &[16.]
+                    } else {
+                        &[8., 16., 24.]
+                    };
+                    for y in ys {
+                        for x in [8., 16., 24.] {
+                            cairo_new_path(c);
+                            cairo_arc(c, x, *y, 1.9, 0., std::f64::consts::TAU);
+                            cairo_fill(c);
+                        }
+                    }
+                }
+                "network" | "network-offline" => {
+                    for r in [7., 13., 19.] {
+                        cairo_new_path(c);
+                        cairo_arc(
+                            c,
+                            16.,
+                            27.,
+                            r,
+                            -3. * std::f64::consts::FRAC_PI_4,
+                            -std::f64::consts::FRAC_PI_4,
+                        );
+                        cairo_stroke(c);
+                    }
+                    cairo_arc(c, 16., 27., 1.7, 0., std::f64::consts::TAU);
+                    cairo_fill(c);
+                    if name.ends_with("offline") {
+                        cairo_move_to(c, 4., 5.);
+                        cairo_line_to(c, 28., 29.);
+                        cairo_stroke(c);
+                    }
+                }
+                "wired" => {
+                    self.rounded_path([4., 5., 24., 17.], 2.);
+                    cairo_stroke(c);
+                    cairo_move_to(c, 16., 22.);
+                    cairo_line_to(c, 16., 28.);
+                    cairo_move_to(c, 10., 28.);
+                    cairo_line_to(c, 22., 28.);
+                    cairo_stroke(c);
+                }
+                "audio" | "audio-muted" => {
+                    cairo_move_to(c, 4., 12.);
+                    cairo_line_to(c, 10., 12.);
+                    cairo_line_to(c, 17., 6.);
+                    cairo_line_to(c, 17., 26.);
+                    cairo_line_to(c, 10., 20.);
+                    cairo_line_to(c, 4., 20.);
+                    cairo_close_path(c);
+                    cairo_fill(c);
+                    if name == "audio" {
+                        for r in [6., 11.] {
+                            cairo_new_path(c);
+                            cairo_arc(c, 17., 16., r, -0.8, 0.8);
+                            cairo_stroke(c);
+                        }
+                    } else {
+                        cairo_move_to(c, 23., 12.);
+                        cairo_line_to(c, 29., 20.);
+                        cairo_move_to(c, 29., 12.);
+                        cairo_line_to(c, 23., 20.);
+                        cairo_stroke(c);
+                    }
+                }
+                "settings" => {
+                    for i in 0..32 {
+                        let a = i as f64 * std::f64::consts::TAU / 32.;
+                        let r = if i % 4 == 0 || i % 4 == 3 { 12.5 } else { 10. };
+                        let (x, y) = (16. + r * a.cos(), 16. + r * a.sin());
+                        if i == 0 {
+                            cairo_move_to(c, x, y);
+                        } else {
+                            cairo_line_to(c, x, y);
+                        }
+                    }
+                    cairo_close_path(c);
+                    cairo_stroke(c);
+                    cairo_arc(c, 16., 16., 4.4, 0., std::f64::consts::TAU);
+                    cairo_stroke(c);
+                }
+                "weather-unavailable" => {
+                    cairo_move_to(c, 8., 24.);
+                    cairo_curve_to(c, 0., 24., 1., 14., 8., 14.);
+                    cairo_curve_to(c, 8., 3., 25., 3., 25., 15.);
+                    cairo_curve_to(c, 33., 15., 32., 24., 25., 24.);
+                    cairo_line_to(c, 8., 24.);
+                    cairo_stroke(c);
+                    cairo_move_to(c, 12., 28.);
+                    cairo_line_to(c, 21., 28.);
+                    cairo_stroke(c);
+                }
+                "close" => {
+                    cairo_move_to(c, 10., 10.);
+                    cairo_line_to(c, 22., 22.);
+                    cairo_move_to(c, 22., 10.);
+                    cairo_line_to(c, 10., 22.);
+                    cairo_stroke(c);
+                }
+                "minimize" => {
+                    cairo_move_to(c, 9., 17.);
+                    cairo_line_to(c, 23., 17.);
+                    cairo_stroke(c);
+                }
+                "curve" => {
+                    cairo_move_to(c, 8., 8.);
+                    cairo_curve_to(c, 13., 11., 19., 11., 24., 8.);
+                    cairo_line_to(c, 24., 24.);
+                    cairo_curve_to(c, 19., 21., 13., 21., 8., 24.);
+                    cairo_close_path(c);
+                    cairo_stroke(c);
+                }
+                _ => {
+                    self.rounded_path([2., 8., 26., 16.], 3.);
+                    cairo_stroke(c);
+                    cairo_move_to(c, 30., 13.);
+                    cairo_line_to(c, 30., 19.);
+                    cairo_stroke(c);
+                    if let Some(level) = battery {
+                        self.rounded(
+                            [5., 11., 20. * (level.min(100) as f32 / 100.), 10.],
+                            ink,
+                            1.,
+                        );
+                    }
+                }
+            }
+            cairo_restore(c);
+        }
+        true
+    }
     pub fn icon(&self, rect: [f32; 4], id: &str) -> bool {
+        if self.symbolic(rect, id, [35. / 255., 48. / 255., 71. / 255., 1.]) {
+            return true;
+        }
         if let Some(bitmap) = crate::art::icon(id) {
             self.bitmap(rect, bitmap, None, 1.);
             return true;

@@ -172,17 +172,17 @@ impl Desktop {
         let frame = self.window_frame(k, 0)?;
         let unit = frame.size[0] / frame.logical[0];
         let grabbed = self.companion_hover.as_deref() == Some(&format!("grab:{k}"));
-        let height = if grabbed { 16. } else { 12. };
-        let bar_width = frame.logical[0] * 0.35;
-        let bar_x = (frame.logical[0] - bar_width) / 2.;
-        // Each companion is an independent world-space surface, 4cm below content.
-        let y = frame.logical[1] + 0.04 / (frame.size[1] / frame.logical[1]) + 4.;
+        let height = if grabbed { 28. } else { 24. };
+        let bar_width = (frame.logical[0] * 0.24).clamp(144., 220.);
+        // Centre the complete companion group instead of the grab capsule alone.
+        let bar_x = (frame.logical[0] - bar_width - 168.) / 2. + 168.;
+        let y = frame.logical[1] + 32.;
         let rect = match kind {
             "grab" => [bar_x, y - height / 2., bar_width, height],
-            "orb" => [bar_x - 10. - 28., y - 14., 28., 28.],
-            "close" => [bar_x - 10. - 28. - 40., y - 14., 28., 28.],
-            "minimize" => [bar_x - 10. - 28. - 80., y - 14., 28., 28.],
-            "curve" => [bar_x - 10. - 28. - 120., y - 14., 28., 28.],
+            "orb" => [bar_x - 42., y - 16., 32., 32.],
+            "curve" => [bar_x - 84., y - 16., 32., 32.],
+            "minimize" => [bar_x - 126., y - 16., 32., 32.],
+            "close" => [bar_x - 168., y - 16., 32., 32.],
             "resize-left" => [-30., frame.logical[1] - 12., 24., 24.],
             "resize-right" => [frame.logical[0] + 6., frame.logical[1] - 12., 24., 24.],
             _ => return None,
@@ -290,7 +290,7 @@ impl Desktop {
                 frame,
                 source: Source::Window(k.clone()),
                 radius: 16.,
-                rim: 2.,
+                rim: 1.5,
                 border: 0.5,
                 material: 2.,
             });
@@ -306,11 +306,11 @@ impl Desktop {
                         radius: if kind == "grab" {
                             frame.logical[1] / 2.
                         } else {
-                            14.
+                            16.
                         },
-                        rim: if kind == "grab" { 0. } else { 1. },
+                        rim: 0.75,
                         border: 0.22,
-                        material: if kind == "grab" { 0. } else { 1. },
+                        material: 1.,
                     });
                 }
             }
@@ -328,7 +328,7 @@ impl Desktop {
                     });
                 }
             }
-            if self.expanded_orb.as_deref() == Some(k) {
+            if self.focus.as_deref() == Some(k) || self.expanded_orb.as_deref() == Some(k) {
                 for (kind, source) in [
                     ("close", Source::Close(k.clone())),
                     ("minimize", Source::Minimize(k.clone())),
@@ -339,8 +339,8 @@ impl Desktop {
                             id: format!("{kind}:{k}"),
                             frame,
                             source,
-                            radius: 14.,
-                            rim: 1.,
+                            radius: 16.,
+                            rim: 0.75,
                             border: 0.22,
                             material: 1.,
                         });
@@ -350,9 +350,7 @@ impl Desktop {
         }
         let mut decorated = Vec::with_capacity(out.len() * 2);
         for d in out {
-            if matches!(d.source, Source::Node(..) | Source::Window(..))
-                && [1., 2.].contains(&d.material)
-            {
+            if [1., 2.].contains(&d.material) {
                 let w = d.frame.logical[0];
                 let h = d.frame.logical[1];
                 decorated.push(Draw {
@@ -389,6 +387,10 @@ impl Desktop {
             let height = draw.frame.logical[1].round().max(1.) as u32;
             let canvas = if matches!(draw.source, Source::Shadow(_)) {
                 Canvas::new(1, 1)?
+            } else if matches!(draw.source, Source::Window(_)) {
+                // Application buffers retain native resolution; Shell vector
+                // controls and text use the separate supersampled path.
+                Canvas::new(width, height)?
             } else {
                 Canvas::for_logical(width, height)?
             };
@@ -415,12 +417,6 @@ impl Desktop {
                                 &w.pixels,
                                 16.,
                             );
-                            canvas.skin(
-                                [0., 0., width as f32, height as f32],
-                                "window-rim",
-                                16.,
-                                0.35,
-                            );
                         }
                     } else {
                         paint_node(
@@ -443,12 +439,6 @@ impl Desktop {
                         &w.pixels,
                         16.,
                     );
-                    canvas.skin(
-                        [0., 0., width as f32, height as f32],
-                        "window-rim",
-                        16.,
-                        0.35,
-                    );
                 }
                 Source::Grab(k) => {
                     let hover = self.companion_hover.as_deref() == Some(&format!("grab:{k}"));
@@ -459,19 +449,19 @@ impl Desktop {
                     );
                     canvas.skin(
                         [0., 0., width as f32, height as f32],
-                        "grab-base",
+                        "capsule-normal",
                         height as f32 / 2.,
                         0.5,
                     );
                     canvas.rounded(
                         [
-                            width as f32 * 0.3,
-                            (height as f32 - 3.) / 2.,
-                            width as f32 * 0.4,
-                            3.,
+                            width as f32 * 0.2,
+                            (height as f32 - 5.) / 2.,
+                            width as f32 * 0.6,
+                            5.,
                         ],
                         theme.colour("accent"),
-                        1.5,
+                        2.5,
                     );
                 }
                 Source::Resize(k, left) => {
@@ -495,30 +485,29 @@ impl Desktop {
                     };
                     let hover = self.companion_hover.as_deref() == Some(&id);
                     canvas.rounded(
-                        [0., 0., 28., 28.],
+                        [0., 0., width as f32, height as f32],
                         if hover {
                             [0.216, 0.565, 0.98, 1.]
                         } else {
                             theme.colour("card")
                         },
-                        14.,
+                        16.,
                     );
-                    let text = match source {
-                        Source::Orb(_) => "···",
-                        Source::Close(_) => "×",
-                        Source::Minimize(_) => "−",
-                        Source::Curve(_) => "⌒",
+                    let icon = match source {
+                        Source::Orb(_) => "ukui-xr-more",
+                        Source::Close(_) => "ukui-xr-close",
+                        Source::Minimize(_) => "ukui-xr-minimize",
+                        Source::Curve(_) => "ukui-xr-curve",
                         _ => "",
                     };
-                    canvas.text(
-                        [3., 1., 24., 27.],
-                        text,
+                    canvas.symbolic(
+                        [5., 5., 22., 22.],
+                        icon,
                         if hover {
                             [1.; 4]
                         } else {
                             theme.colour("foreground")
                         },
-                        20.,
                     );
                 }
             }

@@ -1,3 +1,10 @@
+xr-shell (0.2.6) unstable; urgency=medium
+
+  * Render typography with real Pango metrics, tabular digits and 2x vector sampling.
+  * Refine optical glass, monochrome status vectors and external window companions.
+
+ -- bits <bigbits@hackx.cc>  Wed, 04 Nov 2026 20:35:37 +0800
+
 xr-shell (0.2.5) unstable; urgency=medium
 
   * Add an opt-in UI origin frozen from actual valid stereo head positions.

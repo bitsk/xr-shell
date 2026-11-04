@@ -20,7 +20,7 @@ void main(){
  Item item=items[item_index];vec2 size=item.logical.xy;float material=item.centre.w;float radius=min(item.logical.z,min(size.x,size.y)*.5);
  if(material==4.){
   float distance=rounded((local_uv-.5)*size,max(vec2(1),size*.5-vec2(24)),radius);
-  float alpha=.22*(1.-smoothstep(-4.,24.,distance));if(alpha<.001)discard;
+  float alpha=.17*(1.-smoothstep(-4.,24.,distance));if(alpha<.001)discard;
   colour=vec4(linear_colour(vec3(35,60,96)/255.),alpha);return;
  }
  vec3 normal=normalize(world_normal),toward_eye=normalize(view.origin.xyz-world_position);
@@ -38,7 +38,7 @@ void main(){
   for(int x=-1;x<=1;x++)for(int y=-1;y<=1;y++)blurred+=texture(panorama,eq+refract_offset+vec2(x,y)*.003).rgb/9.;
   vec3 transmitted=blurred*vec3(.98,1.0,1.02);
   pixel.rgb=max(vec3(0),pixel.rgb+(transmitted-original)*((1.-pixel.a)/max(pixel.a,.01)));
-  float spec=mix(.14,.02,clamp((local_uv.x+local_uv.y)*.5,0.,1.));
+  float spec=mix(.10,.02,clamp((local_uv.x+local_uv.y)*.5,0.,1.));
   pixel.rgb=linear_colour(mix(display_colour(pixel.rgb),vec3(1),spec));
  }
  if(material==3.&&pixel.a>.01){
@@ -49,7 +49,7 @@ void main(){
  if(length(edge)>.001)edge_normal=normalize(edge)*sign(q);
  else edge_normal=abs(q.x)-size.x*.5>abs(q.y)-size.y*.5?vec2(sign(q.x),0):vec2(0,sign(q.y));
  float border=item.extra.x;
- if(material==1.)border=mix(.22,.68,clamp(-edge_normal.x-edge_normal.y,0.,1.));
+ if(material==1.)border=mix(.16,.50,clamp(-edge_normal.x-edge_normal.y,0.,1.));
  float rim=(1.-smoothstep(item.logical.w-aa,item.logical.w+aa,abs(distance)))*border;
  pixel.rgb=mix(pixel.rgb,vec3(1),rim);pixel.a=1.-(1.-pixel.a)*(1.-rim);
  colour=vec4(pixel.rgb,pixel.a*mask);
