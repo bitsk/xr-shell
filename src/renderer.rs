@@ -646,9 +646,10 @@ impl Renderer {
         serde_json::json!({
             "source": "OpenXR action grip/aim spaces at predicted display time",
             "model_to_grip_calibrated": false,
+            "model_binding_source": "Resource controller-anchors.json; model-only rotation, tracked grip and aim unchanged",
             "hands": self.controllers.iter().zip(&self.controller_states).enumerate().map(|(hand,(model,state))| {
                 let pose = |p: xr::Posef| serde_json::json!({"position_m":[p.position.x,p.position.y,p.position.z],"orientation_xyzw":[p.orientation.x,p.orientation.y,p.orientation.z,p.orientation.w]});
-                serde_json::json!({"hand":if hand==0 {"left"} else {"right"}, "loaded":model.is_some(), "directory":model.as_ref().map(|m|&m.directory), "visible":model.is_some() && state.grip.is_some(), "grip":state.grip.map(pose), "aim":state.aim.map(pose), "select":state.select,"trigger":state.trigger,"squeeze":state.squeeze,"menu":state.menu,"stick":state.stick})
+                serde_json::json!({"hand":if hand==0 {"left"} else {"right"}, "loaded":model.is_some(), "directory":model.as_ref().map(|m|&m.directory), "visible":model.is_some() && state.grip.is_some(), "grip":state.grip.map(pose), "aim":state.aim.map(pose), "source_binding_present":model.as_ref().is_some_and(|m|m.source_binding_present), "source_rotation_xyzw":model.as_ref().map(|m|{let q=m.source_rotation;[q.x,q.y,q.z,q.w]}), "model_pose":model.as_ref().and_then(|m|state.grip.map(|p|pose(m.model_pose(p)))), "select":state.select,"trigger":state.trigger,"squeeze":state.squeeze,"menu":state.menu,"stick":state.stick})
             }).collect::<Vec<_>>()
         })
     }

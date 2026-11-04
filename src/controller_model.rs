@@ -19,6 +19,76 @@ struct Mesh {
     vertices: Vec<[f32; 8]>,
 }
 
+#[derive(Deserialize)]
+struct ControllerAnchors {
+    schema: u32,
+    model_binding: Option<ModelBinding>,
+}
+#[derive(Deserialize)]
+struct ModelBinding {
+    rotation_xyzw: [f32; 4],
+}
+
+fn source_model_rotation(directory: &Path) -> Result<(xr::Quaternionf, bool)> {
+    let identity = xr::Quaternionf {
+        x: 0.,
+        y: 0.,
+        z: 0.,
+        w: 1.,
+    };
+    let path = directory
+        .parent()
+        .context("controller model has no resource root")?
+        .join("controller-anchors.json");
+    let bytes = match std::fs::read(&path) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            eprintln!(
+                "XR_CONTROLLER_MODEL_BINDING_LEGACY path={} reason=anchors_missing rotation=identity",
+                path.display()
+            );
+            return Ok((identity, false));
+        }
+        Err(error) => {
+            return Err(error)
+                .with_context(|| format!("read controller model binding {}", path.display()));
+        }
+    };
+    let anchors: ControllerAnchors =
+        serde_json::from_slice(&bytes).context("parse controller source anchors")?;
+    ensure!(anchors.schema == 1, "unsupported controller anchors schema");
+    let Some(binding) = anchors.model_binding else {
+        eprintln!(
+            "XR_CONTROLLER_MODEL_BINDING_LEGACY path={} reason=model_binding_missing rotation=identity",
+            path.display()
+        );
+        return Ok((identity, false));
+    };
+    let q = binding.rotation_xyzw;
+    ensure!(
+        q.iter().all(|v| v.is_finite()),
+        "source model rotation must be finite"
+    );
+    let norm: f32 = q.iter().map(|v| v * v).sum();
+    ensure!(
+        (norm - 1.).abs() <= 0.01,
+        "source model rotation must be normalized"
+    );
+    let scale = norm.sqrt().recip();
+    let rotation = xr::Quaternionf {
+        x: q[0] * scale,
+        y: q[1] * scale,
+        z: q[2] * scale,
+        w: q[3] * scale,
+    };
+    eprintln!(
+        "XR_CONTROLLER_MODEL_BINDING path={} rotation_xyzw={:?} scope=model_only",
+        path.display(),
+        [rotation.x, rotation.y, rotation.z, rotation.w]
+    );
+    Ok((rotation, true))
+}
+
 pub struct Model {
     gpu: Rc<Gpu>,
     vertices: Option<Buffer>,
@@ -37,10 +107,13 @@ pub struct Model {
     upload_fence: vk::Fence,
     modules: Vec<vk::ShaderModule>,
     pub directory: String,
+    pub source_rotation: xr::Quaternionf,
+    pub source_binding_present: bool,
 }
 
 impl Model {
     pub fn load(gpu: Rc<Gpu>, pass: vk::RenderPass, directory: &Path) -> Result<Self> {
+        let (source_rotation, source_binding_present) = source_model_rotation(directory)?;
         let mesh: Mesh = serde_json::from_reader(BufReader::new(std::fs::File::open(
             directory.join("mesh.json"),
         )?))?;
@@ -92,6 +165,8 @@ impl Model {
             upload_fence: vk::Fence::null(),
             modules: Vec::new(),
             directory: directory.display().to_string(),
+            source_rotation,
+            source_binding_present,
         };
         let buffer = Buffer::host(
             m.gpu.clone(),
@@ -407,6 +482,20 @@ impl Model {
         Ok(())
     }
 
+    /// The native source binding rotates only the artwork. The tracked origin
+    /// and the independently validated aim action remain untouched.
+    pub fn model_pose(&self, mut grip: xr::Posef) -> xr::Posef {
+        let q = grip.orientation;
+        let local = self.source_rotation;
+        grip.orientation = xr::Quaternionf {
+            x: q.w * local.x + q.x * local.w + q.y * local.z - q.z * local.y,
+            y: q.w * local.y - q.x * local.z + q.y * local.w + q.z * local.x,
+            z: q.w * local.z + q.x * local.y - q.y * local.x + q.z * local.w,
+            w: q.w * local.w - q.x * local.x - q.y * local.y - q.z * local.z,
+        };
+        grip
+    }
+
     pub unsafe fn draw(&self, cmd: vk::CommandBuffer, view: &xr::View, state: &HandState) {
         unsafe {
             let d = &self.gpu.device;
@@ -419,7 +508,10 @@ impl Model {
                 &[self.descriptor],
                 &[],
             );
-            for (pose, beam) in [(state.grip, false), (state.aim, true)] {
+            for (pose, beam) in [
+                (state.grip.map(|p| self.model_pose(p)), false),
+                (state.aim, true),
+            ] {
                 let Some(pose) = pose else {
                     continue;
                 };

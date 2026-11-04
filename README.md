@@ -249,7 +249,10 @@ motion, button mappings and grip/aim alignment require device acceptance.
 Separate device assets provide `left`/`right` `mesh.json` and `texture.png`
 under `/usr/share/xr/devices/a081/controllers` (or `XR_CONTROLLER_MODEL_DIR`).
 Shell renders these models at the runtime grip action and routes rays through
-the independent aim action. It adds no local pose correction. The A081 provider
+the independent aim action. A device package may provide its native
+`model_binding.rotation_xyzw` in `controller-anchors.json`; this rotates only
+the original model frame and is recorded alongside the unmodified grip/aim
+actions in captures. The A081 provider
 uses device-specific render-model components from the original system rather
 than inheriting another controller's grip/aim transforms. Source parameters
 are maintained by the runtime component owner.
