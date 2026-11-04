@@ -126,6 +126,83 @@ struct Cleanup {
     session_ended: bool,
     resources_destroyed: bool,
 }
+#[derive(Clone, Copy, Serialize)]
+struct ViewFlags {
+    raw_bits: u64,
+    orientation_valid: bool,
+    position_valid: bool,
+    orientation_tracked: bool,
+    position_tracked: bool,
+}
+impl From<xr::ViewStateFlags> for ViewFlags {
+    fn from(flags: xr::ViewStateFlags) -> Self {
+        Self {
+            raw_bits: flags.into_raw(),
+            orientation_valid: flags.contains(xr::ViewStateFlags::ORIENTATION_VALID),
+            position_valid: flags.contains(xr::ViewStateFlags::POSITION_VALID),
+            orientation_tracked: flags.contains(xr::ViewStateFlags::ORIENTATION_TRACKED),
+            position_tracked: flags.contains(xr::ViewStateFlags::POSITION_TRACKED),
+        }
+    }
+}
+#[derive(Default, Serialize)]
+struct ViewStateObservations {
+    located_frames: u64,
+    pose_valid_frames: u64,
+    pose_invalid_frames: u64,
+    orientation_valid_frames: u64,
+    orientation_invalid_frames: u64,
+    position_valid_frames: u64,
+    position_invalid_frames: u64,
+    orientation_tracked_frames: u64,
+    orientation_untracked_frames: u64,
+    position_tracked_frames: u64,
+    position_untracked_frames: u64,
+    finite_position_samples: u64,
+    position_non_finite_frames: u64,
+    first_valid_mean_eye_position_m: Option<[f32; 3]>,
+    last_valid_mean_eye_position_m: Option<[f32; 3]>,
+    first_valid_position_time_ns: Option<i64>,
+    last_valid_position_time_ns: Option<i64>,
+    last_flags: Option<ViewFlags>,
+}
+impl ViewStateObservations {
+    fn observe(&mut self, flags: xr::ViewStateFlags, views: &[xr::View], time: xr::Time) {
+        let flags = ViewFlags::from(flags);
+        self.located_frames += 1;
+        let valid = flags.orientation_valid && flags.position_valid;
+        self.pose_valid_frames += u64::from(valid);
+        self.pose_invalid_frames += u64::from(!valid);
+        self.orientation_valid_frames += u64::from(flags.orientation_valid);
+        self.orientation_invalid_frames += u64::from(!flags.orientation_valid);
+        self.position_valid_frames += u64::from(flags.position_valid);
+        self.position_invalid_frames += u64::from(!flags.position_valid);
+        self.orientation_tracked_frames += u64::from(flags.orientation_tracked);
+        self.orientation_untracked_frames += u64::from(!flags.orientation_tracked);
+        self.position_tracked_frames += u64::from(flags.position_tracked);
+        self.position_untracked_frames += u64::from(!flags.position_tracked);
+        self.last_flags = Some(flags);
+        // Record returned positions only when the runtime marks them valid.
+        // This observation never changes rendering, input or tracking gates.
+        if flags.position_valid && views.len() == 2 {
+            let a = views[0].pose.position;
+            let b = views[1].pose.position;
+            let mean = [(a.x + b.x) / 2., (a.y + b.y) / 2., (a.z + b.z) / 2.];
+            if [a.x, a.y, a.z, b.x, b.y, b.z].iter().all(|v| v.is_finite())
+                && mean.iter().all(|v| v.is_finite())
+            {
+                self.finite_position_samples += 1;
+                self.first_valid_mean_eye_position_m.get_or_insert(mean);
+                self.first_valid_position_time_ns
+                    .get_or_insert(time.as_nanos());
+                self.last_valid_mean_eye_position_m = Some(mean);
+                self.last_valid_position_time_ns = Some(time.as_nanos());
+            } else {
+                self.position_non_finite_frames += 1;
+            }
+        }
+    }
+}
 #[derive(Default, Serialize)]
 struct Summary {
     schema: u32,
@@ -141,6 +218,7 @@ struct Summary {
     frames: u64,
     waited_frames: u64,
     eye_submissions: [u64; 2],
+    view_state: ViewStateObservations,
     captures: Vec<String>,
     session_states: Vec<String>,
     elapsed_seconds: f64,
@@ -387,6 +465,9 @@ fn frame_loop(
         }
         let (flags, views) =
             session.locate_views(VIEW_TYPE, state.predicted_display_time, space)?;
+        summary
+            .view_state
+            .observe(flags, &views, state.predicted_display_time);
         if !flags.contains(xr::ViewStateFlags::ORIENTATION_VALID) {
             stream.end(
                 state.predicted_display_time,
@@ -472,6 +553,7 @@ fn frame_loop(
                 state.predicted_display_time.as_nanos(),
                 renderer,
                 &views,
+                flags,
                 indices,
                 pixels,
             )?;
@@ -517,6 +599,7 @@ fn write_capture(
     time: i64,
     renderer: &Renderer,
     views: &[xr::View],
+    flags: xr::ViewStateFlags,
     indices: [u32; 2],
     pixels: Vec<Option<Vec<u8>>>,
 ) -> Result<()> {
@@ -548,6 +631,7 @@ fn write_capture(
         &dir.join(format!("{tag}.json")),
         &json!({"schema":1,"tag":tag,"frame":frame,
         "predicted_display_time_ns":time,"projection_submitted":true,"view_count":2,
+        "view_state_flags": ViewFlags::from(flags),
         "pixels":"actual GPU swapchain readback after rendering","panorama_translation":"ignored", "eyes":eyes}),
     )
 }

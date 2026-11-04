@@ -91,6 +91,17 @@ It contains the frame/time, per-eye pose, FOV, swapchain, acquired image index,
 format and dimensions. Readback and PNG encoding are diagnostic work, so
 capture intervals must be excluded from steady-state performance measurements.
 
+`view_state_flags` preserves the actual `locate_views` raw bits plus separate
+orientation/position valid and tracked booleans. `summary.json` also contains
+`view_state`: valid/invalid and tracked/untracked counts cover every successful
+view location, including orientation-invalid frames skipped by the existing
+renderer. First/last mean eye positions and their predicted display times are
+recorded only from two finite returned eye positions with `POSITION_VALID`;
+they remain null when no such sample exists. These diagnostics neither adjust
+poses or UI anchors nor change rendering/input validity gates. A tracked flag
+is separate from a valid flag, and frame submission is separate from physical
+tracking and wearer acceptance.
+
 On normal completion, `summary.json` records runtime, GPU, asset hash, frames,
 per-eye submission counts, state transitions, validation counts and cleanup
 status. It is placed in the capture directory when supplied, otherwise in
