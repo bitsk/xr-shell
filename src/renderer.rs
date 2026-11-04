@@ -650,10 +650,10 @@ impl Renderer {
             "source": "OpenXR action grip/aim spaces at predicted display time",
             "model_to_grip_calibrated": false,
             "alignment_file": self.controller_alignment.path,
-            "alignment_scope": "visual model local rotation only; tracked grip position and aim unchanged",
+            "alignment_scope": "visual model local rotation and grip-local translation only; tracked grip and aim unchanged",
             "hands": self.controllers.iter().zip(&self.controller_states).enumerate().map(|(hand,(model,state))| {
                 let pose = |p: xr::Posef| serde_json::json!({"position_m":[p.position.x,p.position.y,p.position.z],"orientation_xyzw":[p.orientation.x,p.orientation.y,p.orientation.z,p.orientation.w]});
-                serde_json::json!({"hand":if hand==0 {"left"} else {"right"}, "loaded":model.is_some(), "directory":model.as_ref().map(|m|&m.directory), "visible":model.is_some() && state.grip.is_some(), "grip":state.grip.map(pose), "aim":state.aim.map(pose), "alignment_xyzw":crate::controller_model::quaternion_array(self.controller_alignment.rotations[hand]), "model_pose":state.grip.map(|p|pose(crate::controller_model::aligned_model_pose(p,self.controller_alignment.rotations[hand]))), "select":state.select,"trigger":state.trigger,"squeeze":state.squeeze,"menu":state.menu,"stick":state.stick})
+                serde_json::json!({"hand":if hand==0 {"left"} else {"right"}, "loaded":model.is_some(), "directory":model.as_ref().map(|m|&m.directory), "visible":model.is_some() && state.grip.is_some(), "grip":state.grip.map(pose), "aim":state.aim.map(pose), "alignment_xyzw":crate::controller_model::quaternion_array(self.controller_alignment.rotations[hand]), "model_offset_m":self.controller_alignment.offsets_m[hand], "model_pose":state.grip.map(|p|pose(crate::controller_model::aligned_model_pose(p,self.controller_alignment.rotations[hand],self.controller_alignment.offsets_m[hand]))), "select":state.select,"trigger":state.trigger,"squeeze":state.squeeze,"menu":state.menu,"stick":state.stick})
             }).collect::<Vec<_>>()
         })
     }
@@ -766,6 +766,7 @@ impl Renderer {
                         view,
                         state,
                         self.controller_alignment.rotations[hand],
+                        self.controller_alignment.offsets_m[hand],
                     );
                 }
             }

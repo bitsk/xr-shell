@@ -255,6 +255,8 @@ Local visual calibration uses `/etc/xr/devices/a081/controller-alignment.json`
 (or `XR_CONTROLLER_ALIGNMENT_FILE`). Schema 1 has normalized `left_xyzw` and
 `right_xyzw` quaternions. This configuration is checked once per second and
 applied as `grip_orientation * local_model_rotation`; grip position, original
-actions and aim rays are unchanged. Missing configuration selects identity.
+actions and aim rays are unchanged. Optional `left_offset_m` and `right_offset_m`
+translate only the displayed model in the original grip local basis. Missing
+configuration selects identity and zero offset.
 Capture metadata records the original grip/aim and the separate visual model
 pose. Model calibration does not establish tracking or spatial accuracy.
