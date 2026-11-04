@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
-//! Minimal regression for the observed split-anchor taskbar bug. No XR pose injection.
+//! Regressions for observed taskbar anchoring and hover stalls. No XR pose injection.
 use super::*;
 use crate::spatial::{add, dot, scale, sub};
 use xr_spatial_kit::{Scene, Widget, taskbar};
@@ -35,6 +35,99 @@ fn close(a: [f32; 3], b: [f32; 3]) {
         sub(a, b).iter().all(|d| d.abs() < 0.00001),
         "{a:?} != {b:?}"
     );
+}
+#[test]
+fn hover_reuses_other_rasters_without_freezing_text_or_window_updates() {
+    let dir = std::env::temp_dir().join(format!(
+        "xr-hover-regression-{}-{}",
+        std::process::id(),
+        monotonic()
+    ));
+    let mut d = Desktop::new(&dir.join("shell.sock"), true).unwrap();
+    let mut scene = Scene::new([320., 100.], [0.32, 0.1], [0., 1.6, -1.7], "world_locked");
+    scene.push(Widget::card("bg", [0., 0., 320., 100.], "panel.background"));
+    for (id, x) in [("a", 10.), ("b", 160.)] {
+        scene.push(Widget::button(
+            id,
+            [x, 20., 140., 60.],
+            id,
+            "ui:test",
+            "button.secondary",
+        ));
+    }
+    d.peers.insert(1, peer(&d, 1, scene));
+    d.windows.insert(
+        "test:1".into(),
+        Window {
+            owner: 1,
+            state: json!({"role":"toplevel","workspace":0}),
+            width: 32,
+            height: 32,
+            pixels: vec![255; 32 * 32 * 4],
+            position: [0., 1.5, -1.5],
+            size: [0.32, 0.32],
+            frame: 1,
+            minimized: false,
+            curved: false,
+        },
+    );
+    let rasters = |d: &mut Desktop| -> BTreeMap<String, Arc<[u8]>> {
+        d.dirty = true;
+        d.panels()
+            .unwrap()
+            .unwrap()
+            .into_iter()
+            .map(|p| {
+                assert_eq!(p.rgba.len(), (p.width * p.height * 4) as usize);
+                (p.id, p.rgba)
+            })
+            .collect()
+    };
+    let normal = rasters(&mut d);
+    d.hover = Some((1, "a".into()));
+    let hover = rasters(&mut d);
+    for (id, pixels) in &normal {
+        assert_eq!(Arc::ptr_eq(pixels, &hover[id]), id != "node:1:a", "{id}");
+    }
+    assert_ne!(normal["node:1:a"].as_ref(), hover["node:1:a"].as_ref());
+    d.hover = None;
+    let restored = rasters(&mut d);
+    assert!(Arc::ptr_eq(&normal["node:1:a"], &restored["node:1:a"]));
+    d.capture = Some(Capture {
+        target: Target::Node(1, "a".into()),
+        surface: None,
+        resize_frame: None,
+        size: [0.; 2],
+        logical: [0.; 2],
+        id: "1".into(),
+        interaction: "1".into(),
+        source: "regression".into(),
+        start: [0.; 2],
+        position: [0.; 3],
+    });
+    let pressed = rasters(&mut d);
+    assert_ne!(pressed["node:1:a"].as_ref(), normal["node:1:a"].as_ref());
+    assert!(Arc::ptr_eq(&pressed["node:1:b"], &normal["node:1:b"]));
+    d.capture = None;
+    d.peers
+        .get_mut(&1)
+        .unwrap()
+        .nodes
+        .get_mut("b")
+        .unwrap()
+        .text = "updated".into();
+    d.windows.get_mut("test:1").unwrap().frame += 1;
+    d.windows.get_mut("test:1").unwrap().pixels.fill(128);
+    let updated = rasters(&mut d);
+    assert!(!Arc::ptr_eq(&updated["node:1:b"], &normal["node:1:b"]));
+    assert!(!Arc::ptr_eq(
+        &updated["window:test:1"],
+        &normal["window:test:1"]
+    ));
+    assert!(Arc::ptr_eq(&updated["node:1:a"], &normal["node:1:a"]));
+    assert!(Arc::ptr_eq(&updated["node:1:bg"], &normal["node:1:bg"]));
+    drop(d);
+    std::fs::remove_dir_all(dir).unwrap();
 }
 #[test]
 fn islands_share_motion_capture_and_scene_refresh_without_moving_world_panels() {

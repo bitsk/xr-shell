@@ -1,3 +1,10 @@
+xr-shell (0.2.12) unstable; urgency=medium
+
+  * Cache independent control rasters and upload only changed atlas rectangles.
+  * Keep hover transitions off the full-scene raster and device-idle path.
+
+ -- bits <bigbits@hackx.cc>  Thu, 05 Nov 2026 00:40:42 +0800
+
 xr-shell (0.2.11) unstable; urgency=medium
 
   * Bind real controller grip, trigger, back and thumbstick actions.

@@ -34,6 +34,21 @@ pub struct Geometry {
     pub group: String,
     pub layer: f32,
 }
+fn raster_size(draw: &Draw) -> (u32, u32) {
+    if matches!(draw.source, Source::Shadow(_)) {
+        return (1, 1);
+    }
+    let w = draw.frame.logical[0].round().max(1.) as u32;
+    let h = draw.frame.logical[1].round().max(1.) as u32;
+    if matches!(draw.source, Source::Window(_)) {
+        return (w, h);
+    }
+    let scale = (2048. / w.max(h) as f64).min(2.);
+    (
+        ((w as f64 * scale).round().max(1.)) as u32,
+        ((h as f64 * scale).round().max(1.)) as u32,
+    )
+}
 impl Desktop {
     pub(super) fn node_policy<'a>(p: &'a Peer, node: &'a Node) -> &'a str {
         let mut parent = node.parent_id.as_str();
@@ -407,14 +422,80 @@ impl Desktop {
         }
         decorated
     }
+    fn raster_key(&self, draw: &Draw) -> Value {
+        let state = match &draw.source {
+            Source::Node(id, node) => {
+                let n = &self.peers[id].nodes[node];
+                let window = self
+                    .windows
+                    .get(&format!("{}:{}", n.window_server_generation, n.surface_id));
+                json!({"node":n, "hover":self.hover.as_ref().is_some_and(|(owner,key)|owner==id&&key==node),
+                    "pressed":self.capture.as_ref().is_some_and(|c|matches!(&c.target,Target::Node(owner,key)if owner==id&&key==node)),
+                    "frame":window.map(|w|(w.frame,w.width,w.height))})
+            }
+            Source::Window(k) => {
+                let w = &self.windows[k];
+                json!([w.frame, w.width, w.height])
+            }
+            Source::Grab(k) => json!(self.companion_hover.as_deref() == Some(&format!("grab:{k}"))),
+            Source::Orb(k) => json!(self.companion_hover.as_deref() == Some(&format!("orb:{k}"))),
+            Source::Close(k) => {
+                json!(self.companion_hover.as_deref() == Some(&format!("close:{k}")))
+            }
+            Source::Minimize(k) => {
+                json!(self.companion_hover.as_deref() == Some(&format!("minimize:{k}")))
+            }
+            Source::Curve(k) => {
+                json!(self.companion_hover.as_deref() == Some(&format!("curve:{k}")))
+            }
+            Source::Resize(k, left) => json!(
+                self.companion_hover.as_deref()
+                    == Some(&format!(
+                        "resize-{}:{k}",
+                        if *left { "left" } else { "right" }
+                    ))
+            ),
+            Source::Shadow(_) => Value::Null,
+        };
+        json!([draw.frame.logical, state])
+    }
     pub fn panels(&mut self) -> Result<Option<Vec<Panel>>> {
         if !self.dirty {
             return Ok(None);
         }
         self.dirty = false;
+        let started = std::time::Instant::now();
         let theme = Theme::default();
         let mut panels = Vec::new();
-        for draw in self.draws() {
+        let draws = self.draws();
+        let live: BTreeSet<_> = draws.iter().map(|d| d.id.clone()).collect();
+        self.raster_cache.retain(|id, _| live.contains(id));
+        let mut hits = 0usize;
+        let mut misses = 0usize;
+        for draw in draws {
+            let key = self.raster_key(&draw);
+            if let Some(pixels) = self
+                .raster_cache
+                .get(&draw.id)
+                .and_then(|entries| entries.iter().find(|(k, _)| k == &key))
+                .map(|(_, pixels)| pixels.clone())
+            {
+                let (width, height) = raster_size(&draw);
+                panels.push(Panel {
+                    id: draw.id,
+                    frame: draw.frame,
+                    width,
+                    height,
+                    rgba: pixels,
+                    radius: draw.radius,
+                    rim: draw.rim,
+                    border: draw.border,
+                    material: draw.material,
+                });
+                hits += 1;
+                continue;
+            }
+            misses += 1;
             let width = draw.frame.logical[0].round().max(1.) as u32;
             let height = draw.frame.logical[1].round().max(1.) as u32;
             let canvas = if matches!(draw.source, Source::Shadow(_)) {
@@ -543,17 +624,37 @@ impl Desktop {
                     );
                 }
             }
+            let pixels: Arc<[u8]> = canvas.rgba().into();
+            let variants = if matches!(&draw.source, Source::Node(id,node) if ["Button","Slider"].contains(&self.peers[id].nodes[node].kind.as_str()))
+            {
+                3
+            } else {
+                1
+            };
+            let entries = self.raster_cache.entry(draw.id.clone()).or_default();
+            while entries.len() >= variants {
+                entries.pop_front();
+            }
+            entries.push_back((key, pixels.clone()));
             panels.push(Panel {
                 id: draw.id,
                 frame: draw.frame,
                 width: canvas.width,
                 height: canvas.height,
-                rgba: canvas.rgba(),
+                rgba: pixels,
                 radius: draw.radius,
                 rim: draw.rim,
                 border: draw.border,
                 material: draw.material,
             });
+        }
+        let elapsed = started.elapsed();
+        if crate::ui_profile() || elapsed.as_millis() >= 8 {
+            eprintln!(
+                "XR_UI_RASTER panels={} hits={hits} misses={misses} elapsed_us={}",
+                panels.len(),
+                elapsed.as_micros()
+            );
         }
         ensure!(panels.len() <= 2048, "draw limit exceeded");
         Ok(Some(panels))

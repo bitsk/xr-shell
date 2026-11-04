@@ -716,3 +716,8 @@ fn atomic_json(path: &Path, value: &Value) -> Result<()> {
     fs::rename(tmp, path)?;
     Ok(())
 }
+
+fn ui_profile() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("XR_UI_PROFILE").is_some_and(|v| v == "1"))
+}

@@ -256,3 +256,13 @@ actions in captures. The A081 provider
 uses device-specific render-model components from the original system rather
 than inheriting another controller's grip/aim transforms. Source parameters
 are maintained by the runtime component owner.
+
+## UI texture updates
+
+Hover and press reuse unchanged per-control rasters and retain up to three
+button/slider visual states. Text, scene properties and client frame IDs
+invalidate their own content. Atlas layout changes rebuild the texture; stable
+layouts upload only changed rectangles. The private atlas is protected by the
+Shell submission fence rather than a device-wide idle in the interaction path.
+`XR_UI_PROFILE=1` reports raster cache hits/misses and GPU upload bytes/times;
+slow updates are logged even without profiling.

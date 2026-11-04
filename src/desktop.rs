@@ -4,7 +4,7 @@ use anyhow::{Context, Result, bail, ensure};
 use serde_json::{Value, json};
 use std::{
     cell::RefCell,
-    collections::{BTreeMap, BTreeSet},
+    collections::{BTreeMap, BTreeSet, VecDeque},
     fs,
     os::{
         fd::AsRawFd,
@@ -14,6 +14,7 @@ use std::{
         },
     },
     path::{Path, PathBuf},
+    sync::Arc,
     time::{SystemTime, UNIX_EPOCH},
 };
 use xr_shell_protocols::{CAPABILITIES, Node, Packet, SeqPacket};
@@ -139,7 +140,7 @@ pub struct Panel {
     pub frame: crate::spatial::Frame,
     pub width: u32,
     pub height: u32,
-    pub rgba: Vec<u8>,
+    pub rgba: Arc<[u8]>,
     pub radius: f32,
     pub rim: f32,
     pub border: f32,
@@ -179,6 +180,7 @@ pub struct Desktop {
     lifts: BTreeMap<(u64, String), f32>,
     expanded_orb: Option<String>,
     companion_hover: Option<String>,
+    raster_cache: BTreeMap<String, VecDeque<(Value, Arc<[u8]>)>>,
     stats: Value,
 }
 fn number(v: &Value, k: &str) -> Result<u64> {
@@ -279,6 +281,7 @@ impl Desktop {
             lifts: BTreeMap::new(),
             expanded_orb: None,
             companion_hover: None,
+            raster_cache: BTreeMap::new(),
             stats: json!({"connections":0,"disconnects":0,"scene_transactions":0,"shm_commits":0,"buffer_releases":0,"input_events":0,"cancellations":0,"protocol_errors":0,"focus_changes":0}),
         })
     }

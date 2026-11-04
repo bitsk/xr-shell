@@ -6,7 +6,7 @@ use crate::{
 use anyhow::{Context, Result, ensure};
 use ash::{vk, vk::Handle};
 use openxr as xr;
-use std::{io::Cursor, rc::Rc};
+use std::{io::Cursor, rc::Rc, sync::Arc};
 
 struct DepthTarget {
     gpu: Rc<Gpu>,
@@ -102,6 +102,12 @@ impl Drop for Eye {
     }
 }
 
+struct AtlasEntry {
+    position: (u32, u32),
+    size: (u32, u32),
+    pixels: Arc<[u8]>,
+}
+
 pub struct Renderer {
     gpu: Rc<Gpu>,
     pub eyes: Vec<Eye>,
@@ -127,6 +133,7 @@ pub struct Renderer {
     shaders: Vec<vk::ShaderModule>,
     yaw: f32,
     atlas: Option<Atlas>,
+    atlas_entries: std::collections::BTreeMap<String, AtlasEntry>,
     ui_uniform: Option<Buffer>,
     panel_uniforms: Vec<f32>,
     ui_offset: [f32; 3],
@@ -175,6 +182,7 @@ impl Renderer {
             shaders: Vec::new(),
             yaw: environment.yaw,
             atlas: None,
+            atlas_entries: std::collections::BTreeMap::new(),
             ui_uniform: None,
             panel_uniforms: Vec::new(),
             ui_offset: [0.; 3],
@@ -995,6 +1003,7 @@ impl Renderer {
         self.update_panels(&[])
     }
     pub fn update_panels(&mut self, panels: &[crate::desktop::Panel]) -> Result<()> {
+        let started = std::time::Instant::now();
         ensure!(panels.len() <= 2048, "draw item limit");
         let width = panels
             .iter()
@@ -1018,105 +1027,186 @@ impl Renderer {
         }
         let height = (y + row + 2).max(4).next_power_of_two();
         ensure!(height <= 8192, "spatial atlas capacity");
-        let mut pixels = vec![0u8; width as usize * height as usize * 4];
+        let full = self
+            .atlas
+            .as_ref()
+            .is_none_or(|a| a.width != width || a.height != height)
+            || panels.len() != self.atlas_entries.len()
+            || panels.iter().zip(&packing).any(|(p, position)| {
+                self.atlas_entries
+                    .get(&p.id)
+                    .is_none_or(|e| e.size != (p.width, p.height) || e.position != *position)
+            });
+        let changed: Vec<_> = panels
+            .iter()
+            .enumerate()
+            .filter_map(|(i, p)| {
+                (full
+                    || self
+                        .atlas_entries
+                        .get(&p.id)
+                        .is_none_or(|e| !Arc::ptr_eq(&e.pixels, &p.rgba)))
+                .then_some(i)
+            })
+            .collect();
         self.uv_map.clear();
-        for (p, (x, y)) in panels.iter().zip(packing) {
-            for row in 0..p.height as usize {
-                let dst = ((y as usize + row) * width as usize + x as usize) * 4;
-                let src = row * p.width as usize * 4;
-                pixels[dst..dst + p.width as usize * 4]
-                    .copy_from_slice(&p.rgba[src..src + p.width as usize * 4]);
-            }
+        for (p, (x, y)) in panels.iter().zip(&packing) {
             self.uv_map.insert(
                 p.id.clone(),
                 [
-                    (x as f32 + 0.5) / width as f32,
-                    (y as f32 + 0.5) / height as f32,
+                    (*x as f32 + 0.5) / width as f32,
+                    (*y as f32 + 0.5) / height as f32,
                     (p.width - 1) as f32 / width as f32,
                     (p.height - 1) as f32 / height as f32,
                 ],
             );
         }
-        unsafe {
-            self.gpu.device.device_wait_idle()?;
-        }
-        let staging = Buffer::host(
-            self.gpu.clone(),
-            pixels.len() as u64,
-            vk::BufferUsageFlags::TRANSFER_SRC,
-        )?;
-        staging.write(&pixels)?;
-        if self
-            .atlas
-            .as_ref()
-            .is_none_or(|a| a.width != width || a.height != height)
-        {
-            self.atlas = Some(Atlas::new(self.gpu.clone(), width, height)?);
-        }
-        self.begin()?;
-        {
-            let a = self.atlas.as_ref().unwrap();
-            unsafe {
-                let d = &self.gpu.device;
-                d.cmd_pipeline_barrier(
-                    self.cmd,
-                    if a.initialized {
-                        vk::PipelineStageFlags::FRAGMENT_SHADER
-                    } else {
-                        vk::PipelineStageFlags::TOP_OF_PIPE
-                    },
-                    vk::PipelineStageFlags::TRANSFER,
-                    vk::DependencyFlags::empty(),
-                    &[],
-                    &[],
-                    &[image_barrier(
-                        a.image,
-                        if a.initialized {
-                            vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL
-                        } else {
-                            vk::ImageLayout::UNDEFINED
-                        },
-                        vk::ImageLayout::TRANSFER_DST_OPTIMAL,
-                        if a.initialized {
-                            vk::AccessFlags::SHADER_READ
-                        } else {
-                            vk::AccessFlags::empty()
-                        },
-                        vk::AccessFlags::TRANSFER_WRITE,
-                    )],
-                );
-                d.cmd_copy_buffer_to_image(
-                    self.cmd,
-                    staging.handle,
-                    a.image,
-                    vk::ImageLayout::TRANSFER_DST_OPTIMAL,
-                    &[vk::BufferImageCopy::default()
+        if !changed.is_empty() || self.atlas.as_ref().is_none_or(|a| !a.initialized) {
+            let mut pixels = if full {
+                vec![0u8; width as usize * height as usize * 4]
+            } else {
+                Vec::new()
+            };
+            let mut copies = Vec::new();
+            if full {
+                for (p, (x, y)) in panels.iter().zip(&packing) {
+                    for row in 0..p.height as usize {
+                        let dst = ((*y as usize + row) * width as usize + *x as usize) * 4;
+                        let src = row * p.width as usize * 4;
+                        pixels[dst..dst + p.width as usize * 4]
+                            .copy_from_slice(&p.rgba[src..src + p.width as usize * 4]);
+                    }
+                }
+                copies.push(
+                    vk::BufferImageCopy::default()
                         .image_subresource(colour_layers())
                         .image_extent(vk::Extent3D {
                             width,
                             height,
                             depth: 1,
-                        })],
+                        }),
                 );
-                d.cmd_pipeline_barrier(
-                    self.cmd,
-                    vk::PipelineStageFlags::TRANSFER,
-                    vk::PipelineStageFlags::FRAGMENT_SHADER,
-                    vk::DependencyFlags::empty(),
-                    &[],
-                    &[],
-                    &[image_barrier(
+            } else {
+                for &i in &changed {
+                    let p = &panels[i];
+                    let (x, y) = packing[i];
+                    let offset = pixels.len() as u64;
+                    pixels.extend_from_slice(&p.rgba);
+                    copies.push(
+                        vk::BufferImageCopy::default()
+                            .buffer_offset(offset)
+                            .image_subresource(colour_layers())
+                            .image_offset(vk::Offset3D {
+                                x: x as i32,
+                                y: y as i32,
+                                z: 0,
+                            })
+                            .image_extent(vk::Extent3D {
+                                width: p.width,
+                                height: p.height,
+                                depth: 1,
+                            }),
+                    );
+                }
+            }
+            let upload_bytes = pixels.len();
+            let staging = Buffer::host(
+                self.gpu.clone(),
+                upload_bytes as u64,
+                vk::BufferUsageFlags::TRANSFER_SRC,
+            )?;
+            staging.write(&pixels)?;
+            // Only this queue reads the private UI atlas. Its previous submission
+            // fence protects reuse/reallocation without idling the entire XR device.
+            self.begin()?;
+            if self
+                .atlas
+                .as_ref()
+                .is_none_or(|a| a.width != width || a.height != height)
+            {
+                self.atlas = Some(Atlas::new(self.gpu.clone(), width, height)?);
+            }
+            {
+                let a = self.atlas.as_ref().unwrap();
+                unsafe {
+                    let d = &self.gpu.device;
+                    d.cmd_pipeline_barrier(
+                        self.cmd,
+                        if a.initialized {
+                            vk::PipelineStageFlags::FRAGMENT_SHADER
+                        } else {
+                            vk::PipelineStageFlags::TOP_OF_PIPE
+                        },
+                        vk::PipelineStageFlags::TRANSFER,
+                        vk::DependencyFlags::empty(),
+                        &[],
+                        &[],
+                        &[image_barrier(
+                            a.image,
+                            if a.initialized {
+                                vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL
+                            } else {
+                                vk::ImageLayout::UNDEFINED
+                            },
+                            vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                            if a.initialized {
+                                vk::AccessFlags::SHADER_READ
+                            } else {
+                                vk::AccessFlags::empty()
+                            },
+                            vk::AccessFlags::TRANSFER_WRITE,
+                        )],
+                    );
+                    d.cmd_copy_buffer_to_image(
+                        self.cmd,
+                        staging.handle,
                         a.image,
                         vk::ImageLayout::TRANSFER_DST_OPTIMAL,
-                        vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
-                        vk::AccessFlags::TRANSFER_WRITE,
-                        vk::AccessFlags::SHADER_READ,
-                    )],
+                        &copies,
+                    );
+                    d.cmd_pipeline_barrier(
+                        self.cmd,
+                        vk::PipelineStageFlags::TRANSFER,
+                        vk::PipelineStageFlags::FRAGMENT_SHADER,
+                        vk::DependencyFlags::empty(),
+                        &[],
+                        &[],
+                        &[image_barrier(
+                            a.image,
+                            vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                            vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+                            vk::AccessFlags::TRANSFER_WRITE,
+                            vk::AccessFlags::SHADER_READ,
+                        )],
+                    );
+                }
+            }
+            self.submit()?;
+            self.atlas.as_mut().unwrap().initialized = true;
+            if crate::ui_profile() || started.elapsed().as_millis() >= 8 {
+                eprintln!(
+                    "XR_UI_UPLOAD full={full} regions={} bytes={upload_bytes} atlas={}x{} elapsed_us={}",
+                    changed.len(),
+                    width,
+                    height,
+                    started.elapsed().as_micros()
                 );
             }
-        }
-        self.submit()?;
-        self.atlas.as_mut().unwrap().initialized = true;
+        } // unchanged textures require neither allocation nor a GPU upload
+        self.atlas_entries = panels
+            .iter()
+            .zip(packing)
+            .map(|(p, position)| {
+                (
+                    p.id.clone(),
+                    AtlasEntry {
+                        position,
+                        size: (p.width, p.height),
+                        pixels: p.rgba.clone(),
+                    },
+                )
+            })
+            .collect();
         unsafe {
             let images = [vk::DescriptorImageInfo::default()
                 .sampler(self.sampler)
