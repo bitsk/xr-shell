@@ -244,19 +244,12 @@ sampled even when one owns a drag. The active capture remains authoritative;
 other-hand presses are not replayed when it releases. Physical controller
 motion, button mappings and grip/aim alignment require device acceptance.
 
-## Controller model alignment
+## Original controller models
 
-Optional artwork is loaded from `/usr/share/xr/devices/a081/controllers`
-(or `XR_CONTROLLER_MODEL_DIR`), with separate `left` and `right` directories
-containing `mesh.json` and `texture.png`. Artwork remains separately supplied
-and checksum locked.
-
-Local visual calibration uses `/etc/xr/devices/a081/controller-alignment.json`
-(or `XR_CONTROLLER_ALIGNMENT_FILE`). Schema 1 has normalized `left_xyzw` and
-`right_xyzw` quaternions. This configuration is checked once per second and
-applied as `grip_orientation * local_model_rotation`; grip position, original
-actions and aim rays are unchanged. Optional `left_offset_m` and `right_offset_m`
-translate only the displayed model in the original grip local basis. Missing
-configuration selects identity and zero offset.
-Capture metadata records the original grip/aim and the separate visual model
-pose. Model calibration does not establish tracking or spatial accuracy.
+Separate device assets provide `left`/`right` `mesh.json` and `texture.png`
+under `/usr/share/xr/devices/a081/controllers` (or `XR_CONTROLLER_MODEL_DIR`).
+Shell renders these models at the runtime grip action and routes rays through
+the independent aim action. It adds no local pose correction. The A081 provider
+uses device-specific render-model components from the original system rather
+than inheriting another controller's grip/aim transforms. Source parameters
+are maintained by the runtime component owner.

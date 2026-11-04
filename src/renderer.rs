@@ -111,7 +111,6 @@ pub struct Renderer {
     spatial_pipeline: vk::Pipeline,
     controllers: [Option<crate::controller_model::Model>; 2],
     controller_states: [crate::input::HandState; 2],
-    controller_alignment: crate::controller_model::Alignment,
     draw_count: u32,
     uv_map: std::collections::BTreeMap<String, [f32; 4]>,
     layout: vk::PipelineLayout,
@@ -160,7 +159,6 @@ impl Renderer {
             spatial_pipeline: vk::Pipeline::null(),
             controllers: [None, None],
             controller_states: [crate::input::HandState::default(); 2],
-            controller_alignment: crate::controller_model::Alignment::new(),
             draw_count: 0,
             uv_map: std::collections::BTreeMap::new(),
             layout: vk::PipelineLayout::null(),
@@ -641,7 +639,6 @@ impl Renderer {
     }
 
     pub fn update_controllers(&mut self, states: &[crate::input::HandState; 2]) {
-        self.controller_alignment.poll();
         self.controller_states = *states;
     }
 
@@ -649,11 +646,9 @@ impl Renderer {
         serde_json::json!({
             "source": "OpenXR action grip/aim spaces at predicted display time",
             "model_to_grip_calibrated": false,
-            "alignment_file": self.controller_alignment.path,
-            "alignment_scope": "visual model local rotation and grip-local translation only; tracked grip and aim unchanged",
             "hands": self.controllers.iter().zip(&self.controller_states).enumerate().map(|(hand,(model,state))| {
                 let pose = |p: xr::Posef| serde_json::json!({"position_m":[p.position.x,p.position.y,p.position.z],"orientation_xyzw":[p.orientation.x,p.orientation.y,p.orientation.z,p.orientation.w]});
-                serde_json::json!({"hand":if hand==0 {"left"} else {"right"}, "loaded":model.is_some(), "directory":model.as_ref().map(|m|&m.directory), "visible":model.is_some() && state.grip.is_some(), "grip":state.grip.map(pose), "aim":state.aim.map(pose), "alignment_xyzw":crate::controller_model::quaternion_array(self.controller_alignment.rotations[hand]), "model_offset_m":self.controller_alignment.offsets_m[hand], "model_pose":state.grip.map(|p|pose(crate::controller_model::aligned_model_pose(p,self.controller_alignment.rotations[hand],self.controller_alignment.offsets_m[hand]))), "select":state.select,"trigger":state.trigger,"squeeze":state.squeeze,"menu":state.menu,"stick":state.stick})
+                serde_json::json!({"hand":if hand==0 {"left"} else {"right"}, "loaded":model.is_some(), "directory":model.as_ref().map(|m|&m.directory), "visible":model.is_some() && state.grip.is_some(), "grip":state.grip.map(pose), "aim":state.aim.map(pose), "select":state.select,"trigger":state.trigger,"squeeze":state.squeeze,"menu":state.menu,"stick":state.stick})
             }).collect::<Vec<_>>()
         })
     }
@@ -754,20 +749,9 @@ impl Renderer {
                 bytes,
             );
             d.cmd_draw(self.cmd, 3, 1, 0, 0);
-            for (hand, (model, state)) in self
-                .controllers
-                .iter()
-                .zip(&self.controller_states)
-                .enumerate()
-            {
+            for (model, state) in self.controllers.iter().zip(&self.controller_states) {
                 if let Some(model) = model {
-                    model.draw(
-                        self.cmd,
-                        view,
-                        state,
-                        self.controller_alignment.rotations[hand],
-                        self.controller_alignment.offsets_m[hand],
-                    );
+                    model.draw(self.cmd, view, state);
                 }
             }
             // Controller drawing uses a separate descriptor and push-constant layout.
