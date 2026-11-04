@@ -3,7 +3,7 @@ use crate::{
     environment::Environment,
     gpu::{Buffer, Gpu},
 };
-use anyhow::{Result, ensure};
+use anyhow::{Context, Result, ensure};
 use ash::{vk, vk::Handle};
 use openxr as xr;
 use std::{io::Cursor, rc::Rc};
@@ -65,7 +65,11 @@ impl Renderer {
         environment: &Environment,
         scale: f32,
     ) -> Result<Self> {
-        let formats = session.enumerate_swapchain_formats()?;
+        eprintln!("XR_INIT_STAGE=swapchain-formats STATUS=begin");
+        let formats = session
+            .enumerate_swapchain_formats()
+            .context("xrEnumerateSwapchainFormats")?;
+        eprintln!("XR_INIT_STAGE=swapchain-formats STATUS=complete FORMATS={formats:?}");
         let format = [vk::Format::R8G8B8A8_SRGB, vk::Format::B8G8R8A8_SRGB]
             .into_iter()
             .find(|f| formats.contains(&(f.as_raw() as _)))
@@ -116,10 +120,15 @@ impl Renderer {
                 None,
             )?;
         }
-        r.upload(environment)?;
-        r.init_panels()?;
-        r.pipeline()?;
-        r.create_spatial_pipeline()?;
+        eprintln!("XR_INIT_STAGE=renderer-resources STATUS=begin FORMAT={format:?}");
+        r.upload(environment)
+            .context("upload panorama Vulkan texture")?;
+        r.init_panels()
+            .context("initialize spatial panel Vulkan resources")?;
+        r.pipeline().context("create panorama Vulkan pipeline")?;
+        r.create_spatial_pipeline()
+            .context("create spatial Vulkan pipeline")?;
+        eprintln!("XR_INIT_STAGE=renderer-resources STATUS=complete");
         for (index, v) in views.iter().enumerate() {
             let extent = vk::Extent2D {
                 width: ((v.recommended_image_rect_width as f32 * scale).round() as u32)
@@ -129,6 +138,13 @@ impl Renderer {
                     .max(1)
                     .min(v.max_image_rect_height),
             };
+            eprintln!(
+                "XR_INIT_STAGE=swapchain-create STATUS=begin EYE={index} SIZE={}x{} FORMAT={format:?} SAMPLES=1 RECOMMENDED_SAMPLES={} MAX_SAMPLES={} ARRAY_SIZE=1 FACE_COUNT=1 MIP_COUNT=1 USAGE=COLOR_ATTACHMENT|TRANSFER_SRC",
+                extent.width,
+                extent.height,
+                v.recommended_swapchain_sample_count,
+                v.max_swapchain_sample_count
+            );
             let swapchain = session.create_swapchain(&xr::SwapchainCreateInfo {
                 create_flags: xr::SwapchainCreateFlags::EMPTY,
                 usage_flags: xr::SwapchainUsageFlags::COLOR_ATTACHMENT
@@ -140,14 +156,24 @@ impl Renderer {
                 face_count: 1,
                 array_size: 1,
                 mip_count: 1,
-            })?;
+            }).with_context(|| format!("xrCreateSwapchain(eye={index}, {}x{}, format={format:?}, samples=1, array=1, usage=COLOR_ATTACHMENT|TRANSFER_SRC)", extent.width, extent.height))?;
+            eprintln!("XR_INIT_STAGE=swapchain-create STATUS=complete EYE={index}");
             let mut eye = Eye {
                 gpu: r.gpu.clone(),
                 swapchain,
                 extent,
                 images: Vec::new(),
             };
-            for image in eye.swapchain.enumerate_images()? {
+            eprintln!("XR_INIT_STAGE=swapchain-images STATUS=begin EYE={index}");
+            let images = eye
+                .swapchain
+                .enumerate_images()
+                .with_context(|| format!("xrEnumerateSwapchainImages(eye={index})"))?;
+            eprintln!(
+                "XR_INIT_STAGE=swapchain-images STATUS=complete EYE={index} IMAGES={}",
+                images.len()
+            );
+            for (image_index, image) in images.into_iter().enumerate() {
                 eye.images.push(ImageTarget {
                     image: vk::Image::from_raw(image),
                     view: vk::ImageView::null(),
@@ -155,23 +181,35 @@ impl Renderer {
                 });
                 let target = eye.images.last_mut().unwrap();
                 unsafe {
-                    target.view = r.gpu.device.create_image_view(
-                        &vk::ImageViewCreateInfo::default()
-                            .image(target.image)
-                            .view_type(vk::ImageViewType::TYPE_2D)
-                            .format(format)
-                            .subresource_range(colour_range()),
-                        None,
-                    )?;
-                    target.framebuffer = r.gpu.device.create_framebuffer(
-                        &vk::FramebufferCreateInfo::default()
-                            .render_pass(r.pass)
-                            .attachments(&[target.view])
-                            .width(extent.width)
-                            .height(extent.height)
-                            .layers(1),
-                        None,
-                    )?;
+                    target.view = r
+                        .gpu
+                        .device
+                        .create_image_view(
+                            &vk::ImageViewCreateInfo::default()
+                                .image(target.image)
+                                .view_type(vk::ImageViewType::TYPE_2D)
+                                .format(format)
+                                .subresource_range(colour_range()),
+                            None,
+                        )
+                        .with_context(|| {
+                            format!("vkCreateImageView(eye={index}, image={image_index})")
+                        })?;
+                    target.framebuffer = r
+                        .gpu
+                        .device
+                        .create_framebuffer(
+                            &vk::FramebufferCreateInfo::default()
+                                .render_pass(r.pass)
+                                .attachments(&[target.view])
+                                .width(extent.width)
+                                .height(extent.height)
+                                .layers(1),
+                            None,
+                        )
+                        .with_context(|| {
+                            format!("vkCreateFramebuffer(eye={index}, image={image_index})")
+                        })?;
                 }
             }
             println!(

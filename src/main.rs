@@ -223,6 +223,7 @@ struct Summary {
     session_states: Vec<String>,
     elapsed_seconds: f64,
     reference_space: Option<String>,
+    initialization_stage: Option<&'static str>,
     cleanup: Cleanup,
     outcome: String,
     error: Option<String>,
@@ -303,8 +304,21 @@ fn run(options: &Options, summary: &mut Summary) -> Result<()> {
     ));
     println!("XR_RUNTIME={}", summary.runtime.as_ref().unwrap());
     let system = instance.system(xr::FormFactor::HEAD_MOUNTED_DISPLAY)?;
-    let config = instance.enumerate_view_configuration_views(system, VIEW_TYPE)?;
+    let config = instance
+        .enumerate_view_configuration_views(system, VIEW_TYPE)
+        .context("xrEnumerateViewConfigurationViews(PRIMARY_STEREO)")?;
     ensure!(config.len() == 2, "PRIMARY_STEREO must expose two views");
+    for (eye, view) in config.iter().enumerate() {
+        eprintln!(
+            "XR_VIEW_CONFIG EYE={eye} RECOMMENDED={}x{} MAX={}x{} RECOMMENDED_SAMPLES={} MAX_SAMPLES={}",
+            view.recommended_image_rect_width,
+            view.recommended_image_rect_height,
+            view.max_image_rect_width,
+            view.max_image_rect_height,
+            view.recommended_swapchain_sample_count,
+            view.max_swapchain_sample_count
+        );
+    }
     let blends = instance.enumerate_environment_blend_modes(system, VIEW_TYPE)?;
     ensure!(
         blends.contains(&xr::EnvironmentBlendMode::OPAQUE),
@@ -314,29 +328,54 @@ fn run(options: &Options, summary: &mut Summary) -> Result<()> {
     summary.gpu = Some(gpu.name.clone());
     let validation_stats = gpu.instance.validation.clone();
     let (session, mut waiter, mut stream) = gpu.session(&instance, system)?;
-    let spaces = session.enumerate_reference_spaces()?;
+    summary.initialization_stage = Some("enumerate-reference-spaces");
+    eprintln!("XR_INIT_STAGE=enumerate-reference-spaces STATUS=begin");
+    let spaces = session
+        .enumerate_reference_spaces()
+        .context("xrEnumerateReferenceSpaces")?;
+    eprintln!("XR_INIT_STAGE=enumerate-reference-spaces STATUS=complete SPACES={spaces:?}");
     let space_type = if spaces.contains(&xr::ReferenceSpaceType::STAGE) {
         xr::ReferenceSpaceType::STAGE
     } else {
         xr::ReferenceSpaceType::LOCAL
     };
     summary.reference_space = Some(format!("{space_type:?}"));
-    let space = session.create_reference_space(space_type, xr::Posef::IDENTITY)?;
+    summary.initialization_stage = Some("create-reference-space");
+    eprintln!("XR_INIT_STAGE=create-reference-space STATUS=begin TYPE={space_type:?}");
+    let space = session
+        .create_reference_space(space_type, xr::Posef::IDENTITY)
+        .with_context(|| format!("xrCreateReferenceSpace({space_type:?}, identity)"))?;
+    eprintln!("XR_INIT_STAGE=create-reference-space STATUS=complete TYPE={space_type:?}");
     let mut input = if options.components {
-        Some(input::Input::new(&instance, &session)?)
+        summary.initialization_stage = Some("input");
+        eprintln!("XR_INIT_STAGE=input STATUS=begin");
+        let input = input::Input::new(&instance, &session)
+            .context("initialize OpenXR controller actions")?;
+        eprintln!("XR_INIT_STAGE=input STATUS=complete");
+        Some(input)
     } else {
         None
     };
-    let mut renderer = Renderer::new(gpu.clone(), &session, &config, &environment, options.scale)?;
+    summary.initialization_stage = Some("renderer");
+    eprintln!("XR_INIT_STAGE=renderer STATUS=begin");
+    let mut renderer = Renderer::new(gpu.clone(), &session, &config, &environment, options.scale)
+        .context("initialize Vulkan renderer and OpenXR eye swapchains")?;
+    eprintln!("XR_INIT_STAGE=renderer STATUS=complete");
+    summary.initialization_stage = Some("desktop");
     let mut desktop = if options.components {
         let path = options.socket.clone().unwrap_or_else(|| {
             PathBuf::from(env::var_os("XDG_RUNTIME_DIR").unwrap_or_else(|| "/tmp".into()))
                 .join("xr-desktop/shell.sock")
         });
-        Some(desktop::Desktop::new(&path, options.debug_input)?)
+        Some(
+            desktop::Desktop::new(&path, options.debug_input)
+                .context("create desktop component socket")?,
+        )
     } else {
         None
     };
+    summary.initialization_stage = Some("complete");
+    eprintln!("XR_INIT_STAGE=complete STATUS=complete");
     let started = Instant::now();
     let result = frame_loop(
         options,

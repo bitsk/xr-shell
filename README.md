@@ -109,6 +109,13 @@ status. It is placed in the capture directory when supplied, otherwise in
 return nonzero and record the available failure state; successful compilation
 alone is not runtime acceptance.
 
+Initialization writes `XR_INIT_STAGE` begin/complete records for reference
+spaces, controller actions and each eye swapchain; errors retain the exact
+OpenXR/Vulkan operation in their context chain. `initialization_stage` in the
+summary identifies the last major stage entered. `XR_VIEW_CONFIG` and swapchain
+records show runtime recommended/max samples and the unchanged requested
+sample count, format, size, array size and usage.
+
 S1 deliberately waits for each eye's GPU work before releasing its XR image.
 This is a clear correctness baseline, not a claim of an optimized multi-frame
 pipeline or zero-copy display transport. Observation through a browser may

@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 use crate::desktop::Desktop;
-use anyhow::Result;
+use anyhow::{Context, Result};
 use openxr as xr;
 
 const SOURCES: [&str; 2] = ["controller_ray:left", "controller_ray:right"];
@@ -25,14 +25,36 @@ pub struct Input {
 }
 impl Input {
     pub fn new(instance: &xr::Instance, session: &xr::Session<xr::Vulkan>) -> Result<Self> {
+        eprintln!("XR_INIT_STAGE=input-hand-paths STATUS=begin");
         let hands = [
-            instance.string_to_path("/user/hand/left")?,
-            instance.string_to_path("/user/hand/right")?,
+            instance
+                .string_to_path("/user/hand/left")
+                .context("xrStringToPath(/user/hand/left)")?,
+            instance
+                .string_to_path("/user/hand/right")
+                .context("xrStringToPath(/user/hand/right)")?,
         ];
-        let set = instance.create_action_set("desktop", "Desktop interaction", 0)?;
-        let aim = set.create_action::<xr::Posef>("aim", "Aim ray", &hands)?;
-        let select = set.create_action::<bool>("select", "Select", &hands)?;
-        let trigger = set.create_action::<f32>("trigger", "Trigger", &hands)?;
+        eprintln!("XR_INIT_STAGE=input-hand-paths STATUS=complete");
+        eprintln!("XR_INIT_STAGE=input-action-set STATUS=begin");
+        let set = instance
+            .create_action_set("desktop", "Desktop interaction", 0)
+            .context("xrCreateActionSet(desktop)")?;
+        eprintln!("XR_INIT_STAGE=input-action-set STATUS=complete");
+        eprintln!("XR_INIT_STAGE=input-action-aim STATUS=begin");
+        let aim = set
+            .create_action::<xr::Posef>("aim", "Aim ray", &hands)
+            .context("xrCreateAction(aim, pose)")?;
+        eprintln!("XR_INIT_STAGE=input-action-aim STATUS=complete");
+        eprintln!("XR_INIT_STAGE=input-action-select STATUS=begin");
+        let select = set
+            .create_action::<bool>("select", "Select", &hands)
+            .context("xrCreateAction(select, boolean)")?;
+        eprintln!("XR_INIT_STAGE=input-action-select STATUS=complete");
+        eprintln!("XR_INIT_STAGE=input-action-trigger STATUS=begin");
+        let trigger = set
+            .create_action::<f32>("trigger", "Trigger", &hands)
+            .context("xrCreateAction(trigger, float)")?;
+        eprintln!("XR_INIT_STAGE=input-action-trigger STATUS=complete");
         for (profile, button, float) in [
             (
                 "/interaction_profiles/khr/simple_controller",
@@ -50,30 +72,53 @@ impl Input {
                 true,
             ),
         ] {
+            eprintln!("XR_INIT_STAGE=input-profile STATUS=begin PROFILE={profile}");
             let mut bindings = Vec::new();
             for hand in ["left", "right"] {
+                let aim_path = format!("/user/hand/{hand}/input/aim/pose");
                 bindings.push(xr::Binding::new(
                     &aim,
-                    instance.string_to_path(&format!("/user/hand/{hand}/input/aim/pose"))?,
+                    instance
+                        .string_to_path(&aim_path)
+                        .with_context(|| format!("xrStringToPath({aim_path})"))?,
                 ));
-                let path = instance.string_to_path(&format!("/user/hand/{hand}/input/{button}"))?;
+                let button_path = format!("/user/hand/{hand}/input/{button}");
+                let path = instance
+                    .string_to_path(&button_path)
+                    .with_context(|| format!("xrStringToPath({button_path})"))?;
                 if float {
                     bindings.push(xr::Binding::new(&trigger, path));
                 } else {
                     bindings.push(xr::Binding::new(&select, path));
                 }
             }
-            if let Err(error) = instance
-                .suggest_interaction_profile_bindings(instance.string_to_path(profile)?, &bindings)
+            let profile_path = instance
+                .string_to_path(profile)
+                .with_context(|| format!("xrStringToPath({profile})"))?;
+            if let Err(error) =
+                instance.suggest_interaction_profile_bindings(profile_path, &bindings)
             {
                 eprintln!("XR_INPUT_PROFILE_UNAVAILABLE={profile} {error:?}");
+            } else {
+                eprintln!("XR_INIT_STAGE=input-profile STATUS=complete PROFILE={profile}");
             }
         }
-        session.attach_action_sets(&[&set])?;
-        let spaces = [
-            aim.create_space(session, hands[0], xr::Posef::IDENTITY)?,
-            aim.create_space(session, hands[1], xr::Posef::IDENTITY)?,
-        ];
+        eprintln!("XR_INIT_STAGE=input-attach-action-sets STATUS=begin");
+        session
+            .attach_action_sets(&[&set])
+            .context("xrAttachSessionActionSets(desktop)")?;
+        eprintln!("XR_INIT_STAGE=input-attach-action-sets STATUS=complete");
+        eprintln!("XR_INIT_STAGE=input-action-space STATUS=begin HAND=left");
+        let left_space = aim
+            .create_space(session, hands[0], xr::Posef::IDENTITY)
+            .context("xrCreateActionSpace(aim, left, identity)")?;
+        eprintln!("XR_INIT_STAGE=input-action-space STATUS=complete HAND=left");
+        eprintln!("XR_INIT_STAGE=input-action-space STATUS=begin HAND=right");
+        let right_space = aim
+            .create_space(session, hands[1], xr::Posef::IDENTITY)
+            .context("xrCreateActionSpace(aim, right, identity)")?;
+        eprintln!("XR_INIT_STAGE=input-action-space STATUS=complete HAND=right");
+        let spaces = [left_space, right_space];
         Ok(Self {
             set,
             aim,

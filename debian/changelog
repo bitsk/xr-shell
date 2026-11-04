@@ -1,3 +1,11 @@
+xr-shell (0.2.4) unstable; urgency=medium
+
+  * Identify OpenXR reference-space and controller-action initialization steps.
+  * Record runtime view sample counts and each eye swapchain creation stage.
+  * Add failure context without changing bindings, geometry or rendering gates.
+
+ -- bits <bigbits@hackx.cc>  Wed, 04 Nov 2026 11:26:57 +0800
+
 xr-shell (0.2.3) unstable; urgency=medium
 
   * Capture raw OpenXR view-state flags and their validity/tracking meanings.
