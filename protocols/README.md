@@ -36,6 +36,11 @@ The M0 contract is implemented by these messages:
   Component-local rectangles use logical pixels, +X right/+Y down. Scene
   roots are metres in +Y-up/-Z-front world coordinates. Policies are
   `world_locked` and `dock_lazy_follow`.
+  With negotiated `scene.spatial-policy.v1`, an independent `spatial_panel`
+  Group may set `spatial_policy` to either policy (default `world_locked`).
+  All `dock_lazy_follow` roots and groups share one Shell-owned rigid anchor,
+  including across component processes. Capturing any followed node freezes
+  the whole taskbar until release/Cancel. Unrelated panels remain world locked.
 - `snapshot.v1`: `GetSnapshot`, `Snapshot`, `StateChanged`; the Shell publishes
   windows, active workspace, acknowledged focus epoch, component scene
   revisions and bounded system/clipboard summaries. A revision gap requires

@@ -18,6 +18,7 @@ pub const VERSION: &str = "xr-desktop/1.0";
 pub const CAPABILITIES: &[&str] = &[
     "core.v1",
     "scene.v1",
+    "scene.spatial-policy.v1",
     "snapshot.v1",
     "input.v1",
     "shm.v1",
@@ -279,6 +280,9 @@ pub struct Node {
     pub kind: String,
     #[serde(default)]
     pub spatial_panel: bool,
+    /// Independent panels are world locked unless explicitly opted into the shared taskbar anchor.
+    #[serde(default = "world_locked")]
+    pub spatial_policy: String,
     #[serde(default)]
     pub logical_size: [f32; 2],
     #[serde(default)]
@@ -311,6 +315,9 @@ pub struct Node {
     pub min: f32,
     #[serde(default = "one")]
     pub max: f32,
+}
+fn world_locked() -> String {
+    "world_locked".into()
 }
 fn root_id() -> String {
     "root".into()

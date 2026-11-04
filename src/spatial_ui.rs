@@ -35,7 +35,31 @@ pub struct Geometry {
     pub layer: f32,
 }
 impl Desktop {
-    fn node_base(p: &Peer, node: &Node) -> (Frame, String) {
+    pub(super) fn node_policy<'a>(p: &'a Peer, node: &'a Node) -> &'a str {
+        let mut parent = node.parent_id.as_str();
+        for _ in 0..512 {
+            if parent == "root" {
+                break;
+            }
+            let Some(n) = p.nodes.get(parent) else {
+                break;
+            };
+            if n.spatial_panel {
+                return &n.spatial_policy;
+            }
+            parent = &n.parent_id;
+        }
+        &p.root.policy
+    }
+    fn panel_frame(&self, n: &Node) -> Frame {
+        let frame = Frame::new(n.position_m, n.size_m, n.logical_size, n.rotation_degrees);
+        if n.spatial_policy == "dock_lazy_follow" {
+            self.taskbar_follow.frame(frame)
+        } else {
+            frame
+        }
+    }
+    fn node_base(&self, p: &Peer, node: &Node) -> (Frame, String) {
         let mut parent = node.parent_id.as_str();
         for _ in 0..512 {
             if parent == "root" {
@@ -46,13 +70,13 @@ impl Desktop {
             };
             if n.spatial_panel {
                 return (
-                    Frame::new(n.position_m, n.size_m, n.logical_size, n.rotation_degrees),
+                    self.panel_frame(n),
                     format!("component:{}:{}", p.id, n.node_id),
                 );
             }
             parent = &n.parent_id;
         }
-        (Self::root_frame(p), format!("component:{}:root", p.id))
+        (self.root_frame(p), format!("component:{}:root", p.id))
     }
     fn window_group(&self, key: &str) -> (String, [f32; 3], f32) {
         let mut root = key.to_owned();
@@ -83,12 +107,20 @@ impl Desktop {
             depth as f32 * 0.004,
         )
     }
-    fn root_frame(p: &Peer) -> Frame {
-        let mut rotation = p.root.rotation;
-        rotation[1] += p.root.yaw.to_degrees();
-        Frame::new(p.root.position, p.root.size, p.root.logical, rotation)
+    pub(super) fn root_frame(&self, p: &Peer) -> Frame {
+        let frame = Frame::new(
+            p.root.position,
+            p.root.size,
+            p.root.logical,
+            p.root.rotation,
+        );
+        if p.root.policy == "dock_lazy_follow" {
+            self.taskbar_follow.frame(frame)
+        } else {
+            frame
+        }
     }
-    fn node_frame(&self, p: &Peer, node: &Node) -> Option<Frame> {
+    pub(super) fn node_frame(&self, p: &Peer, node: &Node) -> Option<Frame> {
         if !node.visible || node.kind == "Group" {
             return None;
         }
@@ -110,7 +142,7 @@ impl Desktop {
             .copied()
             .unwrap_or(0.);
         let mut parent = node.parent_id.as_str();
-        let mut frame = Self::root_frame(p);
+        let mut frame = self.root_frame(p);
         for _ in 0..512 {
             if parent == "root" {
                 break;
@@ -120,7 +152,7 @@ impl Desktop {
                 return None;
             }
             if n.spatial_panel {
-                frame = Frame::new(n.position_m, n.size_m, n.logical_size, n.rotation_degrees);
+                frame = self.panel_frame(n);
                 break;
             }
             rect[0] += n.rect[0];
@@ -538,7 +570,7 @@ impl Desktop {
                 let (anchor, group, mut layer) = match original {
                     Source::Node(id, node) => {
                         let p = &self.peers[id];
-                        let (base, group) = Self::node_base(p, &p.nodes[node]);
+                        let (base, group) = self.node_base(p, &p.nodes[node]);
                         (
                             base.position,
                             group,

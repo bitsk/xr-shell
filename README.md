@@ -200,3 +200,15 @@ uses nine-slice scaling for optical edges, and keeps glyphs and live state separ
 `XR_SPATIAL_ART_DIR` can select a development art directory; the executable prefix
 is checked before the system path. `XR_ART_LIBRARY` and `XR_ART_RESOURCE` report
 loaded art; explicit fallback logs identify missing or invalid resources.
+
+## Shared taskbar follow anchor
+
+All roots and independent groups opting into `dock_lazy_follow` use one
+Shell-owned rigid transform. It preserves island gaps, normals, shadows and
+ray coordinates across Dock/System UI scene refreshes. Yaw keeps the 20-degree
+activation and 2-degree settling thresholds; translation is smoothed. Capturing
+any followed control freezes the entire taskbar until release or Cancel.
+Unrelated world-locked panels and application windows retain their positions.
+The negotiated `scene.spatial-policy.v1` extension selects group policy explicitly;
+missing group policy remains world locked. Snapshots expose `taskbar_follow`
+and `taskbar_capture_frozen` for diagnostics without injecting XR poses.

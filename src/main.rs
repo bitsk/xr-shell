@@ -7,6 +7,7 @@ mod input;
 mod raster;
 mod renderer;
 mod spatial;
+mod taskbar_follow;
 mod ui_anchor;
 
 use anyhow::{Context, Result, bail, ensure};

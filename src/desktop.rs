@@ -25,10 +25,6 @@ struct Root {
     size: [f32; 2],
     position: [f32; 3],
     policy: String,
-    anchor: [f32; 3],
-    yaw: f32,
-    following: bool,
-    initialized: bool,
     rotation: [f32; 3],
 }
 impl Default for Root {
@@ -38,10 +34,6 @@ impl Default for Root {
             size: [0.8, 0.5],
             position: [0., 1.5, -1.5],
             policy: "world_locked".into(),
-            anchor: [0., 1.5, -1.5],
-            yaw: 0.,
-            following: false,
-            initialized: false,
             rotation: [0.; 3],
         }
     }
@@ -180,7 +172,7 @@ pub struct Desktop {
     state_dirty: bool,
     pending_pointer: Option<Value>,
     pub focused: bool,
-    head_height: Option<f32>,
+    taskbar_follow: crate::taskbar_follow::TaskbarFollow,
     ui_offset: [f32; 3],
     ui_anchor_ready: bool,
     lifts: BTreeMap<(u64, String), f32>,
@@ -280,7 +272,7 @@ impl Desktop {
             state_dirty: false,
             pending_pointer: None,
             focused: false,
-            head_height: None,
+            taskbar_follow: Default::default(),
             ui_offset: [0.; 3],
             ui_anchor_ready: true,
             lifts: BTreeMap::new(),
@@ -319,13 +311,13 @@ impl Desktop {
                 v
             })
             .collect();
-        let mut components:Vec<_>=self.peers.values().filter(|p|!p.role.is_empty()).map(|p|json!({"component_id":p.id.to_string(),"component_generation":p.generation,"role":p.role,"scene_revision":p.revision.to_string(),"node_count":p.nodes.len(),"root":{"logical_size":p.root.logical,"size_m":p.root.size,"position_m":p.root.position}})).collect();
+        let mut components:Vec<_>=self.peers.values().filter(|p|!p.role.is_empty()).map(|p|json!({"component_id":p.id.to_string(),"component_generation":p.generation,"role":p.role,"scene_revision":p.revision.to_string(),"node_count":p.nodes.len(),"root":{"logical_size":p.root.logical,"size_m":p.root.size,"position_m":self.root_frame(p).position,"policy":p.root.policy}})).collect();
         if let Some((_, role, component, _)) = &self.active_peer {
             if !role.is_empty() {
                 components.push(component.clone());
             }
         }
-        json!({"state_revision":self.revision.to_string(),"windows":windows,"components":components,"active_workspace":self.workspace,"focus_epoch":self.focus_epoch.to_string(),"focus":self.focus,"focus_applied":self.focus_applied,"system":self.system,"clipboard":self.clipboard_summary(),"stats":self.stats})
+        json!({"state_revision":self.revision.to_string(),"windows":windows,"components":components,"active_workspace":self.workspace,"focus_epoch":self.focus_epoch.to_string(),"focus":self.focus,"focus_applied":self.focus_applied,"system":self.system,"clipboard":self.clipboard_summary(),"stats":self.stats,"taskbar_follow":self.taskbar_follow,"taskbar_capture_frozen":self.taskbar_captured()})
     }
     fn clipboard_summary(&self) -> Value {
         if self.clipboard.is_null() {
@@ -441,7 +433,7 @@ impl Desktop {
                         self.active_peer = Some((
                             peer.id,
                             peer.role.clone(),
-                            json!({"component_id":peer.id.to_string(),"component_generation":peer.generation,"role":peer.role,"scene_revision":peer.revision.to_string(),"node_count":peer.nodes.len(),"root":{"logical_size":peer.root.logical,"size_m":peer.root.size,"position_m":peer.root.position}}),
+                            json!({"component_id":peer.id.to_string(),"component_generation":peer.generation,"role":peer.role,"scene_revision":peer.revision.to_string(),"node_count":peer.nodes.len(),"root":{"logical_size":peer.root.logical,"size_m":peer.root.size,"position_m":self.root_frame(&peer).position,"policy":peer.root.policy}}),
                             peer.capabilities.clone(),
                         ));
                         let handled = self.handle(&mut peer, packet);
@@ -745,6 +737,16 @@ impl Desktop {
                                     || (node.kind == "Group" && node.style_id.is_empty()),
                                 "unregistered style id"
                             );
+                            ensure!(
+                                ["world_locked", "dock_lazy_follow"]
+                                    .contains(&node.spatial_policy.as_str())
+                                    && (node.spatial_policy == "world_locked"
+                                        || (node.spatial_panel
+                                            && p.capabilities
+                                                .iter()
+                                                .any(|c| c == "scene.spatial-policy.v1"))),
+                                "invalid or unnegotiated spatial policy"
+                            );
                             if node.spatial_panel {
                                 ensure!(
                                     node.kind == "Group"
@@ -796,18 +798,9 @@ impl Desktop {
                             );
                             root.logical = vector(&op["logical_size"])?;
                             root.size = vector(&op["size_m"])?;
-                            let anchor = vector(&op["position_m"])?;
-                            root.anchor = anchor;
+                            root.position = vector(&op["position_m"])?;
                             if op.get("rotation_degrees").is_some() {
                                 root.rotation = vector(&op["rotation_degrees"])?;
-                            }
-                            if root.policy != "dock_lazy_follow" || !root.initialized {
-                                root.position = anchor;
-                            }
-                            if root.policy != "dock_lazy_follow" {
-                                root.yaw = 0.;
-                                root.initialized = false;
-                                root.following = false;
                             }
                             ensure!(
                                 root.logical.iter().all(|v| *v >= 1. && *v <= 2048.)
@@ -1739,65 +1732,32 @@ impl Desktop {
         self.ui_offset = offset.unwrap_or([0.; 3]);
     }
 
-    /// A lazy-follow Dock uses the actual located head pose and keeps a capture
-    /// stationary until release. World-locked application planes remain fixed.
+    /// Every opted-in root/panel uses one anchor; capturing any island freezes all.
+    /// Actual application windows and unrelated System UI panels remain world locked.
     pub fn update_head(&mut self, position: [f32; 3], q: [f32; 4], dt: f32) -> bool {
-        if !self.ui_anchor_ready {
+        if !self.ui_anchor_ready || self.taskbar_captured() {
             return false;
         }
-        let position = crate::spatial::sub(position, self.ui_offset);
-        let height = *self.head_height.get_or_insert(position[1]);
-        let yaw = (2. * (q[0] * q[2] + q[3] * q[1])).atan2(1. - 2. * (q[0] * q[0] + q[1] * q[1]));
-        let mut changed = false;
-        for p in self
-            .peers
-            .values_mut()
-            .filter(|p| p.root.policy == "dock_lazy_follow")
-        {
-            if self
-                .capture
-                .as_ref()
-                .is_some_and(|c| matches!(&c.target,Target::Node(id,_)if *id==p.id))
-            {
-                continue;
-            }
-            let root = &mut p.root;
-            let mut delta = (yaw - root.yaw + std::f32::consts::PI)
-                .rem_euclid(std::f32::consts::TAU)
-                - std::f32::consts::PI;
-            if !root.initialized {
-                root.yaw = yaw;
-                root.initialized = true;
-                root.following = true;
-                delta = 0.;
-            }
-            if delta.abs() > 20f32.to_radians() {
-                root.following = true;
-            }
-            if root.following {
-                let step = delta.clamp(-3. * dt, 3. * dt);
-                root.yaw += step;
-                if delta.abs() < 2f32.to_radians() {
-                    root.following = false;
-                }
-                changed |= step.abs() > 0.00001;
-            }
-            let (sin, cos) = root.yaw.sin_cos();
-            let target = [
-                position[0] + cos * root.anchor[0] + sin * root.anchor[2],
-                position[1] + root.anchor[1] - height,
-                position[2] - sin * root.anchor[0] + cos * root.anchor[2],
-            ];
-            let alpha = (dt * 8.).clamp(0., 1.);
-            for i in 0..3 {
-                let step = (target[i] - root.position[i]) * alpha;
-                if step.abs() > 0.00001 {
-                    root.position[i] += step;
-                    changed = true;
-                }
-            }
+        if !self.peers.values().any(|p| {
+            p.root.policy == "dock_lazy_follow"
+                || p.nodes
+                    .values()
+                    .any(|n| n.spatial_panel && n.spatial_policy == "dock_lazy_follow")
+        }) {
+            return false;
         }
-        changed
+        self.taskbar_follow
+            .update(crate::spatial::sub(position, self.ui_offset), q, dt)
+    }
+    fn taskbar_captured(&self) -> bool {
+        self.capture.as_ref().is_some_and(|c| match &c.target {
+            Target::Node(id, node) => self.peers.get(id).is_some_and(|p| {
+                p.nodes
+                    .get(node)
+                    .is_some_and(|n| Self::node_policy(p, n) == "dock_lazy_follow")
+            }),
+            _ => false,
+        })
     }
     fn logical(w: &Window) -> [f32; 2] {
         [
@@ -1822,3 +1782,7 @@ impl Drop for Desktop {
 
 #[path = "spatial_ui.rs"]
 pub(crate) mod spatial_ui;
+
+#[cfg(test)]
+#[path = "taskbar_follow_test.rs"]
+mod taskbar_follow_test;
