@@ -407,7 +407,13 @@ impl Model {
         Ok(())
     }
 
-    pub unsafe fn draw(&self, cmd: vk::CommandBuffer, view: &xr::View, state: &HandState) {
+    pub unsafe fn draw(
+        &self,
+        cmd: vk::CommandBuffer,
+        view: &xr::View,
+        state: &HandState,
+        alignment: xr::Quaternionf,
+    ) {
         unsafe {
             let d = &self.gpu.device;
             d.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::GRAPHICS, self.pipeline);
@@ -419,7 +425,10 @@ impl Model {
                 &[self.descriptor],
                 &[],
             );
-            for (pose, beam) in [(state.grip, false), (state.aim, true)] {
+            for (pose, beam) in [
+                (state.grip.map(|p| aligned_model_pose(p, alignment)), false),
+                (state.aim, true),
+            ] {
                 let Some(pose) = pose else {
                     continue;
                 };
@@ -514,4 +523,136 @@ pub fn load_models(gpu: Rc<Gpu>, pass: vk::RenderPass) -> [Option<Model>; 2] {
             }
         }
     })
+}
+
+#[derive(Deserialize)]
+struct AlignmentFile {
+    schema: u32,
+    left_xyzw: [f32; 4],
+    right_xyzw: [f32; 4],
+}
+
+/// Local visual alignment only. The tracked grip position and aim ray are never
+/// modified; a missing configuration has the identity rotation for both hands.
+pub struct Alignment {
+    pub rotations: [xr::Quaternionf; 2],
+    pub path: std::path::PathBuf,
+    next_poll: std::time::Instant,
+    content: Option<Vec<u8>>,
+    read_error: Option<String>,
+}
+impl Alignment {
+    pub fn new() -> Self {
+        let mut value = Self {
+            rotations: [xr::Quaternionf {
+                x: 0.,
+                y: 0.,
+                z: 0.,
+                w: 1.,
+            }; 2],
+            path: std::env::var_os("XR_CONTROLLER_ALIGNMENT_FILE")
+                .map(std::path::PathBuf::from)
+                .unwrap_or_else(|| "/etc/xr/devices/a081/controller-alignment.json".into()),
+            next_poll: std::time::Instant::now(),
+            content: None,
+            read_error: None,
+        };
+        value.poll();
+        value
+    }
+
+    pub fn poll(&mut self) {
+        let now = std::time::Instant::now();
+        if now < self.next_poll {
+            return;
+        }
+        self.next_poll = now + std::time::Duration::from_secs(1);
+        let content = match std::fs::read(&self.path) {
+            Ok(bytes) => Some(bytes),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+            Err(error) => {
+                let error = error.to_string();
+                if self.read_error.as_ref() != Some(&error) {
+                    eprintln!(
+                        "XR_CONTROLLER_ALIGNMENT_REJECTED path={} error={error}; retaining previous visual rotation",
+                        self.path.display()
+                    );
+                    self.read_error = Some(error);
+                }
+                return;
+            }
+        };
+        self.read_error = None;
+        if content == self.content {
+            return;
+        }
+        self.content = content;
+        let parsed = (|| -> Result<[xr::Quaternionf; 2]> {
+            let Some(bytes) = &self.content else {
+                return Ok([xr::Quaternionf {
+                    x: 0.,
+                    y: 0.,
+                    z: 0.,
+                    w: 1.,
+                }; 2]);
+            };
+            let file: AlignmentFile = serde_json::from_slice(bytes)?;
+            ensure!(file.schema == 1, "unsupported visual alignment schema");
+            let mut result = [xr::Quaternionf {
+                x: 0.,
+                y: 0.,
+                z: 0.,
+                w: 1.,
+            }; 2];
+            for (slot, q) in result.iter_mut().zip([file.left_xyzw, file.right_xyzw]) {
+                ensure!(
+                    q.iter().all(|v| v.is_finite()),
+                    "visual alignment quaternion must be finite"
+                );
+                let norm: f32 = q.iter().map(|v| v * v).sum();
+                ensure!(
+                    (norm - 1.).abs() <= 0.01,
+                    "visual alignment quaternion must be normalized"
+                );
+                let scale = norm.sqrt().recip();
+                *slot = xr::Quaternionf {
+                    x: q[0] * scale,
+                    y: q[1] * scale,
+                    z: q[2] * scale,
+                    w: q[3] * scale,
+                };
+            }
+            Ok(result)
+        })();
+        match parsed {
+            Ok(rotations) => {
+                self.rotations = rotations;
+                eprintln!(
+                    "XR_CONTROLLER_ALIGNMENT path={} left_xyzw={:?} right_xyzw={:?}",
+                    self.path.display(),
+                    quaternion_array(rotations[0]),
+                    quaternion_array(rotations[1])
+                );
+            }
+            Err(error) => eprintln!(
+                "XR_CONTROLLER_ALIGNMENT_REJECTED path={} error={error:#}; retaining previous visual rotation",
+                self.path.display()
+            ),
+        }
+    }
+}
+
+pub fn quaternion_array(q: xr::Quaternionf) -> [f32; 4] {
+    [q.x, q.y, q.z, q.w]
+}
+
+pub fn aligned_model_pose(mut pose: xr::Posef, local: xr::Quaternionf) -> xr::Posef {
+    let q = pose.orientation;
+    pose.orientation = xr::Quaternionf {
+        x: q.w * local.x + q.x * local.w + q.y * local.z - q.z * local.y,
+        y: q.w * local.y - q.x * local.z + q.y * local.w + q.z * local.x,
+        z: q.w * local.z + q.x * local.y - q.y * local.x + q.z * local.w,
+        w: q.w * local.w - q.x * local.x - q.y * local.y - q.z * local.z,
+    };
+    pose
 }

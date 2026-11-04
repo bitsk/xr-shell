@@ -223,7 +223,7 @@ Snapshots expose `taskbar_mode`; window/world-locked panel policies are unchange
 ## Controller input
 
 Shell reads both hands through OpenXR actions, using the runtime's current
-interaction profile. KHR simple and Vive select buttons and Oculus Touch trigger
+interaction profile. KHR simple and Vive select buttons, Touch A/X clicks and trigger
 values route the same ray press/drag/release path. Grip and aim are separate pose
 actions at the predicted display time; models use the grip pose, while pointer
 hit testing uses aim. Invalid, non-finite or inactive poses are omitted every
@@ -243,3 +243,18 @@ be released before it can issue a new press after recovery. Both hands are
 sampled even when one owns a drag. The active capture remains authoritative;
 other-hand presses are not replayed when it releases. Physical controller
 motion, button mappings and grip/aim alignment require device acceptance.
+
+## Controller model alignment
+
+Optional artwork is loaded from `/usr/share/xr/devices/a081/controllers`
+(or `XR_CONTROLLER_MODEL_DIR`), with separate `left` and `right` directories
+containing `mesh.json` and `texture.png`. Artwork remains separately supplied
+and checksum locked.
+
+Local visual calibration uses `/etc/xr/devices/a081/controller-alignment.json`
+(or `XR_CONTROLLER_ALIGNMENT_FILE`). Schema 1 has normalized `left_xyzw` and
+`right_xyzw` quaternions. This configuration is checked once per second and
+applied as `grip_orientation * local_model_rotation`; grip position, original
+actions and aim rays are unchanged. Missing configuration selects identity.
+Capture metadata records the original grip/aim and the separate visual model
+pose. Model calibration does not establish tracking or spatial accuracy.
