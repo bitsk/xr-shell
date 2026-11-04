@@ -59,6 +59,7 @@ fn message_capability(kind: &str) -> &'static str {
         "ShmBufferCommit" | "BufferRelease" => "shm.v1",
         "FocusChanged" | "FocusApplied" | "SurfaceInput" => "focus.v1",
         "WindowIntent" | "RequestResult" => "window.v1",
+        "TaskbarIntent" | "TaskbarApplied" => "taskbar.v1",
         "ComponentIntent" | "ComponentCommand" | "SystemState" | "TextCommit" | "KeyIntent" => {
             "system.v1"
         }
@@ -317,7 +318,7 @@ impl Desktop {
                 components.push(component.clone());
             }
         }
-        json!({"state_revision":self.revision.to_string(),"windows":windows,"components":components,"active_workspace":self.workspace,"focus_epoch":self.focus_epoch.to_string(),"focus":self.focus,"focus_applied":self.focus_applied,"system":self.system,"clipboard":self.clipboard_summary(),"stats":self.stats,"taskbar_follow":self.taskbar_follow,"taskbar_capture_frozen":self.taskbar_captured()})
+        json!({"state_revision":self.revision.to_string(),"windows":windows,"components":components,"active_workspace":self.workspace,"focus_epoch":self.focus_epoch.to_string(),"focus":self.focus,"focus_applied":self.focus_applied,"system":self.system,"clipboard":self.clipboard_summary(),"stats":self.stats,"taskbar_mode":self.taskbar_follow.mode(),"taskbar_follow":self.taskbar_follow,"taskbar_capture_frozen":self.taskbar_captured()})
     }
     fn clipboard_summary(&self) -> Value {
         if self.clipboard.is_null() {
@@ -1144,6 +1145,19 @@ impl Desktop {
                 );
                 self.to_role(role, "ComponentCommand", payload.clone())?;
                 p.send(&self.session, "IntentAccepted", request, payload.clone())?;
+            }
+            "TaskbarIntent" => {
+                ensure!(p.role == "system_ui", "wrong_role");
+                let mode = payload["mode"].as_str().context("taskbar mode missing")?;
+                ensure!(["fixed", "follow"].contains(&mode), "invalid taskbar mode");
+                self.taskbar_follow.set_mode(mode == "follow");
+                self.changed();
+                p.send(
+                    &self.session,
+                    "TaskbarApplied",
+                    request,
+                    json!({"mode":self.taskbar_follow.mode()}),
+                )?;
             }
             "SystemState" => {
                 ensure!(p.role == "system_ui", "wrong_role");

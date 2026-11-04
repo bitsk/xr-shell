@@ -212,3 +212,9 @@ Unrelated world-locked panels and application windows retain their positions.
 The negotiated `scene.spatial-policy.v1` extension selects group policy explicitly;
 missing group policy remains world locked. Snapshots expose `taskbar_follow`
 and `taskbar_capture_frozen` for diagnostics without injecting XR poses.
+
+The taskbar defaults to `fixed`. The control centre can select fixed/follow;
+fixing preserves the current pose and enabling follow starts smooth motion.
+System UI persists only acknowledged choices in its per-user preferences.
+`taskbar.v1` provides `TaskbarIntent{mode:fixed|follow}` / `TaskbarApplied{mode}`.
+Snapshots expose `taskbar_mode`; window/world-locked panel policies are unchanged.

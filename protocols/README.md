@@ -91,3 +91,9 @@ The renderer currently rasterises Kit primitives and application snapshots
 through an explicit CPU path before Vulkan samples spatial planes into the
 runtime's two eye swapchains. DMA-BUF, optimized retained rendering and SDK
 build closure on clean target distributions remain separate milestones.
+
+- `taskbar.v1`: System UI sends `TaskbarIntent{mode:fixed|follow}` and receives
+  `TaskbarApplied{mode}`. The Shell starts fixed, freezes its current rigid
+  taskbar pose on fixed, and smoothly resumes shared following on follow.
+  Snapshots expose `taskbar_mode`; System UI persists acknowledged choices
+  and restores them at startup. Independent world-locked panels stay fixed.

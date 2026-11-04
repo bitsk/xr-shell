@@ -103,6 +103,11 @@ fn islands_share_motion_capture_and_scene_refresh_without_moving_world_panels() 
     };
     let world = frame(&d, 2, "control");
     d.update_head([0., 1.6, 0.], [0., 0., 0., 1.], 1. / 72.);
+    assert_eq!(d.taskbar_follow.mode(), "fixed");
+    let fixed_center = frame(&d, 1, "center");
+    d.update_head([0.3, 1.7, 0.2], [0., 0.3826834, 0., 0.9238795], 1.);
+    close(frame(&d, 1, "center").position, fixed_center.position);
+    d.taskbar_follow.set_mode(true);
     let yaw = 45f32.to_radians();
     let q = [0., (yaw / 2.).sin(), 0., (yaw / 2.).cos()];
     for _ in 0..120 {
@@ -173,6 +178,14 @@ fn islands_share_motion_capture_and_scene_refresh_without_moving_world_panels() 
         ),
         scale(center.right, 0.9632),
     );
+    let current = frame(&d, 1, "center");
+    d.taskbar_follow.set_mode(false);
+    d.update_head([1., 2., 1.], [0., 0., 0., 1.], 1.);
+    close(frame(&d, 1, "center").position, current.position);
+    close(frame(&d, 1, "center").normal(), current.normal());
+    d.taskbar_follow.set_mode(true);
+    close(frame(&d, 1, "center").position, current.position);
+    close(frame(&d, 1, "center").normal(), current.normal());
     drop(d);
     std::fs::remove_dir_all(dir).unwrap();
 }

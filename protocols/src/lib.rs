@@ -19,6 +19,7 @@ pub const CAPABILITIES: &[&str] = &[
     "core.v1",
     "scene.v1",
     "scene.spatial-policy.v1",
+    "taskbar.v1",
     "snapshot.v1",
     "input.v1",
     "shm.v1",

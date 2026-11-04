@@ -11,6 +11,7 @@ pub struct TaskbarFollow {
     initialized: bool,
     following: bool,
     head_height: Option<f32>,
+    follow_enabled: bool,
 }
 impl Default for TaskbarFollow {
     fn default() -> Self {
@@ -20,6 +21,7 @@ impl Default for TaskbarFollow {
             initialized: false,
             following: false,
             head_height: None,
+            follow_enabled: false,
         }
     }
 }
@@ -37,20 +39,28 @@ impl TaskbarFollow {
         frame.down = self.rotate(frame.down);
         frame
     }
+    pub fn mode(&self) -> &'static str {
+        if self.follow_enabled {
+            "follow"
+        } else {
+            "fixed"
+        }
+    }
+    pub fn set_mode(&mut self, follow: bool) {
+        self.follow_enabled = follow;
+        self.following = follow;
+    }
     pub fn update(&mut self, position: [f32; 3], q: [f32; 4], dt: f32) -> bool {
         let height = *self.head_height.get_or_insert(position[1]);
+        self.initialized = true;
+        if !self.follow_enabled {
+            return false;
+        }
         let yaw = (2. * (q[0] * q[2] + q[3] * q[1])).atan2(1. - 2. * (q[0] * q[0] + q[1] * q[1]));
-        let mut delta = (yaw - self.yaw_radians + std::f32::consts::PI)
+        let delta = (yaw - self.yaw_radians + std::f32::consts::PI)
             .rem_euclid(std::f32::consts::TAU)
             - std::f32::consts::PI;
         let mut changed = false;
-        if !self.initialized {
-            self.yaw_radians = yaw;
-            self.initialized = true;
-            self.following = true;
-            changed = true;
-            delta = 0.;
-        }
         if delta.abs() > 20f32.to_radians() {
             self.following = true;
         }
