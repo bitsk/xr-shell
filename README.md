@@ -218,3 +218,28 @@ fixing preserves the current pose and enabling follow starts smooth motion.
 System UI persists only acknowledged choices in its per-user preferences.
 `taskbar.v1` provides `TaskbarIntent{mode:fixed|follow}` / `TaskbarApplied{mode}`.
 Snapshots expose `taskbar_mode`; window/world-locked panel policies are unchanged.
+
+
+## Controller input
+
+Shell reads both hands through OpenXR actions, using the runtime's current
+interaction profile. KHR simple and Vive select buttons and Oculus Touch trigger
+values route the same ray press/drag/release path. Grip and aim are separate pose
+actions at the predicted display time; models use the grip pose, while pointer
+hit testing uses aim. Invalid, non-finite or inactive poses are omitted every
+frame. Pose freshness and the original hardware packet validity gates remain
+the runtime's responsibility.
+
+Touch thumbsticks (or Vive trackpads) scroll the focused application with a
+0.18 dead zone and elapsed-time scaling. Left menu and left Y/right B send a
+back action: release capture, then an Escape press/release to the acknowledged
+focused application. SteamVR may reserve its system key, so the application
+back binding does not depend on that key. Grip pressure is exposed in the
+controller state without assigning it an arbitrary desktop action.
+
+Input is routed only while the XR session is FOCUSED. Focus loss, invalid aim
+or a failed action query cancels the affected pointer; a held trigger/menu must
+be released before it can issue a new press after recovery. Both hands are
+sampled even when one owns a drag. The active capture remains authoritative;
+other-hand presses are not replayed when it releases. Physical controller
+motion, button mappings and grip/aim alignment require device acceptance.

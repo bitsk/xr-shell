@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 mod art;
+mod controller_model;
 mod desktop;
 mod environment;
 mod gpu;
@@ -509,6 +510,8 @@ fn frame_loop(
         let state = waiter.wait()?;
         stream.begin()?;
         summary.waited_frames += 1;
+        // Clear visibility even while the runtime suspends scene rendering.
+        renderer.update_controllers(&[input::HandState::default(); 2]);
         if !state.should_render {
             stream.end(
                 state.predicted_display_time,
@@ -556,6 +559,7 @@ fn frame_loop(
         }
         if let (Some(i), Some(d)) = (input.as_mut(), desktop.as_mut()) {
             i.update(session, space, state.predicted_display_time, d)?;
+            renderer.update_controllers(i.controllers());
         }
         if let Some(d) = desktop.as_mut() {
             d.animate(dt);
@@ -702,6 +706,7 @@ fn write_capture(
         "predicted_display_time_ns":time,"projection_submitted":true,"view_count":2,
         "view_state_flags": ViewFlags::from(flags),
         "ui_anchor": ui_anchor,
+        "controllers": renderer.controller_status(),
         "pixels":"actual GPU swapchain readback after rendering","panorama_translation":"ignored", "eyes":eyes}),
     )
 }

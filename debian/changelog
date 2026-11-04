@@ -1,3 +1,10 @@
+xr-shell (0.2.11) unstable; urgency=medium
+
+  * Bind real controller grip, trigger, back and thumbstick actions.
+  * Render separately installed stock controller meshes with depth and textures.
+
+ -- bits <bigbits@hackx.cc>  Wed, 04 Nov 2026 23:46:52 +0800
+
 xr-shell (0.2.10) unstable; urgency=medium
 
   * Default to a fixed taskbar with explicit smooth fixed/follow mode changes.

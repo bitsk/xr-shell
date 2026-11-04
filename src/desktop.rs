@@ -1341,6 +1341,24 @@ impl Desktop {
             self.cancel(reason);
         }
     }
+    /// Controller back releases any capture before forwarding an Escape tap.
+    pub fn controller_back(&mut self) -> Result<()> {
+        ensure!(self.focused, "XR session not focused");
+        self.cancel("controller back");
+        if self.focus.is_some() && self.focus_applied {
+            self.surface_input(json!({"kind":"key","keycode":1,"pressed":true}))?;
+            self.surface_input(json!({"kind":"key","keycode":1,"pressed":false}))?;
+        }
+        Ok(())
+    }
+    pub fn controller_scroll(&mut self, delta: [f32; 2]) -> Result<()> {
+        ensure!(self.focused, "XR session not focused");
+        ensure!(delta.iter().all(|v| v.is_finite()), "invalid scroll delta");
+        if self.focus.is_some() && self.focus_applied {
+            self.surface_input(json!({"kind":"scroll","dx":delta[0],"dy":delta[1]}))?;
+        }
+        Ok(())
+    }
     pub fn set_xr_focus(&mut self, focused: bool) {
         if self.focused && !focused {
             self.cancel("XR focus lost");

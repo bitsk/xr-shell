@@ -8,10 +8,82 @@ use ash::{vk, vk::Handle};
 use openxr as xr;
 use std::{io::Cursor, rc::Rc};
 
+struct DepthTarget {
+    gpu: Rc<Gpu>,
+    image: vk::Image,
+    memory: vk::DeviceMemory,
+    view: vk::ImageView,
+}
+impl DepthTarget {
+    fn new(gpu: Rc<Gpu>, extent: vk::Extent2D) -> Result<Self> {
+        let mut depth = Self {
+            gpu,
+            image: vk::Image::null(),
+            memory: vk::DeviceMemory::null(),
+            view: vk::ImageView::null(),
+        };
+        unsafe {
+            let d = &depth.gpu.device;
+            depth.image = d.create_image(
+                &vk::ImageCreateInfo::default()
+                    .image_type(vk::ImageType::TYPE_2D)
+                    .format(vk::Format::D32_SFLOAT)
+                    .extent(vk::Extent3D {
+                        width: extent.width,
+                        height: extent.height,
+                        depth: 1,
+                    })
+                    .mip_levels(1)
+                    .array_layers(1)
+                    .samples(vk::SampleCountFlags::TYPE_1)
+                    .tiling(vk::ImageTiling::OPTIMAL)
+                    .usage(vk::ImageUsageFlags::DEPTH_STENCIL_ATTACHMENT)
+                    .sharing_mode(vk::SharingMode::EXCLUSIVE),
+                None,
+            )?;
+            let req = d.get_image_memory_requirements(depth.image);
+            depth.memory = d.allocate_memory(
+                &vk::MemoryAllocateInfo::default()
+                    .allocation_size(req.size)
+                    .memory_type_index(depth.gpu.memory_type(
+                        req.memory_type_bits,
+                        vk::MemoryPropertyFlags::DEVICE_LOCAL,
+                    )?),
+                None,
+            )?;
+            d.bind_image_memory(depth.image, depth.memory, 0)?;
+            depth.view = d.create_image_view(
+                &vk::ImageViewCreateInfo::default()
+                    .image(depth.image)
+                    .view_type(vk::ImageViewType::TYPE_2D)
+                    .format(vk::Format::D32_SFLOAT)
+                    .subresource_range(
+                        vk::ImageSubresourceRange::default()
+                            .aspect_mask(vk::ImageAspectFlags::DEPTH)
+                            .level_count(1)
+                            .layer_count(1),
+                    ),
+                None,
+            )?;
+        }
+        Ok(depth)
+    }
+}
+impl Drop for DepthTarget {
+    fn drop(&mut self) {
+        unsafe {
+            self.gpu.device.destroy_image_view(self.view, None);
+            self.gpu.device.destroy_image(self.image, None);
+            self.gpu.device.free_memory(self.memory, None);
+        }
+    }
+}
+
 struct ImageTarget {
     image: vk::Image,
     view: vk::ImageView,
     framebuffer: vk::Framebuffer,
+    depth: Option<DepthTarget>,
 }
 pub struct Eye {
     gpu: Rc<Gpu>,
@@ -37,6 +109,8 @@ pub struct Renderer {
     pass: vk::RenderPass,
     pipeline: vk::Pipeline,
     spatial_pipeline: vk::Pipeline,
+    controllers: [Option<crate::controller_model::Model>; 2],
+    controller_states: [crate::input::HandState; 2],
     draw_count: u32,
     uv_map: std::collections::BTreeMap<String, [f32; 4]>,
     layout: vk::PipelineLayout,
@@ -83,6 +157,8 @@ impl Renderer {
             pass: vk::RenderPass::null(),
             pipeline: vk::Pipeline::null(),
             spatial_pipeline: vk::Pipeline::null(),
+            controllers: [None, None],
+            controller_states: [crate::input::HandState::default(); 2],
             draw_count: 0,
             uv_map: std::collections::BTreeMap::new(),
             layout: vk::PipelineLayout::null(),
@@ -132,6 +208,7 @@ impl Renderer {
         r.pipeline().context("create panorama Vulkan pipeline")?;
         r.create_spatial_pipeline()
             .context("create spatial Vulkan pipeline")?;
+        r.controllers = crate::controller_model::load_models(r.gpu.clone(), r.pass);
         eprintln!("XR_INIT_STAGE=renderer-resources STATUS=complete");
         for (index, v) in views.iter().enumerate() {
             let extent = vk::Extent2D {
@@ -182,8 +259,10 @@ impl Renderer {
                     image: vk::Image::from_raw(image),
                     view: vk::ImageView::null(),
                     framebuffer: vk::Framebuffer::null(),
+                    depth: None,
                 });
                 let target = eye.images.last_mut().unwrap();
+                target.depth = Some(DepthTarget::new(r.gpu.clone(), extent)?);
                 unsafe {
                     target.view = r
                         .gpu
@@ -205,7 +284,7 @@ impl Renderer {
                         .create_framebuffer(
                             &vk::FramebufferCreateInfo::default()
                                 .render_pass(r.pass)
-                                .attachments(&[target.view])
+                                .attachments(&[target.view, target.depth.as_ref().unwrap().view])
                                 .width(extent.width)
                                 .height(extent.height)
                                 .layers(1),
@@ -420,28 +499,53 @@ impl Renderer {
     fn pipeline(&mut self) -> Result<()> {
         unsafe {
             let d = &self.gpu.device;
-            let attachments = [vk::AttachmentDescription::default()
-                .format(self.format)
-                .samples(vk::SampleCountFlags::TYPE_1)
-                .load_op(vk::AttachmentLoadOp::DONT_CARE)
-                .store_op(vk::AttachmentStoreOp::STORE)
-                .stencil_load_op(vk::AttachmentLoadOp::DONT_CARE)
-                .stencil_store_op(vk::AttachmentStoreOp::DONT_CARE)
-                .initial_layout(vk::ImageLayout::UNDEFINED)
-                .final_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)];
+            let attachments = [
+                vk::AttachmentDescription::default()
+                    .format(self.format)
+                    .samples(vk::SampleCountFlags::TYPE_1)
+                    .load_op(vk::AttachmentLoadOp::DONT_CARE)
+                    .store_op(vk::AttachmentStoreOp::STORE)
+                    .stencil_load_op(vk::AttachmentLoadOp::DONT_CARE)
+                    .stencil_store_op(vk::AttachmentStoreOp::DONT_CARE)
+                    .initial_layout(vk::ImageLayout::UNDEFINED)
+                    .final_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL),
+                vk::AttachmentDescription::default()
+                    .format(vk::Format::D32_SFLOAT)
+                    .samples(vk::SampleCountFlags::TYPE_1)
+                    .load_op(vk::AttachmentLoadOp::CLEAR)
+                    .store_op(vk::AttachmentStoreOp::DONT_CARE)
+                    .stencil_load_op(vk::AttachmentLoadOp::DONT_CARE)
+                    .stencil_store_op(vk::AttachmentStoreOp::DONT_CARE)
+                    .initial_layout(vk::ImageLayout::UNDEFINED)
+                    .final_layout(vk::ImageLayout::DEPTH_STENCIL_ATTACHMENT_OPTIMAL),
+            ];
             let colour = [vk::AttachmentReference {
                 attachment: 0,
                 layout: vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
             }];
+            let depth = vk::AttachmentReference {
+                attachment: 1,
+                layout: vk::ImageLayout::DEPTH_STENCIL_ATTACHMENT_OPTIMAL,
+            };
             let subpasses = [vk::SubpassDescription::default()
                 .pipeline_bind_point(vk::PipelineBindPoint::GRAPHICS)
-                .color_attachments(&colour)];
+                .color_attachments(&colour)
+                .depth_stencil_attachment(&depth)];
             let deps = [vk::SubpassDependency::default()
                 .src_subpass(vk::SUBPASS_EXTERNAL)
                 .dst_subpass(0)
-                .src_stage_mask(vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT)
-                .dst_stage_mask(vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT)
-                .dst_access_mask(vk::AccessFlags::COLOR_ATTACHMENT_WRITE)];
+                .src_stage_mask(
+                    vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT
+                        | vk::PipelineStageFlags::LATE_FRAGMENT_TESTS,
+                )
+                .dst_stage_mask(
+                    vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT
+                        | vk::PipelineStageFlags::EARLY_FRAGMENT_TESTS,
+                )
+                .dst_access_mask(
+                    vk::AccessFlags::COLOR_ATTACHMENT_WRITE
+                        | vk::AccessFlags::DEPTH_STENCIL_ATTACHMENT_WRITE,
+                )];
             self.pass = d.create_render_pass(
                 &vk::RenderPassCreateInfo::default()
                     .attachments(&attachments)
@@ -504,6 +608,7 @@ impl Renderer {
             let dynamic_states = [vk::DynamicState::VIEWPORT, vk::DynamicState::SCISSOR];
             let dynamic =
                 vk::PipelineDynamicStateCreateInfo::default().dynamic_states(&dynamic_states);
+            let depth_state = vk::PipelineDepthStencilStateCreateInfo::default();
             let create = vk::GraphicsPipelineCreateInfo::default()
                 .stages(&stages)
                 .vertex_input_state(&vertices)
@@ -511,6 +616,7 @@ impl Renderer {
                 .viewport_state(&viewport)
                 .rasterization_state(&raster)
                 .multisample_state(&multi)
+                .depth_stencil_state(&depth_state)
                 .color_blend_state(&blend)
                 .dynamic_state(&dynamic)
                 .layout(self.layout)
@@ -530,6 +636,21 @@ impl Renderer {
             }
             Ok(())
         }
+    }
+
+    pub fn update_controllers(&mut self, states: &[crate::input::HandState; 2]) {
+        self.controller_states = *states;
+    }
+
+    pub fn controller_status(&self) -> serde_json::Value {
+        serde_json::json!({
+            "source": "OpenXR action grip/aim spaces at predicted display time",
+            "model_to_grip_calibrated": false,
+            "hands": self.controllers.iter().zip(&self.controller_states).enumerate().map(|(hand,(model,state))| {
+                let pose = |p: xr::Posef| serde_json::json!({"position_m":[p.position.x,p.position.y,p.position.z],"orientation_xyzw":[p.orientation.x,p.orientation.y,p.orientation.z,p.orientation.w]});
+                serde_json::json!({"hand":if hand==0 {"left"} else {"right"}, "loaded":model.is_some(), "directory":model.as_ref().map(|m|&m.directory), "visible":model.is_some() && state.grip.is_some(), "grip":state.grip.map(pose), "aim":state.aim.map(pose), "select":state.select,"trigger":state.trigger,"squeeze":state.squeeze,"menu":state.menu,"stick":state.stick})
+            }).collect::<Vec<_>>()
+        })
     }
 
     pub fn render(
@@ -566,7 +687,16 @@ impl Renderer {
                 &vk::RenderPassBeginInfo::default()
                     .render_pass(self.pass)
                     .framebuffer(image.framebuffer)
-                    .render_area(rect),
+                    .render_area(rect)
+                    .clear_values(&[
+                        vk::ClearValue::default(),
+                        vk::ClearValue {
+                            depth_stencil: vk::ClearDepthStencilValue {
+                                depth: 1.,
+                                stencil: 0,
+                            },
+                        },
+                    ]),
                 vk::SubpassContents::INLINE,
             );
             d.cmd_set_viewport(
@@ -619,6 +749,27 @@ impl Renderer {
                 bytes,
             );
             d.cmd_draw(self.cmd, 3, 1, 0, 0);
+            for (model, state) in self.controllers.iter().zip(&self.controller_states) {
+                if let Some(model) = model {
+                    model.draw(self.cmd, view, state);
+                }
+            }
+            // Controller drawing uses a separate descriptor and push-constant layout.
+            d.cmd_bind_descriptor_sets(
+                self.cmd,
+                vk::PipelineBindPoint::GRAPHICS,
+                self.layout,
+                0,
+                &[self.descriptor],
+                &[],
+            );
+            d.cmd_push_constants(
+                self.cmd,
+                self.layout,
+                vk::ShaderStageFlags::FRAGMENT | vk::ShaderStageFlags::VERTEX,
+                0,
+                bytes,
+            );
             if self.ui_anchor_ready && self.draw_count > 0 {
                 d.cmd_bind_pipeline(
                     self.cmd,
@@ -710,6 +861,7 @@ impl Drop for Renderer {
         unsafe {
             let _ = self.gpu.device.device_wait_idle();
             self.eyes.clear();
+            self.controllers = [None, None];
             let d = &self.gpu.device;
             d.destroy_pipeline(self.spatial_pipeline, None);
             d.destroy_pipeline(self.pipeline, None);
@@ -1128,6 +1280,10 @@ impl Renderer {
             let blend = vk::PipelineColorBlendStateCreateInfo::default().attachments(&attachments);
             let states = [vk::DynamicState::VIEWPORT, vk::DynamicState::SCISSOR];
             let dynamic = vk::PipelineDynamicStateCreateInfo::default().dynamic_states(&states);
+            let depth_state = vk::PipelineDepthStencilStateCreateInfo::default()
+                .depth_test_enable(true)
+                .depth_write_enable(false)
+                .depth_compare_op(vk::CompareOp::LESS_OR_EQUAL);
             let create = vk::GraphicsPipelineCreateInfo::default()
                 .stages(&stages)
                 .vertex_input_state(&vertices)
@@ -1135,6 +1291,7 @@ impl Renderer {
                 .viewport_state(&viewport)
                 .rasterization_state(&raster)
                 .multisample_state(&multi)
+                .depth_stencil_state(&depth_state)
                 .color_blend_state(&blend)
                 .dynamic_state(&dynamic)
                 .layout(self.layout)

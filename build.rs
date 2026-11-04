@@ -9,6 +9,8 @@ fn main() {
         "panorama.frag",
         "spatial.vert",
         "spatial.frag",
+        "controller.vert",
+        "controller.frag",
     ] {
         let input = PathBuf::from("shaders").join(name);
         let output = PathBuf::from(env::var_os("OUT_DIR").unwrap()).join(format!("{name}.spv"));
