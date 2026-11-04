@@ -1,3 +1,11 @@
+xr-shell (0.2.5) unstable; urgency=medium
+
+  * Add an opt-in UI origin frozen from actual valid stereo head positions.
+  * Translate UI rendering, sorting and ray hits together without changing XR poses.
+  * Record the original anchor sample and fixed offset in summary and captures.
+
+ -- bits <bigbits@hackx.cc>  Wed, 04 Nov 2026 12:17:20 +0800
+
 xr-shell (0.2.4) unstable; urgency=medium
 
   * Identify OpenXR reference-space and controller-action initialization steps.

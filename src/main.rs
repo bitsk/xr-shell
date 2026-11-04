@@ -7,6 +7,7 @@ mod input;
 mod raster;
 mod renderer;
 mod spatial;
+mod ui_anchor;
 
 use anyhow::{Context, Result, bail, ensure};
 use environment::Environment;
@@ -37,6 +38,7 @@ struct Options {
     components: bool,
     debug_input: bool,
     socket: Option<PathBuf>,
+    ui_anchor: ui_anchor::Mode,
 }
 impl Options {
     fn parse() -> Result<Option<Self>> {
@@ -49,6 +51,7 @@ impl Options {
             components: false,
             debug_input: false,
             socket: None,
+            ui_anchor: ui_anchor::Mode::Stage,
         };
         let mut args = env::args().skip(1);
         while let Some(arg) = args.next() {
@@ -83,6 +86,11 @@ impl Options {
                     );
                 }
                 "--validation" => o.validation = true,
+                "--ui-anchor" => {
+                    o.ui_anchor = ui_anchor::Mode::parse(
+                        &args.next().context("--ui-anchor requires stage or head")?,
+                    )?
+                }
                 "--view-scale" => {
                     o.scale = args
                         .next()
@@ -91,11 +99,14 @@ impl Options {
                 }
                 "--help" | "-h" => {
                     println!(
-                        "xr-shell [--environment FILE] [--seconds N] [--capture-dir DIR] [--validation] [--view-scale 0.1..1]\n\
+                        "xr-shell [--environment FILE] [--seconds N] [--capture-dir DIR] [--validation] [--view-scale 0.1..1] [--ui-anchor=stage|head]\n\
                               --seconds 0 runs until SIGINT/SIGTERM or runtime session shutdown.\n\
                               Write an ASCII label to DIR/capture.request to save that frame's two eyes and metadata."
                     );
                     return Ok(None);
+                }
+                _ if arg.starts_with("--ui-anchor=") => {
+                    o.ui_anchor = ui_anchor::Mode::parse(&arg[12..])?
                 }
                 _ => bail!("unknown argument: {arg}"),
             }
@@ -224,6 +235,7 @@ struct Summary {
     elapsed_seconds: f64,
     reference_space: Option<String>,
     initialization_stage: Option<&'static str>,
+    ui_anchor: ui_anchor::UiAnchor,
     cleanup: Cleanup,
     outcome: String,
     error: Option<String>,
@@ -247,6 +259,7 @@ fn entry() -> Result<()> {
         application: "xr-shell",
         version: env!("CARGO_PKG_VERSION"),
         validation_enabled: options.validation,
+        ui_anchor: ui_anchor::UiAnchor::new(options.ui_anchor),
         outcome: "initializing".into(),
         ..Default::default()
     };
@@ -361,16 +374,17 @@ fn run(options: &Options, summary: &mut Summary) -> Result<()> {
     let mut renderer = Renderer::new(gpu.clone(), &session, &config, &environment, options.scale)
         .context("initialize Vulkan renderer and OpenXR eye swapchains")?;
     eprintln!("XR_INIT_STAGE=renderer STATUS=complete");
+    renderer.set_ui_anchor(summary.ui_anchor.offset());
     summary.initialization_stage = Some("desktop");
     let mut desktop = if options.components {
         let path = options.socket.clone().unwrap_or_else(|| {
             PathBuf::from(env::var_os("XDG_RUNTIME_DIR").unwrap_or_else(|| "/tmp".into()))
                 .join("xr-desktop/shell.sock")
         });
-        Some(
-            desktop::Desktop::new(&path, options.debug_input)
-                .context("create desktop component socket")?,
-        )
+        let mut desktop = desktop::Desktop::new(&path, options.debug_input)
+            .context("create desktop component socket")?;
+        desktop.set_ui_anchor(summary.ui_anchor.offset());
+        Some(desktop)
     } else {
         None
     };
@@ -507,6 +521,19 @@ fn frame_loop(
         summary
             .view_state
             .observe(flags, &views, state.predicted_display_time);
+        if summary
+            .ui_anchor
+            .observe(flags, &views, state.predicted_display_time)
+        {
+            renderer.set_ui_anchor(summary.ui_anchor.offset());
+            if let Some(d) = desktop.as_mut() {
+                d.set_ui_anchor(summary.ui_anchor.offset());
+            }
+            eprintln!(
+                "XR_UI_ANCHOR_LOCKED={}",
+                serde_json::to_string(&summary.ui_anchor)?
+            );
+        }
         if !flags.contains(xr::ViewStateFlags::ORIENTATION_VALID) {
             stream.end(
                 state.predicted_display_time,
@@ -593,6 +620,7 @@ fn frame_loop(
                 renderer,
                 &views,
                 flags,
+                &summary.ui_anchor,
                 indices,
                 pixels,
             )?;
@@ -639,6 +667,7 @@ fn write_capture(
     renderer: &Renderer,
     views: &[xr::View],
     flags: xr::ViewStateFlags,
+    ui_anchor: &ui_anchor::UiAnchor,
     indices: [u32; 2],
     pixels: Vec<Option<Vec<u8>>>,
 ) -> Result<()> {
@@ -671,6 +700,7 @@ fn write_capture(
         &json!({"schema":1,"tag":tag,"frame":frame,
         "predicted_display_time_ns":time,"projection_submitted":true,"view_count":2,
         "view_state_flags": ViewFlags::from(flags),
+        "ui_anchor": ui_anchor,
         "pixels":"actual GPU swapchain readback after rendering","panorama_translation":"ignored", "eyes":eyes}),
     )
 }

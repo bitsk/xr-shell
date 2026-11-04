@@ -181,6 +181,8 @@ pub struct Desktop {
     pending_pointer: Option<Value>,
     pub focused: bool,
     head_height: Option<f32>,
+    ui_offset: [f32; 3],
+    ui_anchor_ready: bool,
     lifts: BTreeMap<(u64, String), f32>,
     expanded_orb: Option<String>,
     companion_hover: Option<String>,
@@ -279,6 +281,8 @@ impl Desktop {
             pending_pointer: None,
             focused: false,
             head_height: None,
+            ui_offset: [0.; 3],
+            ui_anchor_ready: true,
             lifts: BTreeMap::new(),
             expanded_orb: None,
             companion_hover: None,
@@ -1525,6 +1529,9 @@ impl Desktop {
             ["hover", "press", "drag", "release"].contains(&phase),
             "unknown pointer phase"
         );
+        if !self.ui_anchor_ready {
+            return Ok(());
+        }
         if self.capture.as_ref().is_some_and(|c| c.source != source) {
             if phase == "hover" {
                 return Ok(());
@@ -1727,9 +1734,18 @@ impl Desktop {
         }
         Ok(())
     }
+    pub fn set_ui_anchor(&mut self, offset: Option<[f32; 3]>) {
+        self.ui_anchor_ready = offset.is_some();
+        self.ui_offset = offset.unwrap_or([0.; 3]);
+    }
+
     /// A lazy-follow Dock uses the actual located head pose and keeps a capture
     /// stationary until release. World-locked application planes remain fixed.
     pub fn update_head(&mut self, position: [f32; 3], q: [f32; 4], dt: f32) -> bool {
+        if !self.ui_anchor_ready {
+            return false;
+        }
+        let position = crate::spatial::sub(position, self.ui_offset);
         let height = *self.head_height.get_or_insert(position[1]);
         let yaw = (2. * (q[0] * q[2] + q[3] * q[1])).atan2(1. - 2. * (q[0] * q[0] + q[1] * q[1]));
         let mut changed = false;

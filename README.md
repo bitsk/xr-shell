@@ -116,6 +116,18 @@ summary identifies the last major stage entered. `XR_VIEW_CONFIG` and swapchain
 records show runtime recommended/max samples and the unchanged requested
 sample count, format, size, array size and usage.
 
+`--ui-anchor=stage` (default) retains the existing UI layout coordinates.
+`--ui-anchor=head` waits for finite stereo poses marked orientation/position
+valid, then freezes the UI translation at their actual mean minus `[0,1.6,0]`.
+Until that sample arrives, the panorama and component processing continue but
+spatial UI is neither displayed nor hit. UI geometry and transparency sorting
+use the same fixed translation; mouse/controller rays and the existing lazy
+Dock layout use its inverse. Local pixel input stays in local coordinates.
+The runtime reference space, tracked views, projection layers, panorama and
+captured eye poses are unchanged. `ui_anchor` in summary and capture metadata
+records the source eye poses, flags, time and fixed offset. This mode does not
+continuously recenter the desktop or synthesize a tracked eye height.
+
 S1 deliberately waits for each eye's GPU work before releasing its XR image.
 This is a clear correctness baseline, not a claim of an optimized multi-frame
 pipeline or zero-copy display transport. Observation through a browser may

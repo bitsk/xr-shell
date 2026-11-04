@@ -55,6 +55,8 @@ pub struct Renderer {
     atlas: Option<Atlas>,
     ui_uniform: Option<Buffer>,
     panel_uniforms: Vec<f32>,
+    ui_offset: [f32; 3],
+    ui_anchor_ready: bool,
 }
 
 impl Renderer {
@@ -99,6 +101,8 @@ impl Renderer {
             atlas: None,
             ui_uniform: None,
             panel_uniforms: Vec::new(),
+            ui_offset: [0.; 3],
+            ui_anchor_ready: true,
         };
         // Everything allocated below is already owned by r, including on error.
         unsafe {
@@ -615,7 +619,7 @@ impl Renderer {
                 bytes,
             );
             d.cmd_draw(self.cmd, 3, 1, 0, 0);
-            if self.draw_count > 0 {
+            if self.ui_anchor_ready && self.draw_count > 0 {
                 d.cmd_bind_pipeline(
                     self.cmd,
                     vk::PipelineBindPoint::GRAPHICS,
@@ -1000,6 +1004,11 @@ impl Renderer {
             .collect();
         self.update_panel_poses(&poses, [0., 1.6, 0.])
     }
+    pub fn set_ui_anchor(&mut self, offset: Option<[f32; 3]>) {
+        self.ui_anchor_ready = offset.is_some();
+        self.ui_offset = offset.unwrap_or([0.; 3]);
+    }
+
     pub fn update_panel_poses(
         &mut self,
         poses: &[crate::desktop::spatial_ui::Geometry],
@@ -1008,7 +1017,7 @@ impl Renderer {
         let mut order: Vec<_> = poses.iter().collect();
         order.sort_by(|a, b| {
             let distance = |p: &crate::desktop::spatial_ui::Geometry| {
-                p.anchor
+                crate::spatial::add(p.anchor, self.ui_offset)
                     .iter()
                     .zip(origin)
                     .map(|(a, b)| (a - b) * (a - b))
@@ -1025,7 +1034,8 @@ impl Renderer {
         self.draw_count = order.len() as u32;
         let mut values = Vec::with_capacity(order.len() * 24);
         for p in order {
-            let f = p.frame;
+            let mut f = p.frame;
+            f.position = crate::spatial::add(f.position, self.ui_offset);
             let uv = self
                 .uv_map
                 .get(&p.id)

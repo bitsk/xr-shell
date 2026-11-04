@@ -656,6 +656,14 @@ impl Desktop {
         phase: &str,
         source: &str,
     ) -> Result<()> {
+        ensure!(
+            ["hover", "press", "drag", "release"].contains(&phase),
+            "unknown pointer phase"
+        );
+        if !self.ui_anchor_ready {
+            return Ok(());
+        }
+        let origin = sub(origin, self.ui_offset);
         if phase == "hover" && self.capture.as_ref().is_some_and(|c| c.source != source) {
             return Ok(());
         }
