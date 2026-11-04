@@ -13,6 +13,12 @@ enum Source {
     Resize(String, bool),
     Shadow(Box<Source>),
 }
+struct RayPick {
+    target: Option<Target>,
+    xy: [f32; 2],
+    distance: f32,
+    companion: Option<String>,
+}
 struct Draw {
     id: String,
     frame: Frame,
@@ -771,36 +777,10 @@ impl Desktop {
             Target::Resize(_, _) => c.resize_frame,
         }
     }
-    pub fn ray(
-        &mut self,
-        origin: [f32; 3],
-        direction: [f32; 3],
-        phase: &str,
-        source: &str,
-    ) -> Result<()> {
-        ensure!(
-            ["hover", "press", "drag", "release"].contains(&phase),
-            "unknown pointer phase"
-        );
-        if !self.ui_anchor_ready {
-            return Ok(());
-        }
-        let origin = sub(origin, self.ui_offset);
-        if phase == "hover" && self.capture.as_ref().is_some_and(|c| c.source != source) {
-            return Ok(());
-        }
-        if let Some(c) = self.capture.clone() {
-            if c.source == source && phase != "press" && phase != "hover" {
-                if let Some(frame) = self.capture_frame(&c) {
-                    if let Some((xy, _)) = frame.project(origin, direction) {
-                        return self.pointer(Some((c.target, xy)), phase, source);
-                    }
-                }
-            }
-        }
-        let mut hit = None;
+    // One occlusion/rounding/curve query serves input and visible feedback.
+    fn nearest_ray_pick(&self, origin: [f32; 3], direction: [f32; 3]) -> Option<RayPick> {
+        let mut pick = None;
         let mut nearest = f32::MAX;
-        let mut hover_companion = None;
         for draw in self.draws() {
             if matches!(draw.source, Source::Shadow(_)) {
                 continue;
@@ -835,13 +815,82 @@ impl Desktop {
             if let Some((xy, t)) = hit_frame.project(origin, direction) {
                 if t < nearest && hit_frame.inside_rounded(xy, draw.radius) {
                     nearest = t;
-                    hit = target.map(|t| (t, xy));
-                    if !matches!(draw.source, Source::Node(_, _) | Source::Window(_)) {
-                        hover_companion = Some(draw.id.clone());
+                    let companion =
+                        (!matches!(draw.source, Source::Node(_, _) | Source::Window(_)))
+                            .then(|| draw.id.clone());
+                    pick = Some(RayPick {
+                        target,
+                        xy,
+                        distance: t,
+                        companion,
+                    });
+                }
+            }
+        }
+        pick
+    }
+
+    pub fn ray_feedback(
+        &self,
+        origin: [f32; 3],
+        direction: [f32; 3],
+        source: &str,
+    ) -> Option<crate::spatial::RayFeedback> {
+        if !self.ui_anchor_ready {
+            return None;
+        }
+        let local_origin = sub(origin, self.ui_offset);
+        let (distance, interactive, captured) =
+            if let Some(c) = self.capture.as_ref().filter(|c| c.source == source) {
+                let frame = self.capture_frame(c)?;
+                let (_, distance) = frame.project(local_origin, direction)?;
+                (distance, true, true)
+            } else {
+                let hit = self.nearest_ray_pick(local_origin, direction)?;
+                (hit.distance, hit.target.is_some(), false)
+            };
+        if !distance.is_finite() || distance <= 0. {
+            return None;
+        }
+        Some(crate::spatial::RayFeedback {
+            distance_m: distance,
+            point_m: add(origin, scale(direction, distance)),
+            interactive,
+            captured,
+        })
+    }
+
+    pub fn ray(
+        &mut self,
+        origin: [f32; 3],
+        direction: [f32; 3],
+        phase: &str,
+        source: &str,
+    ) -> Result<()> {
+        ensure!(
+            ["hover", "press", "drag", "release"].contains(&phase),
+            "unknown pointer phase"
+        );
+        if !self.ui_anchor_ready {
+            return Ok(());
+        }
+        let origin = sub(origin, self.ui_offset);
+        if phase == "hover" && self.capture.as_ref().is_some_and(|c| c.source != source) {
+            return Ok(());
+        }
+        if let Some(c) = self.capture.clone() {
+            if c.source == source && phase != "press" && phase != "hover" {
+                if let Some(frame) = self.capture_frame(&c) {
+                    if let Some((xy, _)) = frame.project(origin, direction) {
+                        return self.pointer(Some((c.target, xy)), phase, source);
                     }
                 }
             }
         }
+        let pick = self.nearest_ray_pick(origin, direction);
+        let (hit, hover_companion) = pick
+            .map(|p| (p.target.map(|t| (t, p.xy)), p.companion))
+            .unwrap_or((None, None));
         if phase == "hover" {
             if let Some(k) = self.expanded_orb.clone() {
                 let within = self.companion_frame(&k, "orb").is_some_and(|f| {

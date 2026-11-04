@@ -117,6 +117,7 @@ pub struct Renderer {
     spatial_pipeline: vk::Pipeline,
     controllers: [Option<crate::controller_model::Model>; 2],
     controller_states: [crate::input::HandState; 2],
+    ray_feedback: [Option<crate::spatial::RayFeedback>; 2],
     draw_count: u32,
     uv_map: std::collections::BTreeMap<String, [f32; 4]>,
     layout: vk::PipelineLayout,
@@ -166,6 +167,7 @@ impl Renderer {
             spatial_pipeline: vk::Pipeline::null(),
             controllers: [None, None],
             controller_states: [crate::input::HandState::default(); 2],
+            ray_feedback: [None; 2],
             draw_count: 0,
             uv_map: std::collections::BTreeMap::new(),
             layout: vk::PipelineLayout::null(),
@@ -650,6 +652,10 @@ impl Renderer {
         self.controller_states = *states;
     }
 
+    pub fn update_ray_feedback(&mut self, feedback: [Option<crate::spatial::RayFeedback>; 2]) {
+        self.ray_feedback = feedback;
+    }
+
     pub fn controller_status(&self) -> serde_json::Value {
         serde_json::json!({
             "source": "OpenXR action grip/aim spaces at predicted display time",
@@ -657,7 +663,7 @@ impl Renderer {
             "model_binding_source": "Resource controller-anchors.json; model-only rotation, tracked grip and aim unchanged",
             "hands": self.controllers.iter().zip(&self.controller_states).enumerate().map(|(hand,(model,state))| {
                 let pose = |p: xr::Posef| serde_json::json!({"position_m":[p.position.x,p.position.y,p.position.z],"orientation_xyzw":[p.orientation.x,p.orientation.y,p.orientation.z,p.orientation.w]});
-                serde_json::json!({"hand":if hand==0 {"left"} else {"right"}, "loaded":model.is_some(), "directory":model.as_ref().map(|m|&m.directory), "visible":model.is_some() && state.grip.is_some(), "grip":state.grip.map(pose), "aim":state.aim.map(pose), "source_binding_present":model.as_ref().is_some_and(|m|m.source_binding_present), "source_rotation_xyzw":model.as_ref().map(|m|{let q=m.source_rotation;[q.x,q.y,q.z,q.w]}), "model_pose":model.as_ref().and_then(|m|state.grip.map(|p|pose(m.model_pose(p)))), "select":state.select,"trigger":state.trigger,"squeeze":state.squeeze,"menu":state.menu,"stick":state.stick})
+                serde_json::json!({"hand":if hand==0 {"left"} else {"right"}, "loaded":model.is_some(), "directory":model.as_ref().map(|m|&m.directory), "visible":model.is_some() && state.grip.is_some(), "grip":state.grip.map(pose), "aim":state.aim.map(pose), "ray_feedback":self.ray_feedback[hand], "ray_length_m":self.ray_feedback[hand].map_or(crate::spatial::IDLE_RAY_LENGTH_M, |h|h.distance_m), "source_binding_present":model.as_ref().is_some_and(|m|m.source_binding_present), "source_rotation_xyzw":model.as_ref().map(|m|{let q=m.source_rotation;[q.x,q.y,q.z,q.w]}), "model_pose":model.as_ref().and_then(|m|state.grip.map(|p|pose(m.model_pose(p)))), "select":state.select,"trigger":state.trigger,"squeeze":state.squeeze,"menu":state.menu,"stick":state.stick})
             }).collect::<Vec<_>>()
         })
     }
@@ -758,9 +764,14 @@ impl Renderer {
                 bytes,
             );
             d.cmd_draw(self.cmd, 3, 1, 0, 0);
-            for (model, state) in self.controllers.iter().zip(&self.controller_states) {
+            for (hand, (model, state)) in self
+                .controllers
+                .iter()
+                .zip(&self.controller_states)
+                .enumerate()
+            {
                 if let Some(model) = model {
-                    model.draw(self.cmd, view, state);
+                    model.draw(self.cmd, view, state, self.ray_feedback[hand].as_ref());
                 }
             }
             // Controller drawing uses a separate descriptor and push-constant layout.

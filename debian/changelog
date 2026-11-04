@@ -1,3 +1,10 @@
+xr-shell (0.2.13) unstable; urgency=medium
+
+  * Draw controller rays to the same surface hit used for interaction.
+  * Show hit reticles and retain captured-plane feedback while dragging.
+
+ -- bits <bigbits@hackx.cc>  Thu, 05 Nov 2026 00:51:22 +0800
+
 xr-shell (0.2.12) unstable; urgency=medium
 
   * Cache independent control rasters and upload only changed atlas rectangles.

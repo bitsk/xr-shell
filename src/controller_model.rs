@@ -184,15 +184,26 @@ impl Model {
                 [0., 0.0008, 0.]
             };
             let points = [
-                [near[0], near[1], -0.025],
-                [-near[0], -near[1], -0.025],
-                [-near[0], -near[1], -1.5],
-                [near[0], near[1], -1.5],
+                [near[0], near[1], 0.],
+                [-near[0], -near[1], 0.],
+                [-near[0], -near[1], -1.],
+                [near[0], near[1], -1.],
             ];
             for i in [0, 1, 2, 0, 2, 3] {
                 let p = points[i];
                 beam.push([p[0], p[1], p[2], 0., 1., 0., 0., 0.]);
             }
+        }
+        // A separate quad at the measured ray endpoint becomes the hit reticle.
+        for [x, y] in [
+            [-1., -1.],
+            [1., -1.],
+            [1., 1.],
+            [-1., -1.],
+            [1., 1.],
+            [-1., 1.],
+        ] {
+            beam.push([x, y, 0., 0., 0., 1., 0., 0.]);
         }
         let buffer = Buffer::host(
             m.gpu.clone(),
@@ -496,7 +507,13 @@ impl Model {
         grip
     }
 
-    pub unsafe fn draw(&self, cmd: vk::CommandBuffer, view: &xr::View, state: &HandState) {
+    pub unsafe fn draw(
+        &self,
+        cmd: vk::CommandBuffer,
+        view: &xr::View,
+        state: &HandState,
+        feedback: Option<&crate::spatial::RayFeedback>,
+    ) {
         unsafe {
             let d = &self.gpu.device;
             d.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::GRAPHICS, self.pipeline);
@@ -508,9 +525,11 @@ impl Model {
                 &[self.descriptor],
                 &[],
             );
-            for (pose, beam) in [
-                (state.grip.map(|p| self.model_pose(p)), false),
-                (state.aim, true),
+            let length = feedback.map_or(crate::spatial::IDLE_RAY_LENGTH_M, |hit| hit.distance_m);
+            for (pose, mode) in [
+                (state.grip.map(|p| self.model_pose(p)), 0),
+                (state.aim, 1),
+                (state.aim.filter(|_| feedback.is_some()), 2),
             ] {
                 let Some(pose) = pose else {
                     continue;
@@ -539,11 +558,19 @@ impl Model {
                     mp.x,
                     mp.y,
                     mp.z,
-                    if beam { 1. } else { 0. },
-                    if state.select { 1. } else { 0. },
-                    0.,
-                    0.,
-                    0.,
+                    mode as f32,
+                    if state.select || state.trigger > 0.5 {
+                        1.
+                    } else {
+                        0.
+                    },
+                    length,
+                    (length * 0.003).clamp(0.003, 0.012),
+                    if feedback.is_some_and(|h| h.interactive) {
+                        1.
+                    } else {
+                        0.
+                    },
                 ];
                 d.cmd_push_constants(
                     cmd,
@@ -552,14 +579,24 @@ impl Model {
                     0,
                     bytes(&constants),
                 );
-                let buffer = if beam {
+                let buffer = if mode != 0 {
                     self.beam.as_ref()
                 } else {
                     self.vertices.as_ref()
                 }
                 .unwrap();
                 d.cmd_bind_vertex_buffers(cmd, 0, &[buffer.handle], &[0]);
-                d.cmd_draw(cmd, if beam { 12 } else { self.count }, 1, 0, 0);
+                d.cmd_draw(
+                    cmd,
+                    match mode {
+                        0 => self.count,
+                        1 => 12,
+                        _ => 6,
+                    },
+                    1,
+                    if mode == 2 { 12 } else { 0 },
+                    0,
+                );
             }
         }
     }

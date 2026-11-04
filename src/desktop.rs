@@ -1226,8 +1226,24 @@ impl Desktop {
                     self.debug && p.capabilities.iter().any(|c| c == "debug.v1"),
                     "missing_capability: debug input disabled"
                 );
-                self.debug_input(payload)?;
-                p.send(&self.session, "InputAccepted", request, self.snapshot())?;
+                if payload["kind"] == "ray_probe" {
+                    let origin = vector::<3>(&payload["origin"])?;
+                    let mut direction = vector::<3>(&payload["direction"])?;
+                    let length = direction.iter().map(|v| v * v).sum::<f32>().sqrt();
+                    ensure!(length > 0.0001, "invalid ray");
+                    for v in &mut direction {
+                        *v /= length;
+                    }
+                    p.send(
+                        &self.session,
+                        "InputAccepted",
+                        request,
+                        json!({"ray_feedback":self.ray_feedback(origin, direction, "mouse")}),
+                    )?;
+                } else {
+                    self.debug_input(payload)?;
+                    p.send(&self.session, "InputAccepted", request, self.snapshot())?;
+                }
             }
             _ => bail!("unknown message: {kind}"),
         }

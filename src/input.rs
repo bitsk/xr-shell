@@ -34,6 +34,27 @@ struct Ray {
     pressed: bool,
 }
 
+impl HandState {
+    pub fn aim_ray(&self) -> Option<([f32; 3], [f32; 3])> {
+        let pose = self.aim?;
+        let q = pose.orientation;
+        let p = pose.position;
+        let mut direction = [
+            -2. * (q.x * q.z + q.w * q.y),
+            -2. * (q.y * q.z - q.w * q.x),
+            -1. + 2. * (q.x * q.x + q.y * q.y),
+        ];
+        let length = direction.iter().map(|v| v * v).sum::<f32>().sqrt();
+        if !length.is_finite() || length < 0.0001 {
+            return None;
+        }
+        for v in &mut direction {
+            *v /= length;
+        }
+        Some(([p.x, p.y, p.z], direction))
+    }
+}
+
 pub struct Input {
     set: xr::ActionSet,
     aim: xr::Action<xr::Posef>,
@@ -455,7 +476,7 @@ impl Input {
                 }
             };
             self.controllers[hand] = state;
-            let Some(pose) = state.aim else {
+            let Some((origin, direction)) = state.aim_ray() else {
                 self.cancel_hand(hand, desktop, "controller pose invalid");
                 continue;
             };
@@ -488,15 +509,9 @@ impl Input {
             }
             self.pressed[hand] = pressed;
             new_press[hand] = pressed && !previous[hand];
-            let q = pose.orientation;
-            let p = pose.position;
             rays[hand] = Some(Ray {
-                origin: [p.x, p.y, p.z],
-                direction: [
-                    -2.0 * (q.x * q.z + q.w * q.y),
-                    -2.0 * (q.y * q.z - q.w * q.x),
-                    -1.0 + 2.0 * (q.x * q.x + q.y * q.y),
-                ],
+                origin,
+                direction,
                 pressed,
             });
         }

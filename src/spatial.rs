@@ -1,6 +1,16 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 //! Shared geometry for rendering and hit testing. Local UI +Y points down;
 //! positive UI Pitch tilts the face upward. STAGE remains +Y up, -Z forward.
+pub const IDLE_RAY_LENGTH_M: f32 = 3.;
+
+#[derive(Clone, Copy, Debug, serde::Serialize)]
+pub struct RayFeedback {
+    pub distance_m: f32,
+    pub point_m: [f32; 3],
+    pub interactive: bool,
+    pub captured: bool,
+}
+
 #[derive(Clone, Copy, Debug)]
 pub struct Frame {
     pub position: [f32; 3],

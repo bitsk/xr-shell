@@ -512,6 +512,7 @@ fn frame_loop(
         summary.waited_frames += 1;
         // Clear visibility even while the runtime suspends scene rendering.
         renderer.update_controllers(&[input::HandState::default(); 2]);
+        renderer.update_ray_feedback([None; 2]);
         if !state.should_render {
             stream.end(
                 state.predicted_display_time,
@@ -567,6 +568,20 @@ fn frame_loop(
                 renderer.update_panels(&panels)?;
             }
             renderer.update_panel_poses(&d.panel_poses(), head_position)?;
+            if let Some(i) = input.as_ref() {
+                renderer.update_ray_feedback(std::array::from_fn(|hand| {
+                    let (origin, direction) = i.controllers()[hand].aim_ray()?;
+                    d.ray_feedback(
+                        origin,
+                        direction,
+                        if hand == 0 {
+                            "controller_ray:left"
+                        } else {
+                            "controller_ray:right"
+                        },
+                    )
+                }));
+            }
         }
 
         let capture = capture_request(options.capture_dir.as_deref())?;

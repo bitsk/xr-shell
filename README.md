@@ -266,3 +266,12 @@ layouts upload only changed rectangles. The private atlas is protected by the
 Shell submission fence rather than a device-wide idle in the interaction path.
 `XR_UI_PROFILE=1` reports raster cache hits/misses and GPU upload bytes/times;
 slow updates are logged even without profiling.
+
+Controller ray feedback shares the window/control hit query, including curved
+surfaces, rounded corners and occlusion. A hit extends the beam to its measured
+distance and displays a reticle; a miss keeps the idle ray without a target dot.
+Captured drags continue to use their target plane. Feedback is resolved after
+UI animation in the same frame, and captures include the world endpoint and
+distance. DebugInput `ray_probe` performs a read-only hit query when debug input
+is enabled. This changes presentation only; device aim/grip parameters remain
+owned by the runtime.
