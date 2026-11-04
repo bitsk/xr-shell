@@ -587,6 +587,9 @@ fn frame_loop(
             );
         }
         if !flags.contains(xr::ViewStateFlags::ORIENTATION_VALID) {
+            if let Some(d) = desktop.as_mut() {
+                d.invalidate_horizon_head();
+            }
             stream.end(
                 state.predicted_display_time,
                 xr::EnvironmentBlendMode::OPAQUE,
@@ -603,6 +606,11 @@ fn frame_loop(
         let dt = state.predicted_display_period.as_nanos() as f32 / 1e9;
         if let Some(d) = desktop.as_mut() {
             let q = views[0].pose.orientation;
+            if flags.contains(xr::ViewStateFlags::POSITION_VALID) {
+                d.observe_horizon_head(head_position, [q.x, q.y, q.z, q.w]);
+            } else {
+                d.invalidate_horizon_head();
+            }
             d.update_head(head_position, [q.x, q.y, q.z, q.w], dt);
         }
         if let (Some(i), Some(d)) = (input.as_mut(), desktop.as_mut()) {

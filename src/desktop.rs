@@ -47,6 +47,7 @@ struct Peer {
     capabilities: Vec<String>,
     revision: u64,
     nodes: BTreeMap<String, Node>,
+    spawn_frames: BTreeMap<String, crate::spatial::Frame>,
     root: Root,
     used_buffers: BTreeSet<String>,
 }
@@ -186,6 +187,7 @@ pub struct Desktop {
     taskbar_follow: crate::taskbar_follow::TaskbarFollow,
     ui_offset: [f32; 3],
     ui_anchor_ready: bool,
+    horizon_head: Option<([f32; 3], [f32; 4])>,
     lifts: BTreeMap<(u64, String), f32>,
     expanded_orb: Option<String>,
     companion_hover: Option<String>,
@@ -287,6 +289,7 @@ impl Desktop {
             taskbar_follow: Default::default(),
             ui_offset: [0.; 3],
             ui_anchor_ready: true,
+            horizon_head: None,
             lifts: BTreeMap::new(),
             expanded_orb: None,
             companion_hover: None,
@@ -422,6 +425,7 @@ impl Desktop {
                     capabilities: Vec::new(),
                     revision: 0,
                     nodes: BTreeMap::new(),
+                    spawn_frames: BTreeMap::new(),
                     root: Root::default(),
                     used_buffers: BTreeSet::new(),
                 },
@@ -751,7 +755,7 @@ impl Desktop {
                                 "unregistered style id"
                             );
                             ensure!(
-                                ["world_locked", "dock_lazy_follow"]
+                                ["world_locked", "dock_lazy_follow", "head_horizon_spawn"]
                                     .contains(&node.spatial_policy.as_str())
                                     && (node.spatial_policy == "world_locked"
                                         || (node.spatial_panel
@@ -759,6 +763,11 @@ impl Desktop {
                                                 .iter()
                                                 .any(|c| c == "scene.spatial-policy.v1"))),
                                 "invalid or unnegotiated spatial policy"
+                            );
+                            ensure!(
+                                node.spatial_policy != "head_horizon_spawn"
+                                    || p.capabilities.iter().any(|c| c == "scene.horizon-spawn.v1"),
+                                "unnegotiated horizon spawn"
                             );
                             if node.spatial_panel {
                                 ensure!(
@@ -876,6 +885,14 @@ impl Desktop {
                     }
                 }
                 p.nodes = nodes;
+                p.spawn_frames.retain(|id, _| {
+                    p.nodes.get(id).is_some_and(|n| {
+                        n.spatial_panel && n.spatial_policy == "head_horizon_spawn"
+                    })
+                });
+                if let Some(head) = self.horizon_head {
+                    Self::freeze_spawn_frames(p, head);
+                }
                 p.root = root;
                 p.revision = rev;
                 self.changed();
@@ -1789,12 +1806,77 @@ impl Desktop {
         let follow = self.taskbar_follow.mode() == "follow";
         self.taskbar_follow = crate::taskbar_follow::TaskbarFollow::default();
         self.taskbar_follow.set_mode(follow);
+        self.horizon_head = None;
+        for peer in self.peers.values_mut() {
+            peer.spawn_frames.clear();
+        }
         self.dirty = true;
     }
 
     pub fn set_ui_anchor(&mut self, offset: Option<[f32; 3]>) {
         self.ui_anchor_ready = offset.is_some();
         self.ui_offset = offset.unwrap_or([0.; 3]);
+    }
+
+    fn freeze_spawn_frames(peer: &mut Peer, (eye, q): ([f32; 3], [f32; 4])) -> bool {
+        let yaw = (2. * (q[0] * q[2] + q[3] * q[1])).atan2(1. - 2. * (q[0] * q[0] + q[1] * q[1]));
+        let (sin, cos) = yaw.sin_cos();
+        let mut changed = false;
+        for node in peer
+            .nodes
+            .values()
+            .filter(|n| n.spatial_panel && n.spatial_policy == "head_horizon_spawn")
+        {
+            if peer.spawn_frames.contains_key(&node.node_id) {
+                continue;
+            }
+            let offset = node.position_m;
+            let delta = [
+                cos * offset[0] + sin * offset[2],
+                offset[1] - 1.6,
+                -sin * offset[0] + cos * offset[2],
+            ];
+            let horizontal = delta[0].hypot(delta[2]);
+            let rotation = [
+                (-delta[1]).atan2(horizontal).to_degrees(),
+                (-delta[0]).atan2(-delta[2]).to_degrees(),
+                0.,
+            ];
+            let position = crate::spatial::add(eye, delta);
+            peer.spawn_frames.insert(
+                node.node_id.clone(),
+                crate::spatial::Frame::new(position, node.size_m, node.logical_size, rotation),
+            );
+            changed = true;
+        }
+        changed
+    }
+
+    /// Only called with position-valid stereo views. A node freezes once per visible lifetime.
+    pub fn observe_horizon_head(&mut self, position: [f32; 3], q: [f32; 4]) {
+        self.horizon_head = None;
+        if !self.ui_anchor_ready || !position.iter().chain(q.iter()).all(|n| n.is_finite()) {
+            return;
+        }
+        let norm: f32 = q.iter().map(|n| n * n).sum();
+        let forward = [
+            2. * (q[0] * q[2] + q[3] * q[1]),
+            1. - 2. * (q[0] * q[0] + q[1] * q[1]),
+        ];
+        if (norm - 1.).abs() > 0.01 || forward[0] * forward[0] + forward[1] * forward[1] < 0.0001 {
+            return;
+        }
+        let head = (crate::spatial::sub(position, self.ui_offset), q);
+        self.horizon_head = Some(head);
+        for peer in self.peers.values_mut() {
+            if Self::freeze_spawn_frames(peer, head) {
+                self.dirty = true;
+            }
+        }
+    }
+
+    pub fn invalidate_horizon_head(&mut self) {
+        self.horizon_head = None;
     }
 
     /// Every opted-in root/panel uses one anchor; capturing any island freezes all.

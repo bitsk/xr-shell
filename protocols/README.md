@@ -41,6 +41,14 @@ The M0 contract is implemented by these messages:
   All `dock_lazy_follow` roots and groups share one Shell-owned rigid anchor,
   including across component processes. Capturing any followed node freezes
   the whole taskbar until release/Cancel. Unrelated panels remain world locked.
+- `scene.horizon-spawn.v1`: an independent spatial Group may opt into
+  `spatial_policy=head_horizon_spawn` in addition to `scene.spatial-policy.v1`.
+  Its `position_m` describes an offset from the design eye `[0,1.6,0]`.
+  Shell samples current valid stereo eye height and horizon-projected head yaw,
+  computes a user-facing pitch/yaw, and freezes that frame once while the Group
+  exists. Removal drops the anchor; re-adding or recentering samples a new one.
+  Rendering and ray hits use that same frozen frame. No new group is shown
+  until a valid pose is available. This policy does not apply to scene roots.
 - `snapshot.v1`: `GetSnapshot`, `Snapshot`, `StateChanged`; the Shell publishes
   windows, active workspace, acknowledged focus epoch, component scene
   revisions and bounded system/clipboard summaries. A revision gap requires

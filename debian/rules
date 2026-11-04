@@ -1,8 +1,9 @@
 #!/usr/bin/make -f
 
 export RUSTFLAGS := $(RUSTFLAGS) --remap-path-prefix=$(CURDIR)=/usr/src/xr-shell
+export RUSTFLAGS += --remap-path-prefix=$(abspath $(CURDIR)/..)=/usr/src/openkylin-xr
 ifneq ($(strip $(CARGO_HOME)),)
-export RUSTFLAGS += --remap-path-prefix=$(CARGO_HOME)=/usr/src/cargo
+export RUSTFLAGS += --remap-path-prefix=$(abspath $(CARGO_HOME))=/usr/src/cargo
 endif
 
 %:

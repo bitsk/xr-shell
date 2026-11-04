@@ -72,9 +72,11 @@ impl Desktop {
         }
         &p.root.policy
     }
-    fn panel_frame(&self, n: &Node) -> Frame {
+    fn panel_frame(&self, p: &Peer, n: &Node) -> Frame {
         let frame = Frame::new(n.position_m, n.size_m, n.logical_size, n.rotation_degrees);
-        if n.spatial_policy == "dock_lazy_follow" {
+        if n.spatial_policy == "head_horizon_spawn" {
+            p.spawn_frames.get(&n.node_id).copied().unwrap_or(frame)
+        } else if n.spatial_policy == "dock_lazy_follow" {
             self.taskbar_follow.frame(frame)
         } else {
             frame
@@ -91,7 +93,7 @@ impl Desktop {
             };
             if n.spatial_panel {
                 return (
-                    self.panel_frame(n),
+                    self.panel_frame(p, n),
                     format!("component:{}:{}", p.id, n.node_id),
                 );
             }
@@ -173,7 +175,12 @@ impl Desktop {
                 return None;
             }
             if n.spatial_panel {
-                frame = self.panel_frame(n);
+                if n.spatial_policy == "head_horizon_spawn"
+                    && !p.spawn_frames.contains_key(&n.node_id)
+                {
+                    return None;
+                }
+                frame = self.panel_frame(p, n);
                 break;
             }
             rect[0] += n.rect[0];

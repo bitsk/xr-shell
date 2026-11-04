@@ -298,3 +298,15 @@ service (0.1.8 or later) supplies `window_controls` from X11 window type,
 override-redirect and transient metadata; menus, tooltips and splash surfaces
 remain undecorated. Mapping an eligible application also acknowledges its
 spatial focus through the normal window-service path.
+
+
+`scene.horizon-spawn.v1` (Shell 0.2.16) permits independent spatial groups with
+`spatial_policy=head_horizon_spawn`. `position_m` is a design-space offset about
+an eye at `[0,1.6,0]`; Shell projects the current head yaw onto the horizon,
+translates to current valid stereo eye height, and faces the panel toward that
+eye. A group freezes once while present; hiding/removing it drops the anchor,
+and re-adding it samples the new pose. Recentering clears those frozen frames.
+No new group draws before a valid finite stereo pose is available. Existing
+world-locked and taskbar-follow policies retain their own anchors. Raster/quad
+placement and ray picking share the same frozen frame. This protocol support
+requires separate rendered and physical-device acceptance.
