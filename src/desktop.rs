@@ -15,7 +15,7 @@ use std::{
     },
     path::{Path, PathBuf},
     sync::Arc,
-    time::{SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 use xr_shell_protocols::{CAPABILITIES, Node, Packet, SeqPacket};
 use xr_spatial_kit::Theme;
@@ -2060,6 +2060,15 @@ impl Drop for Desktop {
     fn drop(&mut self) {
         self.cancel("peer disconnected");
         self.broadcast("SessionEnding", json!({"reason":"shell exit"}));
+        // Closing a Unix socket with unread client packets can reset the peer
+        // before it receives SessionEnding. Drain those packets until clients
+        // close, with one bounded deadline shared by all peers.
+        let deadline = Instant::now() + Duration::from_millis(500);
+        let mut pending: BTreeSet<_> = self.peers.keys().copied().collect();
+        while !pending.is_empty() && Instant::now() < deadline {
+            pending.retain(|id| self.peers[id].socket.recv(2).is_ok());
+        }
+        println!("XR_DESKTOP_ENDING_PENDING={}", pending.len());
         if fs::metadata(&self.path).is_ok_and(|m| m.ino() == self.inode) {
             let _ = fs::remove_file(&self.path);
         }

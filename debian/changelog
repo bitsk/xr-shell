@@ -1,3 +1,9 @@
+xr-shell (0.2.18) unstable; urgency=medium
+
+  * Drain peer packets while clients receive the normal session ending event.
+
+ -- bits <bigbits@hackx.cc>  Thu, 05 Nov 2026 21:17:15 +0800
+
 xr-shell (0.2.17) unstable; urgency=medium
 
   * Use binocular horizon placement, independent pointer captures and spherical grabs.
