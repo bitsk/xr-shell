@@ -103,6 +103,7 @@ pub struct Model {
     descriptor: vk::DescriptorSet,
     layout: vk::PipelineLayout,
     pipeline: vk::Pipeline,
+    beam_pipeline: vk::Pipeline,
     upload_pool: vk::CommandPool,
     upload_fence: vk::Fence,
     modules: Vec<vk::ShaderModule>,
@@ -161,6 +162,7 @@ impl Model {
             descriptor: vk::DescriptorSet::null(),
             layout: vk::PipelineLayout::null(),
             pipeline: vk::Pipeline::null(),
+            beam_pipeline: vk::Pipeline::null(),
             upload_pool: vk::CommandPool::null(),
             upload_fence: vk::Fence::null(),
             modules: Vec::new(),
@@ -191,7 +193,16 @@ impl Model {
             ];
             for i in [0, 1, 2, 0, 2, 3] {
                 let p = points[i];
-                beam.push([p[0], p[1], p[2], 0., 1., 0., 0., 0.]);
+                beam.push([
+                    p[0],
+                    p[1],
+                    p[2],
+                    0.,
+                    1.,
+                    0.,
+                    if i == 0 || i == 3 { 0. } else { 1. },
+                    -p[2],
+                ]);
             }
         }
         // A separate quad at the measured ray endpoint becomes the hit reticle.
@@ -453,6 +464,11 @@ impl Model {
                 .depth_write_enable(true)
                 .depth_compare_op(vk::CompareOp::LESS_OR_EQUAL);
             let attachments = [vk::PipelineColorBlendAttachmentState::default()
+                .blend_enable(true)
+                .src_color_blend_factor(vk::BlendFactor::SRC_ALPHA)
+                .dst_color_blend_factor(vk::BlendFactor::ONE_MINUS_SRC_ALPHA)
+                .src_alpha_blend_factor(vk::BlendFactor::ONE)
+                .dst_alpha_blend_factor(vk::BlendFactor::ONE_MINUS_SRC_ALPHA)
                 .color_write_mask(vk::ColorComponentFlags::RGBA)];
             let blend = vk::PipelineColorBlendStateCreateInfo::default().attachments(&attachments);
             let states = [vk::DynamicState::VIEWPORT, vk::DynamicState::SCISSOR];
@@ -463,7 +479,7 @@ impl Model {
                     .push_constant_ranges(&[vk::PushConstantRange {
                         stage_flags: vk::ShaderStageFlags::VERTEX | vk::ShaderStageFlags::FRAGMENT,
                         offset: 0,
-                        size: 96,
+                        size: 112,
                     }]),
                 None,
             )?;
@@ -489,6 +505,11 @@ impl Model {
                         return Err(error.into());
                     }
                 };
+            let beam_depth = depth.depth_write_enable(false);
+            let beam_create = create.depth_stencil_state(&beam_depth);
+            self.beam_pipeline = d
+                .create_graphics_pipelines(vk::PipelineCache::null(), &[beam_create], None)
+                .map_err(|(_, e)| e)?[0];
         }
         Ok(())
     }
@@ -513,10 +534,19 @@ impl Model {
         view: &xr::View,
         state: &HandState,
         feedback: Option<&crate::spatial::RayFeedback>,
+        beams: bool,
     ) {
         unsafe {
             let d = &self.gpu.device;
-            d.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::GRAPHICS, self.pipeline);
+            d.cmd_bind_pipeline(
+                cmd,
+                vk::PipelineBindPoint::GRAPHICS,
+                if beams {
+                    self.beam_pipeline
+                } else {
+                    self.pipeline
+                },
+            );
             d.cmd_bind_descriptor_sets(
                 cmd,
                 vk::PipelineBindPoint::GRAPHICS,
@@ -531,6 +561,9 @@ impl Model {
                 (state.aim, 1),
                 (state.aim.filter(|_| feedback.is_some()), 2),
             ] {
+                if beams != (mode != 0) {
+                    continue;
+                }
                 let Some(pose) = pose else {
                     continue;
                 };
@@ -571,6 +604,10 @@ impl Model {
                     } else {
                         0.
                     },
+                    feedback.map_or(0., |h| h.normal[0]),
+                    feedback.map_or(0., |h| h.normal[1]),
+                    feedback.map_or(1., |h| h.normal[2]),
+                    0.,
                 ];
                 d.cmd_push_constants(
                     cmd,
@@ -612,6 +649,7 @@ impl Drop for Model {
             // Also covers an interrupted upload before the model becomes visible.
             let _ = d.device_wait_idle();
             d.destroy_pipeline(self.pipeline, None);
+            d.destroy_pipeline(self.beam_pipeline, None);
             d.destroy_pipeline_layout(self.layout, None);
             for module in self.modules.drain(..) {
                 d.destroy_shader_module(module, None);

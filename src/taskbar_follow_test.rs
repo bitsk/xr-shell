@@ -12,6 +12,7 @@ fn peer(d: &Desktop, id: u64, scene: Scene) -> Peer {
         role: if id == 1 { "dock" } else { "system_ui" }.into(),
         capabilities: CAPABILITIES.iter().map(|s| s.to_string()).collect(),
         revision: 1,
+        spawn_frames: BTreeMap::new(),
         nodes: scene
             .widgets
             .iter()
@@ -65,6 +66,8 @@ fn hover_reuses_other_rasters_without_freezing_text_or_window_updates() {
             height: 32,
             pixels: vec![255; 32 * 32 * 4],
             position: [0., 1.5, -1.5],
+            rotation: [0.; 3],
+            placed: true,
             size: [0.32, 0.32],
             frame: 1,
             minimized: false,
@@ -84,31 +87,34 @@ fn hover_reuses_other_rasters_without_freezing_text_or_window_updates() {
             .collect()
     };
     let normal = rasters(&mut d);
-    d.hover = Some((1, "a".into()));
+    d.hovers.insert("regression".into(), (1, "a".into()));
     let hover = rasters(&mut d);
     for (id, pixels) in &normal {
-        assert_eq!(Arc::ptr_eq(pixels, &hover[id]), id != "node:1:a", "{id}");
+        assert!(Arc::ptr_eq(pixels, &hover[id]), "hover repainted {id}");
     }
-    assert_ne!(normal["node:1:a"].as_ref(), hover["node:1:a"].as_ref());
-    d.hover = None;
+    assert_eq!(normal["node:1:a"].as_ref(), hover["node:1:a"].as_ref());
+    d.hovers.clear();
     let restored = rasters(&mut d);
     assert!(Arc::ptr_eq(&normal["node:1:a"], &restored["node:1:a"]));
-    d.capture = Some(Capture {
-        target: Target::Node(1, "a".into()),
-        surface: None,
-        resize_frame: None,
-        size: [0.; 2],
-        logical: [0.; 2],
-        id: "1".into(),
-        interaction: "1".into(),
-        source: "regression".into(),
-        start: [0.; 2],
-        position: [0.; 3],
-    });
+    d.captures.insert(
+        "regression".into(),
+        Capture {
+            target: Target::Node(1, "a".into()),
+            surface: None,
+            resize_frame: None,
+            size: [0.; 2],
+            logical: [0.; 2],
+            id: "1".into(),
+            interaction: "1".into(),
+            grab: None,
+            start: [0.; 2],
+            position: [0.; 3],
+        },
+    );
     let pressed = rasters(&mut d);
-    assert_ne!(pressed["node:1:a"].as_ref(), normal["node:1:a"].as_ref());
+    assert!(Arc::ptr_eq(&pressed["node:1:a"], &normal["node:1:a"]));
     assert!(Arc::ptr_eq(&pressed["node:1:b"], &normal["node:1:b"]));
-    d.capture = None;
+    d.captures.clear();
     d.peers
         .get_mut(&1)
         .unwrap()
@@ -223,8 +229,8 @@ fn islands_share_motion_capture_and_scene_refresh_without_moving_world_panels() 
         sub(right.position, center.position),
         scale(center.right, 0.9632),
     );
-    close(left.right, center.right);
-    close(right.down, center.down);
+    assert!(dot(left.normal(), center.normal()) < 0.99);
+    assert!(dot(right.normal(), center.normal()) < 0.99);
     close(frame(&d, 2, "control").position, world.position);
     close(frame(&d, 2, "control").normal(), world.normal());
     // The same resolved frame drives rendering and ray projection after motion.
@@ -236,24 +242,27 @@ fn islands_share_motion_capture_and_scene_refresh_without_moving_world_panels() 
         )
         .unwrap();
     assert!((xy[0] - 26.).abs() < 0.001 && (xy[1] - 26.).abs() < 0.001);
-    assert!(dot(button.normal(), center.normal()) > 0.9999);
-    d.capture = Some(Capture {
-        target: Target::Node(2, "status".into()),
-        surface: None,
-        resize_frame: None,
-        size: [0.; 2],
-        logical: [0.; 2],
-        id: "1".into(),
-        interaction: "1".into(),
-        source: "regression".into(),
-        start: [0.; 2],
-        position: [0.; 3],
-    });
+    assert!(dot(button.normal(), right.normal()) > 0.9999);
+    d.captures.insert(
+        "regression".into(),
+        Capture {
+            target: Target::Node(2, "status".into()),
+            surface: None,
+            resize_frame: None,
+            size: [0.; 2],
+            logical: [0.; 2],
+            id: "1".into(),
+            interaction: "1".into(),
+            grab: None,
+            start: [0.; 2],
+            position: [0.; 3],
+        },
+    );
     assert!(!d.update_head([1., 1.8, 1.], [0., 0., 0., 1.], 1.));
     close(frame(&d, 1, "center").position, center.position);
     close(frame(&d, 1, "left-bg").position, left.position);
     close(frame(&d, 2, "right-bg").position, right.position);
-    d.capture = None;
+    d.captures.clear();
     // Periodic system-state transactions or a reconnect do not restart the anchor.
     let node = d.peers[&2].nodes["right"].clone();
     d.peers

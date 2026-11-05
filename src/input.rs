@@ -70,7 +70,8 @@ pub struct Input {
     hands: [xr::Path; 2],
     pressed: [bool; 2],
     require_release: [bool; 2],
-    last_hand: Option<usize>,
+    haptic: xr::Action<xr::Haptic>,
+    last_hover: [Option<String>; 2],
     controllers: [HandState; 2],
     menu_pressed: [bool; 2],
     require_menu_release: [bool; 2],
@@ -108,6 +109,7 @@ impl Input {
         let grip = set.create_action::<xr::Posef>("grip", "Controller grip", &hands)?;
         let squeeze = set.create_action::<f32>("squeeze", "Grip pressure", &hands)?;
         let menu = set.create_action::<bool>("menu", "Application menu", &hands)?;
+        let haptic = set.create_action::<xr::Haptic>("feedback", "Spatial feedback", &hands)?;
         let back = set.create_action::<bool>("back", "Back", &hands)?;
         let stick = set.create_action::<xr::Vector2f>("scroll", "Scroll", &hands)?;
         eprintln!("XR_INIT_STAGE=input-action-select STATUS=begin");
@@ -140,6 +142,10 @@ impl Input {
             eprintln!("XR_INIT_STAGE=input-profile STATUS=begin PROFILE={profile}");
             let mut bindings = Vec::new();
             for hand in ["left", "right"] {
+                bindings.push(xr::Binding::new(
+                    &haptic,
+                    instance.string_to_path(&format!("/user/hand/{hand}/output/haptic"))?,
+                ));
                 let grip_path = format!("/user/hand/{hand}/input/grip/pose");
                 bindings.push(xr::Binding::new(
                     &grip,
@@ -249,7 +255,8 @@ impl Input {
             hands,
             pressed: [false; 2],
             require_release: [false; 2],
-            last_hand: None,
+            haptic,
+            last_hover: [None, None],
             controllers: [HandState::default(); 2],
             menu_pressed: [false; 2],
             require_menu_release: [false; 2],
@@ -362,7 +369,7 @@ impl Input {
         for hand in 0..2 {
             self.cancel_hand(hand, desktop, "desktop recentered");
         }
-        self.last_hand = None;
+        self.last_hover = [None, None];
     }
 
     pub fn update(
@@ -457,7 +464,7 @@ impl Input {
             for hand in 0..2 {
                 self.cancel_hand(hand, desktop, "XR focus lost");
             }
-            self.last_hand = None;
+            self.last_hover = [None, None];
             return Ok(());
         }
         if let Err(error) = session.sync_actions(&[(&self.set).into()]) {
@@ -532,61 +539,71 @@ impl Input {
             return Ok(());
         }
 
-        // Desktop remains the capture authority. Its owner always receives
-        // drag/release before another hand may issue a new interaction.
-        let owner = (0..2).find(|&hand| desktop.has_pointer_capture(SOURCES[hand]));
-        let preferred = self.last_hand.unwrap_or(1);
-        let order = [preferred, 1 - preferred];
-        let hand = owner
-            .or_else(|| order.into_iter().find(|&hand| new_press[hand]))
-            .or_else(|| {
-                order.into_iter().find(|&hand| {
-                    rays[hand].is_some()
-                        && self.controllers[hand].stick.iter().any(|v| v.abs() > 0.18)
-                })
-            })
-            .or_else(|| {
-                order
-                    .into_iter()
-                    .find(|&hand| rays[hand].is_some_and(|ray| !ray.pressed))
-            });
-        let Some(hand) = hand else {
-            return Ok(());
-        };
-        let Some(ray) = rays[hand] else {
-            return Ok(());
-        };
-        let phase = if new_press[hand] {
-            "press"
-        } else if !ray.pressed && previous[hand] {
-            "release"
-        } else if ray.pressed {
-            "drag"
-        } else {
-            "hover"
-        };
-        self.last_hand = Some(hand);
-        self.routes[hand] = phase;
-        let result = desktop.ray(ray.origin, ray.direction, phase, SOURCES[hand]);
-        self.route_ok[hand] = result.is_ok();
-        if let Err(error) = result {
-            eprintln!("XR_INPUT_ROUTE={} {error:#}", SOURCES[hand]);
-        }
-        let stick = self.controllers[hand].stick;
-        let axis = |v: f32| {
-            if v.abs() <= 0.18 {
-                0.
+        for hand in 0..2 {
+            let Some(ray) = rays[hand] else {
+                continue;
+            };
+            let phase = if new_press[hand] {
+                "press"
+            } else if !ray.pressed && previous[hand] {
+                "release"
+            } else if ray.pressed {
+                "drag"
             } else {
-                v.signum() * (v.abs() - 0.18) / 0.82
-            }
-        };
-        let scroll = [axis(stick[0]) * 600. * dt, -axis(stick[1]) * 600. * dt];
-        if scroll != [0., 0.] {
-            self.scroll_delta[hand] = scroll;
-            let result = desktop.controller_scroll(scroll);
-            self.scroll_ok[hand] = result.is_ok();
+                "hover"
+            };
+            let stick = self.controllers[hand].stick;
+            let axis = |v: f32| {
+                if v.abs() <= 0.18 {
+                    0.
+                } else {
+                    v.signum() * (v.abs() - 0.18) / 0.82
+                }
+            };
+            // Depth takes priority only for this hand's actual grab.
+            let grabbing = desktop.grab_depth(SOURCES[hand], -axis(stick[1]) * dt);
+            self.routes[hand] = phase;
+            let had_capture = desktop.has_pointer_capture(SOURCES[hand]);
+            let result = desktop.ray(ray.origin, ray.direction, phase, SOURCES[hand]);
+            self.route_ok[hand] = result.is_ok();
             if let Err(error) = result {
-                eprintln!("XR_INPUT_SCROLL={} {error:#}", SOURCES[hand]);
+                eprintln!("XR_INPUT_ROUTE={} {error:#}", SOURCES[hand]);
+            }
+            let hover = desktop.pointer_target(SOURCES[hand], ray.origin, ray.direction);
+            let accepted = desktop.has_pointer_capture(SOURCES[hand]);
+            let pulse = if phase == "press" && accepted {
+                Some((0.45, 18))
+            } else if phase == "release" && had_capture {
+                Some((0.25, 10))
+            } else if hover.is_some() && hover != self.last_hover[hand] {
+                Some((0.12, 7))
+            } else {
+                None
+            };
+            if let Some((amplitude, milliseconds)) = pulse {
+                let vibration = xr::HapticVibration::new()
+                    .amplitude(amplitude)
+                    .frequency(xr::FREQUENCY_UNSPECIFIED)
+                    .duration(xr::Duration::from_nanos(milliseconds * 1_000_000));
+                if let Err(error) =
+                    self.haptic
+                        .apply_feedback(session, self.hands[hand], &vibration)
+                {
+                    eprintln!(
+                        "XR_HAPTIC_UNAVAILABLE source={} error={error:?}",
+                        SOURCES[hand]
+                    );
+                }
+            }
+            self.last_hover[hand] = hover;
+            let scroll = [axis(stick[0]) * 600. * dt, -axis(stick[1]) * 600. * dt];
+            if !grabbing && scroll != [0., 0.] {
+                self.scroll_delta[hand] = scroll;
+                let result = desktop.controller_scroll(scroll);
+                self.scroll_ok[hand] = result.is_ok();
+                if let Err(error) = result {
+                    eprintln!("XR_INPUT_SCROLL={} {error:#}", SOURCES[hand]);
+                }
             }
         }
         Ok(())

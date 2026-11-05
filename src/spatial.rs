@@ -7,6 +7,7 @@ pub const IDLE_RAY_LENGTH_M: f32 = 3.;
 pub struct RayFeedback {
     pub distance_m: f32,
     pub point_m: [f32; 3],
+    pub normal: [f32; 3],
     pub interactive: bool,
     pub captured: bool,
 }
@@ -39,6 +40,37 @@ pub fn cross(a: [f32; 3], b: [f32; 3]) -> [f32; 3] {
         a[0] * b[1] - a[1] * b[0],
     ]
 }
+/// Roll-free orientation: local +Z points from the panel to the user's eyes.
+pub fn user_facing(position: [f32; 3], eye: [f32; 3]) -> [f32; 3] {
+    let d = sub(eye, position);
+    [
+        d[1].atan2(d[0].hypot(d[2])).to_degrees(),
+        d[0].atan2(d[2]).to_degrees(),
+        0.,
+    ]
+}
+
+/// Angles describe placement in the current horizontal head frame, not eye cant.
+pub fn horizon_spawn(
+    eye: [f32; 3],
+    q: [f32; 4],
+    yaw_deg: f32,
+    pitch_deg: f32,
+    distance: f32,
+) -> [f32; 3] {
+    let heading = (2. * (q[0] * q[2] + q[3] * q[1])).atan2(1. - 2. * (q[0] * q[0] + q[1] * q[1]));
+    let yaw = heading + yaw_deg.to_radians();
+    let pitch = pitch_deg.to_radians();
+    add(
+        eye,
+        [
+            -yaw.sin() * pitch.cos() * distance,
+            pitch.sin() * distance,
+            -yaw.cos() * pitch.cos() * distance,
+        ],
+    )
+}
+
 impl Frame {
     pub fn new(position: [f32; 3], size: [f32; 2], logical: [f32; 2], degrees: [f32; 3]) -> Self {
         let (p, y, r) = (
@@ -62,6 +94,17 @@ impl Frame {
     }
     pub fn normal(&self) -> [f32; 3] {
         cross(self.down, self.right)
+    }
+    pub fn normal_at(&self, xy: [f32; 2]) -> [f32; 3] {
+        let angle = if self.curve > 0. {
+            (xy[0] / self.logical[0] - 0.5) * self.size[0] / self.curve
+        } else {
+            0.
+        };
+        sub(
+            scale(self.normal(), angle.cos()),
+            scale(self.right, angle.sin()),
+        )
     }
     pub fn point(&self, xy: [f32; 2], depth: f32) -> [f32; 3] {
         let mut x = (xy[0] / self.logical[0] - 0.5) * self.size[0];

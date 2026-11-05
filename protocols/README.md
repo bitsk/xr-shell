@@ -95,13 +95,34 @@ owned resources, capture and state; ordinary process reconnect cannot inherit
 old IDs. `SessionEnding` precedes normal Shell socket closure. Components
 handle it as normal shutdown; unannounced disconnection is a failure.
 
-The renderer currently rasterises Kit primitives and application snapshots
-through an explicit CPU path before Vulkan samples spatial planes into the
-runtime's two eye swapchains. DMA-BUF, optimized retained rendering and SDK
-build closure on clean target distributions remain separate milestones.
+The renderer caches glyphs, icons and application snapshots on the CPU, while
+Vulkan evaluates spatial geometry, lighting and interaction appearance into the
+two eye swapchains. DMA-BUF and SDK build closure on clean target distributions
+remain separate milestones.
 
 - `taskbar.v1`: System UI sends `TaskbarIntent{mode:fixed|follow}` and receives
   `TaskbarApplied{mode}`. The Shell starts fixed, freezes its current rigid
   taskbar pose on fixed, and smoothly resumes shared following on follow.
   Snapshots expose `taskbar_mode`; System UI persists acknowledged choices
   and restores them at startup. Independent world-locked panels stay fixed.
+
+- `scene.spherical-placement.v1` adds `yaw_deg`, `pitch_deg`, `distance_m` and
+  `user_facing_billboard` to horizon-spawn Groups. Distances are 0.6–4 m;
+  panel centres use yaw ±35° and pitch −25°..+10°. Shell resolves one frozen
+  frame from a valid binocular midpoint and its horizontal heading. Older
+  horizon offsets remain supported. Kit's `Widget::horizon_panel` emits the
+  explicit form; clients must negotiate both horizon and spherical capabilities.
+- Controller rays have independent pointer IDs 2/3, hover and capture slots.
+  Two hands can grab one window to scale it; the legacy Wayland seat retains a
+  single application pointer-button owner. Cancelling one spatial pointer does
+  not release another pointer's capture. In debug sessions, ray parameters may
+  specify `source=debug_ray:left|debug_ray:right|mouse` and a bounded
+  `depth_delta_m`. These are developer parameters, not tracked controller proof.
+
+Spatial backgrounds, rounded geometry, slider tracks, optical lighting and
+hover/press appearance are evaluated by Vulkan. Cairo caches glyphs/icons and
+application snapshots; hover/press alone reuse the same bitmap. Opaque pixel
+cores establish depth before sorted translucent UI. Both eyes are recorded in
+one batch, with one completion wait before XR release. Per-frame resource rings,
+order-independent transparency and native composition-layer promotion remain
+separate work.

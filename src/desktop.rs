@@ -105,6 +105,8 @@ struct Window {
     height: u32,
     pixels: Vec<u8>,
     position: [f32; 3],
+    rotation: [f32; 3],
+    placed: bool,
     size: [f32; 2],
     frame: u64,
     minimized: bool,
@@ -131,16 +133,28 @@ enum Target {
     Curve(String),
 }
 #[derive(Clone)]
+struct Grab {
+    distance: f32,
+    local_anchor: [f32; 3],
+    point: [f32; 3],
+}
+#[derive(Clone)]
+struct Bimanual {
+    span: f32,
+    size: [f32; 2],
+    anchor: [f32; 3],
+}
+#[derive(Clone)]
 struct Capture {
     target: Target,
     /// Real application surface bound at press, even when a UI node embeds it.
     surface: Option<String>,
     resize_frame: Option<crate::spatial::Frame>,
+    grab: Option<Grab>,
     size: [f32; 2],
     logical: [f32; 2],
     id: String,
     interaction: String,
-    source: String,
     start: [f32; 2],
     position: [f32; 3],
 }
@@ -176,8 +190,9 @@ pub struct Desktop {
     system_owner: u64,
     clipboard_owner: u64,
     clipboard: Value,
-    capture: Option<Capture>,
-    hover: Option<(u64, String)>,
+    captures: BTreeMap<String, Capture>,
+    hovers: BTreeMap<String, (u64, String)>,
+    bimanual: BTreeMap<String, Bimanual>,
     event: u64,
     debug: bool,
     dirty: bool,
@@ -190,7 +205,7 @@ pub struct Desktop {
     horizon_head: Option<([f32; 3], [f32; 4])>,
     lifts: BTreeMap<(u64, String), f32>,
     expanded_orb: Option<String>,
-    companion_hover: Option<String>,
+    companion_hovers: BTreeMap<String, String>,
     raster_cache: BTreeMap<String, VecDeque<(Value, Arc<[u8]>)>>,
     stats: Value,
 }
@@ -278,8 +293,9 @@ impl Desktop {
             system_owner: 0,
             clipboard_owner: 0,
             clipboard: Value::Null,
-            capture: None,
-            hover: None,
+            captures: BTreeMap::new(),
+            hovers: BTreeMap::new(),
+            bimanual: BTreeMap::new(),
             event: 0,
             debug,
             dirty: true,
@@ -292,7 +308,7 @@ impl Desktop {
             horizon_head: None,
             lifts: BTreeMap::new(),
             expanded_orb: None,
-            companion_hover: None,
+            companion_hovers: BTreeMap::new(),
             raster_cache: BTreeMap::new(),
             stats: json!({"connections":0,"disconnects":0,"scene_transactions":0,"shm_commits":0,"buffer_releases":0,"input_events":0,"cancellations":0,"protocol_errors":0,"focus_changes":0}),
         })
@@ -305,7 +321,7 @@ impl Desktop {
         self.dirty = true;
     }
     pub fn summary(&self) -> Value {
-        json!({"stats":self.stats,"state_revision":self.revision.to_string(),"window_count":self.windows.len(),"component_count":self.peers.len(),"workspace":self.workspace,"focus_epoch":self.focus_epoch.to_string(),"focus_applied":self.focus_applied,"capture_active":self.capture.is_some()})
+        json!({"stats":self.stats,"state_revision":self.revision.to_string(),"window_count":self.windows.len(),"component_count":self.peers.len(),"workspace":self.workspace,"focus_epoch":self.focus_epoch.to_string(),"focus_applied":self.focus_applied,"capture_active":!self.captures.is_empty(),"capture_count":self.captures.len()})
     }
     pub fn snapshot(&self) -> Value {
         let windows: Vec<_> = self
@@ -322,6 +338,7 @@ impl Desktop {
                 v["curved"] = json!(w.curved);
                 v["focused"] = json!(self.focus.as_ref() == Some(k));
                 v["position_m"] = json!(w.position);
+                v["rotation_degrees"] = json!(w.rotation);
                 v["size_m"] = json!(w.size);
                 v["last_frame_id"] = json!(w.frame.to_string());
                 v
@@ -333,7 +350,7 @@ impl Desktop {
                 components.push(component.clone());
             }
         }
-        json!({"state_revision":self.revision.to_string(),"windows":windows,"components":components,"active_workspace":self.workspace,"focus_epoch":self.focus_epoch.to_string(),"focus":self.focus,"focus_applied":self.focus_applied,"system":self.system,"clipboard":self.clipboard_summary(),"stats":self.stats,"taskbar_mode":self.taskbar_follow.mode(),"taskbar_follow":self.taskbar_follow,"taskbar_capture_frozen":self.taskbar_captured()})
+        json!({"state_revision":self.revision.to_string(),"windows":windows,"components":components,"active_workspace":self.workspace,"focus_epoch":self.focus_epoch.to_string(),"focus":self.focus,"focus_applied":self.focus_applied,"system":self.system,"clipboard":self.clipboard_summary(),"stats":self.stats,"taskbar_mode":self.taskbar_follow.mode(),"taskbar_follow":self.taskbar_follow,"taskbar_capture_frozen":self.taskbar_captured(),"pointer_captures":self.captures.keys().collect::<Vec<_>>(),"pointer_hovers":self.hovers})
     }
     fn clipboard_summary(&self) -> Value {
         if self.clipboard.is_null() {
@@ -769,6 +786,22 @@ impl Desktop {
                                     || p.capabilities.iter().any(|c| c == "scene.horizon-spawn.v1"),
                                 "unnegotiated horizon spawn"
                             );
+                            ensure!(
+                                node.yaw_deg.is_finite()
+                                    && node.pitch_deg.is_finite()
+                                    && node.yaw_deg.abs() <= 35.
+                                    && (-25. ..=10.).contains(&node.pitch_deg)
+                                    && node
+                                        .distance_m
+                                        .is_none_or(|d| d.is_finite() && (0.6..=4.).contains(&d))
+                                    && ((!node.user_facing_billboard && node.distance_m.is_none())
+                                        || (node.spatial_panel
+                                            && node.spatial_policy == "head_horizon_spawn"
+                                            && p.capabilities
+                                                .iter()
+                                                .any(|c| c == "scene.spherical-placement.v1"))),
+                                "invalid or unnegotiated spherical placement"
+                            );
                             if node.spatial_panel {
                                 ensure!(
                                     node.kind == "Group"
@@ -844,41 +877,49 @@ impl Desktop {
                         parent = &nodes.get(parent).context("parent missing")?.parent_id;
                     }
                 }
-                let cancelled = self.capture.as_ref().is_some_and(|c| {
-                    let Target::Node(id, n) = &c.target else {
-                        return false;
-                    };
-                    if *id != p.id {
-                        return false;
-                    }
-                    let Some(node) = nodes.get(n) else {
-                        return true;
-                    };
-                    let reference = (node.kind == "SurfaceReference")
-                        .then(|| format!("{}:{}", node.window_server_generation, node.surface_id));
-                    if reference != c.surface {
-                        return true;
-                    }
-                    if reference.is_some() {
-                        let mut current = node;
-                        loop {
-                            if !current.visible || !current.enabled {
+                let cancelled: Vec<_> = self
+                    .captures
+                    .iter()
+                    .filter_map(|(source, c)| {
+                        let invalid = (|| {
+                            let Target::Node(id, n) = &c.target else {
+                                return false;
+                            };
+                            if *id != p.id {
+                                return false;
+                            }
+                            let Some(node) = nodes.get(n) else {
+                                return true;
+                            };
+                            let reference = (node.kind == "SurfaceReference").then(|| {
+                                format!("{}:{}", node.window_server_generation, node.surface_id)
+                            });
+                            if reference != c.surface {
                                 return true;
                             }
-                            if current.parent_id == "root" {
-                                break;
+                            if reference.is_some() {
+                                let mut current = node;
+                                loop {
+                                    if !current.visible || !current.enabled {
+                                        return true;
+                                    }
+                                    if current.parent_id == "root" {
+                                        break;
+                                    }
+                                    current = &nodes[&current.parent_id];
+                                }
+                                if node.rect[2] <= 0. || node.rect[3] <= 0. {
+                                    return true;
+                                }
                             }
-                            current = &nodes[&current.parent_id];
-                        }
-                        if node.rect[2] <= 0. || node.rect[3] <= 0. {
-                            return true;
-                        }
-                    }
-                    false
-                });
-                if cancelled {
+                            false
+                        })();
+                        invalid.then(|| source.clone())
+                    })
+                    .collect();
+                for source in cancelled {
                     self.pending_pointer = None;
-                    if let Some(c) = self.capture.take() {
+                    if let Some(c) = self.captures.remove(&source) {
                         self.release_capture_surface(&c);
                         p.send(&self.session,"Cancel","0",json!({"capture_id":c.id,"interaction_id":c.interaction,"reason":"target removed"}))?;
                         self.count("cancellations");
@@ -887,7 +928,7 @@ impl Desktop {
                 p.nodes = nodes;
                 p.spawn_frames.retain(|id, _| {
                     p.nodes.get(id).is_some_and(|n| {
-                        n.spatial_panel && n.spatial_policy == "head_horizon_spawn"
+                        n.visible && n.spatial_panel && n.spatial_policy == "head_horizon_spawn"
                     })
                 });
                 if let Some(head) = self.horizon_head {
@@ -943,11 +984,9 @@ impl Desktop {
                             width: 0,
                             height: 0,
                             pixels: Vec::new(),
-                            position: [
-                                (count % 3) as f32 * 0.15,
-                                1.6,
-                                -1.8 - (count % 3) as f32 * 0.1,
-                            ],
+                            position: [0.; 3],
+                            rotation: [0.; 3],
+                            placed: false,
                             size: [1.59, 1.1],
                             frame: 0,
                             minimized: false,
@@ -1104,9 +1143,9 @@ impl Desktop {
                 let logical_width = w.state["width"].as_f64().unwrap_or(width as f64) as f32;
                 let logical_height = w.state["height"].as_f64().unwrap_or(height as f64) as f32;
                 if !self
-                    .capture
-                    .as_ref()
-                    .is_some_and(|c| matches!(&c.target,Target::Resize(key,_) if key==&k))
+                    .captures
+                    .values()
+                    .any(|c| matches!(&c.target,Target::Resize(key,_) if key==&k))
                 {
                     w.size[1] = w.size[0] * logical_height / logical_width.max(1.);
                 }
@@ -1274,12 +1313,14 @@ impl Desktop {
         Ok(())
     }
     fn remove_window(&mut self, k: &str) {
-        if self
-            .capture
-            .as_ref()
-            .is_some_and(|c| c.surface.as_deref() == Some(k))
-        {
-            self.cancel("target removed");
+        let sources: Vec<_> = self
+            .captures
+            .iter()
+            .filter(|(_, c)| c.surface.as_deref() == Some(k))
+            .map(|(source, _)| source.clone())
+            .collect();
+        for source in sources {
+            self.cancel_source(&source, "target removed");
         }
         self.cancel_if(|t|matches!(t,Target::Window(key)|Target::Close(key)|Target::Move(key)|Target::Resize(key,_)|Target::Orb(key)|Target::Minimize(key)|Target::Curve(key) if key==k),"target removed");
         if self.focus.as_deref() == Some(k) {
@@ -1292,6 +1333,17 @@ impl Desktop {
     fn set_focus(&mut self, k: Option<String>) -> Result<()> {
         if self.focus == k && self.focus_applied {
             return Ok(());
+        }
+        if self.focus != k {
+            let sources: Vec<_> = self
+                .captures
+                .iter()
+                .filter(|(_, c)| c.surface.is_some() && c.surface == self.focus)
+                .map(|(source, _)| source.clone())
+                .collect();
+            for source in sources {
+                self.cancel_source(&source, "application focus changed");
+            }
         }
         if let Some(key) = &k {
             if let Some(w) = self.windows.get_mut(key) {
@@ -1356,7 +1408,13 @@ impl Desktop {
                     pos.iter().all(|n| n.abs() <= 10.),
                     "invalid window position"
                 );
-                self.windows.get_mut(&k).unwrap().position = pos;
+                let (eye, _) = self
+                    .horizon_head
+                    .context("valid binocular head pose required for placement")?;
+                let w = self.windows.get_mut(&k).unwrap();
+                w.position = pos;
+                w.rotation = crate::spatial::user_facing(pos, eye);
+                w.placed = true;
                 self.changed();
                 Ok(())
             }
@@ -1377,12 +1435,12 @@ impl Desktop {
         }
     }
     pub fn has_pointer_capture(&self, source: &str) -> bool {
-        self.capture.as_ref().is_some_and(|c| c.source == source)
+        self.captures.contains_key(source)
     }
     pub fn cancel_pointer(&mut self, source: &str, reason: &str) {
-        if self.has_pointer_capture(source) {
-            self.cancel(reason);
-        }
+        self.cancel_source(source, reason);
+        self.hovers.remove(source);
+        self.companion_hovers.remove(source);
     }
     /// Controller back releases any capture before forwarding an Escape tap.
     pub fn controller_back(&mut self) -> Result<()> {
@@ -1410,27 +1468,43 @@ impl Desktop {
         self.focused = focused;
     }
     fn cancel_if(&mut self, predicate: impl Fn(&Target) -> bool, reason: &str) {
-        if self.capture.as_ref().is_some_and(|c| predicate(&c.target)) {
-            self.cancel(reason);
+        let sources: Vec<_> = self
+            .captures
+            .iter()
+            .filter(|(_, c)| predicate(&c.target))
+            .map(|(s, _)| s.clone())
+            .collect();
+        for source in sources {
+            self.cancel_source(&source, reason);
         }
     }
     fn cancel(&mut self, reason: &str) {
-        self.pending_pointer = None;
-        if let Some(c) = self.capture.take() {
+        let sources: Vec<_> = self.captures.keys().cloned().collect();
+        for source in sources {
+            self.cancel_source(&source, reason);
+        }
+        self.hovers.clear();
+        self.companion_hovers.clear();
+    }
+    fn cancel_source(&mut self, source: &str, reason: &str) {
+        if let Some(c) = self.captures.remove(source) {
+            if c.surface.is_some() {
+                self.pending_pointer = None;
+            }
             if let Target::Resize(key, _) = &c.target {
                 if let Some(w) = self.windows.get_mut(key) {
                     w.size = c.size;
                     w.position = c.position;
                 }
             }
+            if let Target::Move(key) = &c.target {
+                self.finish_grab(key);
+            }
             self.release_capture_surface(&c);
             if let Target::Node(id, node) = c.target {
                 if let Some(p) = self.peers.get(&id) {
                     let _=p.send(&self.session,"Cancel","0",json!({"target_node_id":node,"capture_id":c.id,"interaction_id":c.interaction,"reason":reason}));
                 }
-            } else if c.surface.is_none() {
-                let _ = self
-                    .surface_input(json!({"kind":"pointer_button","button":272,"pressed":false}));
             }
             self.count("cancellations");
             self.dirty = true;
@@ -1501,8 +1575,8 @@ impl Desktop {
         let n = p.nodes.get(node).context("target gone")?;
         self.event += 1;
         let (capture, interaction) = self
-            .capture
-            .as_ref()
+            .captures
+            .get(source)
             .map(|c| (c.id.clone(), c.interaction.clone()))
             .unwrap_or_else(|| ("0".into(), self.event.to_string()));
         let value = n.min + (n.max - n.min) * (local[0] / n.rect[2].max(1.)).clamp(0., 1.);
@@ -1522,7 +1596,12 @@ impl Desktop {
     fn debug_input(&mut self, payload: &Value) -> Result<()> {
         match payload["kind"].as_str().unwrap_or("pointer") {
             "cancel" => {
-                self.cancel(payload["reason"].as_str().unwrap_or("source switched"));
+                let reason = payload["reason"].as_str().unwrap_or("developer cancel");
+                if let Some(source) = payload["source"].as_str() {
+                    self.cancel_pointer(source, reason);
+                } else {
+                    self.cancel(reason);
+                }
                 Ok(())
             }
             "key" | "text" | "scroll" | "pointer_motion" | "pointer_button" => {
@@ -1536,11 +1615,23 @@ impl Desktop {
                 for v in &mut direction {
                     *v /= length;
                 }
+                let source = payload["source"].as_str().unwrap_or("mouse");
+                ensure!(
+                    ["mouse", "debug_ray:left", "debug_ray:right"].contains(&source),
+                    "invalid debug pointer source"
+                );
+                if let Some(delta) = payload["depth_delta_m"].as_f64() {
+                    ensure!(
+                        delta.is_finite() && delta.abs() <= 0.25,
+                        "invalid depth delta"
+                    );
+                    self.grab_depth(source, delta as f32);
+                }
                 self.ray(
                     origin,
                     direction,
                     payload["phase"].as_str().context("phase missing")?,
-                    "mouse",
+                    source,
                 )
             }
             "focus_lost" => {
@@ -1565,7 +1656,7 @@ impl Desktop {
                     )
                 };
                 ensure!(x.is_finite() && y.is_finite(), "invalid pointer coordinate");
-                let hit = if let Some(c) = &self.capture {
+                let hit = if let Some(c) = self.captures.get("mouse") {
                     if let Target::Node(owner, node) = &c.target {
                         if *owner == id {
                             let r = Self::node_rect(
@@ -1600,20 +1691,17 @@ impl Desktop {
         if !self.ui_anchor_ready {
             return Ok(());
         }
-        if self.capture.as_ref().is_some_and(|c| c.source != source) {
-            if phase == "hover" {
-                return Ok(());
-            }
-            self.cancel("source switched");
-        }
-        if phase == "release" && self.capture.is_none() {
+        if phase == "release" && !self.captures.contains_key(source) {
             return Ok(());
         }
         if phase == "release" && !self.focus_applied {
             self.pending_pointer = None;
         }
         if phase == "press" {
-            ensure!(self.capture.is_none(), "pointer already captured");
+            ensure!(
+                !self.captures.contains_key(source),
+                "pointer already captured"
+            );
             if let Some((target, xy)) = &hit {
                 self.event += 1;
                 let pos = match target {
@@ -1630,31 +1718,49 @@ impl Desktop {
                         .map(|n| format!("{}:{}", n.window_server_generation, n.surface_id)),
                     _ => None,
                 };
-                self.capture = Some(Capture {
-                    target: target.clone(),
-                    resize_frame: match target {
-                        Target::Resize(k, left) => self
-                            .companion_frame(k, if *left { "resize-left" } else { "resize-right" }),
-                        _ => None,
+                // A legacy Wayland seat has one cursor/button stream. It does
+                // not arbitrate independent spatial controls or two-hand grabs.
+                if surface.is_some() && self.captures.values().any(|c| c.surface.is_some()) {
+                    return Ok(());
+                }
+                if self.captures.values().any(|c| match (&c.target, target) {
+                    (Target::Node(a, b), Target::Node(x, y)) => a == x && b == y,
+                    (Target::Resize(a, _), Target::Resize(b, _) | Target::Move(b))
+                    | (Target::Move(a), Target::Resize(b, _)) => a == b,
+                    _ => false,
+                }) {
+                    return Ok(());
+                }
+                self.captures.insert(
+                    source.into(),
+                    Capture {
+                        grab: None,
+                        target: target.clone(),
+                        resize_frame: match target {
+                            Target::Resize(k, left) => self.companion_frame(
+                                k,
+                                if *left { "resize-left" } else { "resize-right" },
+                            ),
+                            _ => None,
+                        },
+                        size: match target {
+                            Target::Resize(k, _) => self.windows[k].size,
+                            _ => [0.; 2],
+                        },
+                        logical: match target {
+                            Target::Resize(k, _) => Self::logical(&self.windows[k]),
+                            _ => [0.; 2],
+                        },
+                        surface,
+                        id: self.event.to_string(),
+                        interaction: self.event.to_string(),
+                        start: *xy,
+                        position: pos,
                     },
-                    size: match target {
-                        Target::Resize(k, _) => self.windows[k].size,
-                        _ => [0.; 2],
-                    },
-                    logical: match target {
-                        Target::Resize(k, _) => Self::logical(&self.windows[k]),
-                        _ => [0.; 2],
-                    },
-                    surface,
-                    id: self.event.to_string(),
-                    interaction: self.event.to_string(),
-                    source: source.into(),
-                    start: *xy,
-                    position: pos,
-                });
+                );
             }
         }
-        let target = if let Some(c) = &self.capture {
+        let target = if let Some(c) = self.captures.get(source) {
             let xy = hit.as_ref().map(|(_, xy)| *xy).unwrap_or([-1., -1.]);
             Some((c.target.clone(), xy))
         } else {
@@ -1664,9 +1770,9 @@ impl Desktop {
             match target {
                 Target::Node(id, n) => {
                     if phase == "hover" {
-                        let hover = Some((id, n.clone()));
-                        if self.hover != hover {
-                            self.hover = hover;
+                        let hover = (id, n.clone());
+                        if self.hovers.get(source) != Some(&hover) {
+                            self.hovers.insert(source.into(), hover);
                             self.dirty = true;
                         }
                     }
@@ -1683,13 +1789,25 @@ impl Desktop {
                             xy[0] * logical[0] / node.rect[2],
                             xy[1] * logical[1] / node.rect[3],
                         ];
-                        self.pointer_surface(&key, local, phase)?;
+                        if !self
+                            .captures
+                            .iter()
+                            .any(|(owner, c)| owner != source && c.surface.is_some())
+                        {
+                            self.pointer_surface(&key, local, phase)?;
+                        }
                     } else {
                         self.emit_node(id, &n, phase, xy, source)?;
                     }
                 }
                 Target::Window(k) => {
-                    self.pointer_surface(&k, xy, phase)?;
+                    if !self
+                        .captures
+                        .iter()
+                        .any(|(owner, c)| owner != source && c.surface.is_some())
+                    {
+                        self.pointer_surface(&k, xy, phase)?;
+                    }
                 }
                 Target::Orb(k) => {
                     if (phase == "hover" || phase == "press")
@@ -1722,21 +1840,10 @@ impl Desktop {
                         self.window_intent(json!({"intent":"close","surface_id":w.state["surface_id"],"window_server_generation":w.state["window_server_generation"]}))?;
                     }
                 }
-                Target::Move(k) => {
-                    if phase == "drag" {
-                        if let Some(c) = &self.capture {
-                            let w = self.windows.get_mut(&k).unwrap();
-                            w.position[0] = c.position[0]
-                                + (xy[0] - c.start[0]) * w.size[0] / Self::logical(w)[0];
-                            w.position[1] = c.position[1]
-                                - (xy[1] - c.start[1]) * w.size[1] / Self::logical(w)[1].max(1.);
-                            self.dirty = true;
-                        }
-                    }
-                }
+                Target::Move(_) => { /* Updated from the 3D ray by spatial_ui. */ }
                 Target::Resize(k, left) => {
                     if phase == "drag" || phase == "release" {
-                        if let Some(c) = self.capture.clone() {
+                        if let Some(c) = self.captures.get(source).cloned() {
                             let width = (c.logical[0]
                                 + (xy[0] - c.start[0]) * if left { -1. } else { 1. })
                             .clamp(160., 2048.)
@@ -1761,12 +1868,23 @@ impl Desktop {
                             } else {
                                 0.
                             };
-                            w.position = [
-                                c.position[0]
-                                    + (c.size[0] - size[0]) * if left { 0.5 } else { -0.5 } * arc_x,
-                                c.position[1] + (c.size[1] - size[1]) * 0.5,
-                                c.position[2] + (c.size[0] - size[0]) * arc_z,
-                            ];
+                            let f = crate::spatial::Frame::new(
+                                c.position, c.size, c.logical, w.rotation,
+                            );
+                            let offset = crate::spatial::add(
+                                crate::spatial::scale(
+                                    f.right,
+                                    (c.size[0] - size[0]) * if left { 0.5 } else { -0.5 } * arc_x,
+                                ),
+                                crate::spatial::add(
+                                    crate::spatial::scale(f.down, (size[1] - c.size[1]) * 0.5),
+                                    crate::spatial::scale(
+                                        f.normal(),
+                                        (c.size[0] - size[0]) * arc_z,
+                                    ),
+                                ),
+                            );
+                            w.position = crate::spatial::add(c.position, offset);
                             self.dirty = true;
                             if phase == "release" {
                                 self.window_intent(json!({"intent":"resize","surface_id":self.windows[&k].state["surface_id"],"window_server_generation":self.windows[&k].state["window_server_generation"],"width":width as u32,"height":height as u32}))?;
@@ -1778,7 +1896,11 @@ impl Desktop {
             }
         }
         if phase == "release" {
-            self.capture = None;
+            if let Some(c) = self.captures.remove(source) {
+                if let Target::Move(key) = c.target {
+                    self.finish_grab(&key);
+                }
+            }
         }
         if phase != "hover" {
             self.dirty = true;
@@ -1825,24 +1947,25 @@ impl Desktop {
         for node in peer
             .nodes
             .values()
-            .filter(|n| n.spatial_panel && n.spatial_policy == "head_horizon_spawn")
+            .filter(|n| n.visible && n.spatial_panel && n.spatial_policy == "head_horizon_spawn")
         {
             if peer.spawn_frames.contains_key(&node.node_id) {
                 continue;
             }
-            let offset = node.position_m;
-            let delta = [
-                cos * offset[0] + sin * offset[2],
-                offset[1] - 1.6,
-                -sin * offset[0] + cos * offset[2],
-            ];
-            let horizontal = delta[0].hypot(delta[2]);
-            let rotation = [
-                (-delta[1]).atan2(horizontal).to_degrees(),
-                (-delta[0]).atan2(-delta[2]).to_degrees(),
-                0.,
-            ];
-            let position = crate::spatial::add(eye, delta);
+            let position = if let Some(distance) = node.distance_m {
+                crate::spatial::horizon_spawn(eye, q, node.yaw_deg, node.pitch_deg, distance)
+            } else {
+                let offset = node.position_m;
+                crate::spatial::add(
+                    eye,
+                    [
+                        cos * offset[0] + sin * offset[2],
+                        offset[1] - 1.6,
+                        -sin * offset[0] + cos * offset[2],
+                    ],
+                )
+            };
+            let rotation = crate::spatial::user_facing(position, eye);
             peer.spawn_frames.insert(
                 node.node_id.clone(),
                 crate::spatial::Frame::new(position, node.size_m, node.logical_size, rotation),
@@ -1868,6 +1991,23 @@ impl Desktop {
         }
         let head = (crate::spatial::sub(position, self.ui_offset), q);
         self.horizon_head = Some(head);
+        // A window may arrive before the first valid stereo pose. Leave it
+        // invisible until it can be placed in a real horizon frame.
+        let mut index = self
+            .windows
+            .values()
+            .filter(|w| {
+                w.placed && w.has_window_controls() && w.state["workspace"] == self.workspace
+            })
+            .count();
+        for w in self.windows.values_mut().filter(|w| !w.placed) {
+            let yaw = [0., -24., 24.][index % 3];
+            w.position = crate::spatial::horizon_spawn(head.0, head.1, yaw, 0., 1.8);
+            w.rotation = crate::spatial::user_facing(w.position, head.0);
+            w.placed = true;
+            index += 1;
+            self.dirty = true;
+        }
         for peer in self.peers.values_mut() {
             if Self::freeze_spawn_frames(peer, head) {
                 self.dirty = true;
@@ -1897,7 +2037,7 @@ impl Desktop {
             .update(crate::spatial::sub(position, self.ui_offset), q, dt)
     }
     fn taskbar_captured(&self) -> bool {
-        self.capture.as_ref().is_some_and(|c| match &c.target {
+        self.captures.values().any(|c| match &c.target {
             Target::Node(id, node) => self.peers.get(id).is_some_and(|p| {
                 p.nodes
                     .get(node)

@@ -115,6 +115,7 @@ pub struct Renderer {
     pass: vk::RenderPass,
     pipeline: vk::Pipeline,
     spatial_pipeline: vk::Pipeline,
+    opaque_pipeline: vk::Pipeline,
     controllers: [Option<crate::controller_model::Model>; 2],
     controller_states: [crate::input::HandState; 2],
     ray_feedback: [Option<crate::spatial::RayFeedback>; 2],
@@ -128,6 +129,7 @@ pub struct Renderer {
     image_memory: vk::DeviceMemory,
     image_view: vk::ImageView,
     sampler: vk::Sampler,
+    atlas_sampler: vk::Sampler,
     pool: vk::CommandPool,
     cmd: vk::CommandBuffer,
     fence: vk::Fence,
@@ -165,6 +167,7 @@ impl Renderer {
             pass: vk::RenderPass::null(),
             pipeline: vk::Pipeline::null(),
             spatial_pipeline: vk::Pipeline::null(),
+            opaque_pipeline: vk::Pipeline::null(),
             controllers: [None, None],
             controller_states: [crate::input::HandState::default(); 2],
             ray_feedback: [None; 2],
@@ -178,6 +181,7 @@ impl Renderer {
             image_memory: vk::DeviceMemory::null(),
             image_view: vk::ImageView::null(),
             sampler: vk::Sampler::null(),
+            atlas_sampler: vk::Sampler::null(),
             pool: vk::CommandPool::null(),
             cmd: vk::CommandBuffer::null(),
             fence: vk::Fence::null(),
@@ -341,7 +345,7 @@ impl Renderer {
                 &[vk::SubmitInfo::default().command_buffers(&[self.cmd])],
                 self.fence,
             )?;
-            // S1 deliberately completes GPU work before releasing each XR image.
+            // Complete the stereo batch before releasing the acquired XR images.
             self.gpu
                 .device
                 .wait_for_fences(&[self.fence], true, u64::MAX)?;
@@ -361,18 +365,36 @@ impl Renderer {
             height: environment.height,
             depth: 1,
         };
+        let levels = mip_count(environment.width, environment.height);
         unsafe {
             let d = &self.gpu.device;
+            let features = self
+                .gpu
+                .instance
+                .get_physical_device_format_properties(self.gpu.physical, vk::Format::R8G8B8A8_SRGB)
+                .optimal_tiling_features;
+            ensure!(
+                features.contains(
+                    vk::FormatFeatureFlags::BLIT_SRC
+                        | vk::FormatFeatureFlags::BLIT_DST
+                        | vk::FormatFeatureFlags::SAMPLED_IMAGE_FILTER_LINEAR
+                ),
+                "UI sRGB format needs filtered mip blits"
+            );
             self.image = d.create_image(
                 &vk::ImageCreateInfo::default()
                     .image_type(vk::ImageType::TYPE_2D)
                     .format(vk::Format::R8G8B8A8_SRGB)
                     .extent(extent)
-                    .mip_levels(1)
+                    .mip_levels(levels)
                     .array_layers(1)
                     .samples(vk::SampleCountFlags::TYPE_1)
                     .tiling(vk::ImageTiling::OPTIMAL)
-                    .usage(vk::ImageUsageFlags::TRANSFER_DST | vk::ImageUsageFlags::SAMPLED)
+                    .usage(
+                        vk::ImageUsageFlags::TRANSFER_DST
+                            | vk::ImageUsageFlags::TRANSFER_SRC
+                            | vk::ImageUsageFlags::SAMPLED,
+                    )
                     .sharing_mode(vk::SharingMode::EXCLUSIVE)
                     .initial_layout(vk::ImageLayout::UNDEFINED),
                 None,
@@ -395,7 +417,8 @@ impl Renderer {
                 vk::ImageLayout::TRANSFER_DST_OPTIMAL,
                 vk::AccessFlags::empty(),
                 vk::AccessFlags::TRANSFER_WRITE,
-            );
+            )
+            .subresource_range(colour_range().level_count(levels));
             d.cmd_pipeline_barrier(
                 self.cmd,
                 vk::PipelineStageFlags::TOP_OF_PIPE,
@@ -414,21 +437,13 @@ impl Renderer {
                     .image_subresource(colour_layers())
                     .image_extent(extent)],
             );
-            let to_sample = image_barrier(
-                self.image,
-                vk::ImageLayout::TRANSFER_DST_OPTIMAL,
-                vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
-                vk::AccessFlags::TRANSFER_WRITE,
-                vk::AccessFlags::SHADER_READ,
-            );
-            d.cmd_pipeline_barrier(
+            generate_mips(
+                &self.gpu,
                 self.cmd,
-                vk::PipelineStageFlags::TRANSFER,
-                vk::PipelineStageFlags::FRAGMENT_SHADER,
-                vk::DependencyFlags::empty(),
-                &[],
-                &[],
-                &[to_sample],
+                self.image,
+                environment.width,
+                environment.height,
+                levels,
             );
             self.submit()?;
             self.image_view = d.create_image_view(
@@ -436,18 +451,35 @@ impl Renderer {
                     .image(self.image)
                     .view_type(vk::ImageViewType::TYPE_2D)
                     .format(vk::Format::R8G8B8A8_SRGB)
-                    .subresource_range(colour_range()),
+                    .subresource_range(colour_range().level_count(levels)),
                 None,
             )?;
             self.sampler = d.create_sampler(
                 &vk::SamplerCreateInfo::default()
                     .mag_filter(vk::Filter::LINEAR)
                     .min_filter(vk::Filter::LINEAR)
-                    .mipmap_mode(vk::SamplerMipmapMode::NEAREST)
+                    .mipmap_mode(vk::SamplerMipmapMode::LINEAR)
                     .address_mode_u(vk::SamplerAddressMode::REPEAT)
                     .address_mode_v(vk::SamplerAddressMode::CLAMP_TO_EDGE)
                     .address_mode_w(vk::SamplerAddressMode::CLAMP_TO_EDGE)
-                    .max_lod(0.0),
+                    .anisotropy_enable(self.gpu.anisotropy > 1.)
+                    .max_anisotropy(self.gpu.anisotropy)
+                    .max_lod((levels - 1) as f32),
+                None,
+            )?;
+            self.atlas_sampler = d.create_sampler(
+                &vk::SamplerCreateInfo::default()
+                    .mag_filter(vk::Filter::LINEAR)
+                    .min_filter(vk::Filter::LINEAR)
+                    .mipmap_mode(vk::SamplerMipmapMode::LINEAR)
+                    .address_mode_u(vk::SamplerAddressMode::CLAMP_TO_EDGE)
+                    .address_mode_v(vk::SamplerAddressMode::CLAMP_TO_EDGE)
+                    .address_mode_w(vk::SamplerAddressMode::CLAMP_TO_EDGE)
+                    .anisotropy_enable(self.gpu.anisotropy > 1.)
+                    .max_anisotropy(self.gpu.anisotropy)
+                    // Sixteen duplicated edge texels isolate the first four levels,
+                    // including the two-tap anisotropic footprint at the coarsest LOD.
+                    .max_lod(3.),
                 None,
             )?;
             self.descriptor_layout = d.create_descriptor_set_layout(
@@ -668,13 +700,13 @@ impl Renderer {
         })
     }
 
-    pub fn render(
+    fn record_eye(
         &self,
         eye: usize,
         image_index: usize,
         view: &xr::View,
         capture: bool,
-    ) -> Result<Option<Vec<u8>>> {
+    ) -> Result<Option<Buffer>> {
         let target = &self.eyes[eye];
         ensure!(
             image_index < target.images.len(),
@@ -690,7 +722,6 @@ impl Renderer {
         } else {
             None
         };
-        self.begin()?;
         unsafe {
             let d = &self.gpu.device;
             let rect = vk::Rect2D {
@@ -771,7 +802,13 @@ impl Renderer {
                 .enumerate()
             {
                 if let Some(model) = model {
-                    model.draw(self.cmd, view, state, self.ray_feedback[hand].as_ref());
+                    model.draw(
+                        self.cmd,
+                        view,
+                        state,
+                        self.ray_feedback[hand].as_ref(),
+                        false,
+                    );
                 }
             }
             // Controller drawing uses a separate descriptor and push-constant layout.
@@ -791,12 +828,29 @@ impl Renderer {
                 bytes,
             );
             if self.ui_anchor_ready && self.draw_count > 0 {
-                d.cmd_bind_pipeline(
-                    self.cmd,
-                    vk::PipelineBindPoint::GRAPHICS,
-                    self.spatial_pipeline,
-                );
-                d.cmd_draw(self.cmd, 192 + 36 * 6, self.draw_count, 0, 0);
+                // Opaque window/glyph cores establish per-pixel depth before
+                // sorted translucent glass. Intersecting opaque panels no longer
+                // depend on their centre-distance order.
+                for pipeline in [self.opaque_pipeline, self.spatial_pipeline] {
+                    d.cmd_bind_pipeline(self.cmd, vk::PipelineBindPoint::GRAPHICS, pipeline);
+                    d.cmd_draw(self.cmd, 192 + 36 * 6, self.draw_count, 0, 0);
+                }
+            }
+            for (hand, (model, state)) in self
+                .controllers
+                .iter()
+                .zip(&self.controller_states)
+                .enumerate()
+            {
+                if let Some(model) = model {
+                    model.draw(
+                        self.cmd,
+                        view,
+                        state,
+                        self.ray_feedback[hand].as_ref(),
+                        true,
+                    );
+                }
             }
             d.cmd_end_render_pass(self.cmd);
             if let Some(buffer) = &readback {
@@ -861,18 +915,38 @@ impl Renderer {
                 );
             }
         }
+        Ok(readback)
+    }
+
+    /// Both eyes share one recording/submission. The single completion wait
+    /// protects XR release and optional readback; no CPU wait splits the eyes.
+    pub fn render_stereo(
+        &self,
+        indices: [u32; 2],
+        views: &[xr::View],
+        capture: bool,
+    ) -> Result<Vec<Option<Vec<u8>>>> {
+        self.begin()?;
+        let readbacks: Vec<_> = (0..2)
+            .map(|eye| self.record_eye(eye, indices[eye] as usize, &views[eye], capture))
+            .collect::<Result<_>>()?;
         self.submit()?;
-        if let Some(buffer) = readback {
-            let mut rgba = buffer.read()?;
-            if self.format == vk::Format::B8G8R8A8_SRGB {
-                for p in rgba.chunks_exact_mut(4) {
-                    p.swap(0, 2);
-                }
-            }
-            Ok(Some(rgba))
-        } else {
-            Ok(None)
-        }
+        readbacks
+            .into_iter()
+            .map(|buffer| {
+                buffer
+                    .map(|buffer| {
+                        let mut rgba = buffer.read()?;
+                        if self.format == vk::Format::B8G8R8A8_SRGB {
+                            for p in rgba.chunks_exact_mut(4) {
+                                p.swap(0, 2);
+                            }
+                        }
+                        Ok(rgba)
+                    })
+                    .transpose()
+            })
+            .collect()
     }
 }
 
@@ -884,6 +958,7 @@ impl Drop for Renderer {
             self.controllers = [None, None];
             let d = &self.gpu.device;
             d.destroy_pipeline(self.spatial_pipeline, None);
+            d.destroy_pipeline(self.opaque_pipeline, None);
             d.destroy_pipeline(self.pipeline, None);
             d.destroy_pipeline_layout(self.layout, None);
             for shader in self.shaders.drain(..) {
@@ -893,12 +968,116 @@ impl Drop for Renderer {
             d.destroy_descriptor_pool(self.descriptor_pool, None);
             d.destroy_descriptor_set_layout(self.descriptor_layout, None);
             d.destroy_sampler(self.sampler, None);
+            d.destroy_sampler(self.atlas_sampler, None);
             d.destroy_image_view(self.image_view, None);
             d.destroy_image(self.image, None);
             d.free_memory(self.image_memory, None);
             d.destroy_fence(self.fence, None);
             d.destroy_command_pool(self.pool, None);
         }
+    }
+}
+
+fn mip_count(width: u32, height: u32) -> u32 {
+    32 - width.max(height).leading_zeros()
+}
+fn align_tile(n: u32) -> u32 {
+    (n + 15) & !15
+}
+fn padded_pixels(p: &crate::desktop::Panel) -> Vec<u8> {
+    let width = align_tile(p.width + 32);
+    let height = align_tile(p.height + 32);
+    let mut tile = Vec::with_capacity((width * height * 4) as usize);
+    for y in 0..height {
+        for x in 0..width {
+            let px = x.saturating_sub(16).min(p.width - 1);
+            let py = y.saturating_sub(16).min(p.height - 1);
+            let offset = ((py * p.width + px) * 4) as usize;
+            tile.extend_from_slice(&p.rgba[offset..offset + 4]);
+        }
+    }
+    tile
+}
+unsafe fn generate_mips(
+    gpu: &Gpu,
+    cmd: vk::CommandBuffer,
+    image: vk::Image,
+    width: u32,
+    height: u32,
+    levels: u32,
+) {
+    unsafe {
+        let d = &gpu.device;
+        for level in 1..levels {
+            let range = colour_range().base_mip_level(level - 1);
+            d.cmd_pipeline_barrier(
+                cmd,
+                vk::PipelineStageFlags::TRANSFER,
+                vk::PipelineStageFlags::TRANSFER,
+                vk::DependencyFlags::empty(),
+                &[],
+                &[],
+                &[image_barrier(
+                    image,
+                    vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                    vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+                    vk::AccessFlags::TRANSFER_WRITE,
+                    vk::AccessFlags::TRANSFER_READ,
+                )
+                .subresource_range(range)],
+            );
+            let extent = |l: u32| vk::Offset3D {
+                x: (width >> l).max(1) as i32,
+                y: (height >> l).max(1) as i32,
+                z: 1,
+            };
+            let blit = vk::ImageBlit::default()
+                .src_subresource(colour_layers().mip_level(level - 1))
+                .src_offsets([vk::Offset3D::default(), extent(level - 1)])
+                .dst_subresource(colour_layers().mip_level(level))
+                .dst_offsets([vk::Offset3D::default(), extent(level)]);
+            d.cmd_blit_image(
+                cmd,
+                image,
+                vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+                image,
+                vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                &[blit],
+                vk::Filter::LINEAR,
+            );
+            d.cmd_pipeline_barrier(
+                cmd,
+                vk::PipelineStageFlags::TRANSFER,
+                vk::PipelineStageFlags::FRAGMENT_SHADER,
+                vk::DependencyFlags::empty(),
+                &[],
+                &[],
+                &[image_barrier(
+                    image,
+                    vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+                    vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+                    vk::AccessFlags::TRANSFER_READ,
+                    vk::AccessFlags::SHADER_READ,
+                )
+                .subresource_range(range)],
+            );
+        }
+        d.cmd_pipeline_barrier(
+            cmd,
+            vk::PipelineStageFlags::TRANSFER,
+            vk::PipelineStageFlags::FRAGMENT_SHADER,
+            vk::DependencyFlags::empty(),
+            &[],
+            &[],
+            &[image_barrier(
+                image,
+                vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+                vk::AccessFlags::TRANSFER_WRITE,
+                vk::AccessFlags::SHADER_READ,
+            )
+            .subresource_range(colour_range().base_mip_level(levels - 1))],
+        );
     }
 }
 
@@ -962,11 +1141,15 @@ impl Atlas {
                         height,
                         depth: 1,
                     })
-                    .mip_levels(1)
+                    .mip_levels(mip_count(width, height))
                     .array_layers(1)
                     .samples(vk::SampleCountFlags::TYPE_1)
                     .tiling(vk::ImageTiling::OPTIMAL)
-                    .usage(vk::ImageUsageFlags::TRANSFER_DST | vk::ImageUsageFlags::SAMPLED)
+                    .usage(
+                        vk::ImageUsageFlags::TRANSFER_DST
+                            | vk::ImageUsageFlags::TRANSFER_SRC
+                            | vk::ImageUsageFlags::SAMPLED,
+                    )
                     .sharing_mode(vk::SharingMode::EXCLUSIVE),
                 None,
             )?;
@@ -986,7 +1169,7 @@ impl Atlas {
                     .image(a.image)
                     .view_type(vk::ImageViewType::TYPE_2D)
                     .format(vk::Format::R8G8B8A8_SRGB)
-                    .subresource_range(colour_range()),
+                    .subresource_range(colour_range().level_count(mip_count(width, height))),
                 None,
             )?;
         }
@@ -1003,7 +1186,7 @@ impl Drop for Atlas {
         }
     }
 }
-const UI_UNIFORM_BYTES: u64 = 2048 * 96;
+const UI_UNIFORM_BYTES: u64 = 2048 * 128;
 impl Renderer {
     fn init_panels(&mut self) -> Result<()> {
         self.ui_uniform = Some(Buffer::host(
@@ -1018,25 +1201,25 @@ impl Renderer {
         ensure!(panels.len() <= 2048, "draw item limit");
         let width = panels
             .iter()
-            .map(|p| p.width + 4)
+            .map(|p| align_tile(p.width + 32))
             .max()
             .unwrap_or(4)
             .max(512)
             .next_power_of_two()
             .min(4096);
         let mut packing = Vec::new();
-        let (mut x, mut y, mut row) = (2u32, 2u32, 0u32);
+        let (mut x, mut y, mut row) = (0u32, 0u32, 0u32);
         for p in panels {
-            if x + p.width + 2 > width {
-                x = 2;
-                y += row + 4;
+            if x + align_tile(p.width + 32) > width {
+                x = 0;
+                y += row;
                 row = 0;
             }
-            packing.push((x, y));
-            x += p.width + 4;
-            row = row.max(p.height);
+            packing.push((x + 16, y + 16));
+            x += align_tile(p.width + 32);
+            row = row.max(align_tile(p.height + 32));
         }
-        let height = (y + row + 2).max(4).next_power_of_two();
+        let height = (y + row).max(32).next_power_of_two();
         ensure!(height <= 8192, "spatial atlas capacity");
         let full = self
             .atlas
@@ -1081,11 +1264,14 @@ impl Renderer {
             let mut copies = Vec::new();
             if full {
                 for (p, (x, y)) in panels.iter().zip(&packing) {
-                    for row in 0..p.height as usize {
-                        let dst = ((*y as usize + row) * width as usize + *x as usize) * 4;
-                        let src = row * p.width as usize * 4;
-                        pixels[dst..dst + p.width as usize * 4]
-                            .copy_from_slice(&p.rgba[src..src + p.width as usize * 4]);
+                    let tile = padded_pixels(p);
+                    let tile_width = align_tile(p.width + 32) as usize;
+                    for row in 0..align_tile(p.height + 32) as usize {
+                        let dst =
+                            (((*y - 16) as usize + row) * width as usize + (*x - 16) as usize) * 4;
+                        pixels[dst..dst + tile_width * 4].copy_from_slice(
+                            &tile[row * tile_width * 4..(row + 1) * tile_width * 4],
+                        );
                     }
                 }
                 copies.push(
@@ -1102,19 +1288,19 @@ impl Renderer {
                     let p = &panels[i];
                     let (x, y) = packing[i];
                     let offset = pixels.len() as u64;
-                    pixels.extend_from_slice(&p.rgba);
+                    pixels.extend_from_slice(&padded_pixels(p));
                     copies.push(
                         vk::BufferImageCopy::default()
                             .buffer_offset(offset)
                             .image_subresource(colour_layers())
                             .image_offset(vk::Offset3D {
-                                x: x as i32,
-                                y: y as i32,
+                                x: (x - 16) as i32,
+                                y: (y - 16) as i32,
                                 z: 0,
                             })
                             .image_extent(vk::Extent3D {
-                                width: p.width,
-                                height: p.height,
+                                width: align_tile(p.width + 32),
+                                height: align_tile(p.height + 32),
                                 depth: 1,
                             }),
                     );
@@ -1166,6 +1352,9 @@ impl Renderer {
                                 vk::AccessFlags::empty()
                             },
                             vk::AccessFlags::TRANSFER_WRITE,
+                        )
+                        .subresource_range(
+                            colour_range().level_count(mip_count(a.width, a.height)),
                         )],
                     );
                     d.cmd_copy_buffer_to_image(
@@ -1175,20 +1364,13 @@ impl Renderer {
                         vk::ImageLayout::TRANSFER_DST_OPTIMAL,
                         &copies,
                     );
-                    d.cmd_pipeline_barrier(
+                    generate_mips(
+                        &self.gpu,
                         self.cmd,
-                        vk::PipelineStageFlags::TRANSFER,
-                        vk::PipelineStageFlags::FRAGMENT_SHADER,
-                        vk::DependencyFlags::empty(),
-                        &[],
-                        &[],
-                        &[image_barrier(
-                            a.image,
-                            vk::ImageLayout::TRANSFER_DST_OPTIMAL,
-                            vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
-                            vk::AccessFlags::TRANSFER_WRITE,
-                            vk::AccessFlags::SHADER_READ,
-                        )],
+                        a.image,
+                        a.width,
+                        a.height,
+                        mip_count(a.width, a.height),
                     );
                 }
             }
@@ -1220,7 +1402,7 @@ impl Renderer {
             .collect();
         unsafe {
             let images = [vk::DescriptorImageInfo::default()
-                .sampler(self.sampler)
+                .sampler(self.atlas_sampler)
                 .image_view(self.atlas.as_ref().unwrap().view)
                 .image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)];
             let buffer = [vk::DescriptorBufferInfo::default()
@@ -1254,6 +1436,8 @@ impl Renderer {
                 anchor: p.frame.position,
                 group: p.id.clone(),
                 layer: 0.,
+                tint: [0.; 4],
+                controls: [0.; 4],
             })
             .collect();
         self.update_panel_poses(&poses, [0., 1.6, 0.])
@@ -1286,7 +1470,7 @@ impl Renderer {
             }
         });
         self.draw_count = order.len() as u32;
-        let mut values = Vec::with_capacity(order.len() * 24);
+        let mut values = Vec::with_capacity(order.len() * 32);
         for p in order {
             let mut f = p.frame;
             f.position = crate::spatial::add(f.position, self.ui_offset);
@@ -1325,6 +1509,8 @@ impl Renderer {
                 },
                 0.,
             ]);
+            values.extend_from_slice(&p.tint);
+            values.extend_from_slice(&p.controls);
         }
         self.panel_uniforms = values;
         self.ui_uniform.as_ref().unwrap().write(unsafe {
@@ -1372,7 +1558,7 @@ impl Renderer {
                 .rasterization_samples(vk::SampleCountFlags::TYPE_1);
             let attachments = [vk::PipelineColorBlendAttachmentState::default()
                 .blend_enable(true)
-                .src_color_blend_factor(vk::BlendFactor::SRC_ALPHA)
+                .src_color_blend_factor(vk::BlendFactor::ONE)
                 .dst_color_blend_factor(vk::BlendFactor::ONE_MINUS_SRC_ALPHA)
                 .color_blend_op(vk::BlendOp::ADD)
                 .src_alpha_blend_factor(vk::BlendFactor::ONE)
@@ -1399,10 +1585,27 @@ impl Renderer {
                 .layout(self.layout)
                 .render_pass(self.pass);
             let result = d.create_graphics_pipelines(vk::PipelineCache::null(), &[create], None);
+            self.spatial_pipeline = result.map_err(|(_, e)| e)?[0];
+            let opaque_value = 1_u32.to_ne_bytes();
+            let entries = [vk::SpecializationMapEntry::default()
+                .constant_id(0)
+                .offset(0)
+                .size(4)];
+            let specialization = vk::SpecializationInfo::default()
+                .map_entries(&entries)
+                .data(&opaque_value);
+            let mut opaque_stages = stages;
+            opaque_stages[1] = opaque_stages[1].specialization_info(&specialization);
+            let opaque_depth = depth_state.depth_write_enable(true);
+            let opaque_create = create
+                .stages(&opaque_stages)
+                .depth_stencil_state(&opaque_depth);
+            let result =
+                d.create_graphics_pipelines(vk::PipelineCache::null(), &[opaque_create], None);
             for module in modules {
                 d.destroy_shader_module(module, None);
             }
-            self.spatial_pipeline = result.map_err(|(_, e)| e)?[0];
+            self.opaque_pipeline = result.map_err(|(_, e)| e)?[0];
             Ok(())
         }
     }

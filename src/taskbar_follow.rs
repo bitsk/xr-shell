@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
-//! One rigid, lazy-follow anchor for every taskbar island, across components.
+//! One shared lazy-follow anchor with individually user-facing taskbar islands.
 use crate::spatial::{Frame, add, sub};
 use serde::Serialize;
 use xr_spatial_kit::taskbar;
@@ -35,9 +35,22 @@ impl TaskbarFollow {
             self.position_m,
             self.rotate(sub(frame.position, taskbar::CENTER_POSITION)),
         );
-        frame.right = self.rotate(frame.right);
-        frame.down = self.rotate(frame.down);
-        frame
+        let eye = sub(
+            self.position_m,
+            self.rotate([
+                0.,
+                taskbar::CENTER_POSITION[1] - 1.6,
+                taskbar::CENTER_POSITION[2],
+            ]),
+        );
+        let mut facing = Frame::new(
+            frame.position,
+            frame.size,
+            frame.logical,
+            crate::spatial::user_facing(frame.position, eye),
+        );
+        facing.curve = frame.curve;
+        facing
     }
     pub fn mode(&self) -> &'static str {
         if self.follow_enabled {
@@ -51,12 +64,24 @@ impl TaskbarFollow {
         self.following = follow;
     }
     pub fn update(&mut self, position: [f32; 3], q: [f32; 4], dt: f32) -> bool {
-        let height = *self.head_height.get_or_insert(position[1]);
-        self.initialized = true;
+        self.head_height.get_or_insert(position[1]);
+        let yaw = (2. * (q[0] * q[2] + q[3] * q[1])).atan2(1. - 2. * (q[0] * q[0] + q[1] * q[1]));
+        if !self.initialized {
+            self.yaw_radians = yaw;
+            self.position_m = add(
+                position,
+                self.rotate([
+                    0.,
+                    taskbar::CENTER_POSITION[1] - 1.6,
+                    taskbar::CENTER_POSITION[2],
+                ]),
+            );
+            self.initialized = true;
+            return true;
+        }
         if !self.follow_enabled {
             return false;
         }
-        let yaw = (2. * (q[0] * q[2] + q[3] * q[1])).atan2(1. - 2. * (q[0] * q[0] + q[1] * q[1]));
         let delta = (yaw - self.yaw_radians + std::f32::consts::PI)
             .rem_euclid(std::f32::consts::TAU)
             - std::f32::consts::PI;
@@ -75,7 +100,7 @@ impl TaskbarFollow {
         let rotated = self.rotate(taskbar::CENTER_POSITION);
         let target = [
             position[0] + rotated[0],
-            position[1] + rotated[1] - height,
+            position[1] + rotated[1] - 1.6,
             position[2] + rotated[2],
         ];
         let alpha = (dt * 8.).clamp(0., 1.);

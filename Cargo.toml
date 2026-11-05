@@ -1,6 +1,6 @@
 [package]
 name = "xr-shell"
-version = "0.2.16"
+version = "0.2.17"
 edition = "2024"
 license = "GPL-3.0-or-later"
 description = "Rust OpenXR spatial shell for UKUI XR"
@@ -10,7 +10,7 @@ members = ["protocols"]
 
 [dependencies]
 xr-shell-protocols = { path = "protocols" }
-xr-spatial-kit = { path = "../xr-spatial-kit" }
+xr-spatial-kit = { version = "=0.2.5", path = "../xr-spatial-kit" }
 libc = "0.2"
 anyhow = "1"
 ash = { version = "0.38", default-features = false, features = ["loaded", "debug", "std"] }

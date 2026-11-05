@@ -1,3 +1,11 @@
+xr-shell (0.2.17) unstable; urgency=medium
+
+  * Use binocular horizon placement, independent pointer captures and spherical grabs.
+  * Render GPU SDF controls, per-eye optical highlights and normal-aligned ray feedback.
+  * Batch stereo recording and add opaque depth plus padded mipmapped UI sampling.
+
+ -- bits <bigbits@hackx.cc>  Thu, 05 Nov 2026 20:01:31 +0800
+
 xr-shell (0.2.16) unstable; urgency=medium
 
   * Add negotiated horizon-relative panel spawning with frozen user-facing frames.

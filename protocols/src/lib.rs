@@ -20,6 +20,7 @@ pub const CAPABILITIES: &[&str] = &[
     "scene.v1",
     "scene.spatial-policy.v1",
     "scene.horizon-spawn.v1",
+    "scene.spherical-placement.v1",
     "taskbar.v1",
     "snapshot.v1",
     "input.v1",
@@ -293,6 +294,14 @@ pub struct Node {
     pub size_m: [f32; 2],
     #[serde(default)]
     pub rotation_degrees: [f32; 3],
+    #[serde(default)]
+    pub yaw_deg: f32,
+    #[serde(default)]
+    pub pitch_deg: f32,
+    #[serde(default)]
+    pub distance_m: Option<f32>,
+    #[serde(default)]
+    pub user_facing_billboard: bool,
     #[serde(default = "yes")]
     pub visible: bool,
     #[serde(default)]

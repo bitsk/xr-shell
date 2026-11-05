@@ -17,6 +17,7 @@ struct RayPick {
     target: Option<Target>,
     xy: [f32; 2],
     distance: f32,
+    normal: [f32; 3],
     companion: Option<String>,
 }
 struct Draw {
@@ -39,6 +40,8 @@ pub struct Geometry {
     pub anchor: [f32; 3],
     pub group: String,
     pub layer: f32,
+    pub tint: [f32; 4],
+    pub controls: [f32; 4],
 }
 fn raster_size(draw: &Draw) -> (u32, u32) {
     if matches!(draw.source, Source::Shadow(_)) {
@@ -200,7 +203,10 @@ impl Desktop {
     fn window_frame(&self, k: &str, level: u32) -> Option<Frame> {
         let w = self.windows.get(k)?;
         let logical = Self::logical(w);
-        let mut frame = Frame::new(w.position, w.size, logical, [0.; 3]);
+        if !w.placed {
+            return None;
+        }
+        let mut frame = Frame::new(w.position, w.size, logical, w.rotation);
         frame.curve = if w.curved {
             w.size[0] / 30f32.to_radians()
         } else {
@@ -220,6 +226,7 @@ impl Desktop {
     }
     fn visible_window(&self, w: &Window) -> bool {
         !w.minimized
+            && w.placed
             && w.state["mapped"] != false
             && w.state["workspace"].as_u64().unwrap_or(0) == self.workspace as u64
             && !w.pixels.is_empty()
@@ -231,8 +238,7 @@ impl Desktop {
         }
         let frame = self.window_frame(k, 0)?;
         let unit = frame.size[0] / frame.logical[0];
-        let grabbed = self.companion_hover.as_deref() == Some(&format!("grab:{k}"));
-        let height = if grabbed { 28. } else { 24. };
+        let height = 24.;
         let bar_width = (frame.logical[0] * 0.24).clamp(144., 220.);
         // Centre the complete companion group instead of the grab capsule alone.
         let bar_x = (frame.logical[0] - bar_width - 168.) / 2. + 168.;
@@ -260,7 +266,7 @@ impl Desktop {
         let mut out = Vec::new();
         for p in self.peers.values() {
             for node in Self::ordered_nodes(p) {
-                let Some(mut frame) = self.node_frame(p, node) else {
+                let Some(frame) = self.node_frame(p, node) else {
                     continue;
                 };
                 if node.kind == "SurfaceReference"
@@ -270,12 +276,6 @@ impl Desktop {
                     ))
                 {
                     continue;
-                }
-                if node.kind == "Slider" {
-                    frame = frame.rect(
-                        [0., (frame.logical[1] - 32.) / 2., frame.logical[0], 32.],
-                        0.,
-                    );
                 }
                 let button = node.kind == "Button";
                 let icon_button = button
@@ -331,8 +331,8 @@ impl Desktop {
                         1.
                     } else if node.kind == "SurfaceReference" {
                         2.
-                    } else if icon_button {
-                        0.
+                    } else if node.kind == "Slider" {
+                        5.
                     } else if button || node.kind == "Card" || node.kind == "Slider" {
                         3.
                     } else {
@@ -410,13 +410,22 @@ impl Desktop {
         }
         let mut decorated = Vec::with_capacity(out.len() * 2);
         for d in out {
-            if [1., 2.].contains(&d.material) {
+            if [1., 2., 3., 5.].contains(&d.material) {
                 let w = d.frame.logical[0];
                 let h = d.frame.logical[1];
+                let elevation = match &d.source {
+                    Source::Node(id, key) if [3., 5.].contains(&d.material) => {
+                        0.008 + self.lifts.get(&(*id, key.clone())).copied().unwrap_or(0.)
+                    }
+                    _ => 0.,
+                };
                 decorated.push(Draw {
                     id: format!("shadow:{}", d.id),
                     frame: Frame {
-                        position: add(d.frame.position, scale(d.frame.normal(), -0.01)),
+                        position: add(
+                            sub(d.frame.position, scale(d.frame.normal(), elevation + 0.001)),
+                            scale(d.frame.down, elevation * 0.6),
+                        ),
                         size: [
                             d.frame.size[0] * (w + 48.) / w,
                             d.frame.size[1] * (h + 48.) / h,
@@ -442,32 +451,27 @@ impl Desktop {
                 let window = self
                     .windows
                     .get(&format!("{}:{}", n.window_server_generation, n.surface_id));
-                json!({"node":n, "hover":self.hover.as_ref().is_some_and(|(owner,key)|owner==id&&key==node),
-                    "pressed":self.capture.as_ref().is_some_and(|c|matches!(&c.target,Target::Node(owner,key)if owner==id&&key==node)),
-                    "frame":window.map(|w|(w.frame,w.width,w.height))})
+                // Geometry, interaction state and slider value live in the SSBO.
+                // Cache keys contain only glyph/icon content and source pixels.
+                json!([
+                    n.kind,
+                    n.text,
+                    n.icon_id,
+                    n.style_id,
+                    n.enabled,
+                    window.map(|w| (w.frame, w.width, w.height))
+                ])
             }
             Source::Window(k) => {
                 let w = &self.windows[k];
                 json!([w.frame, w.width, w.height])
             }
-            Source::Grab(k) => json!(self.companion_hover.as_deref() == Some(&format!("grab:{k}"))),
-            Source::Orb(k) => json!(self.companion_hover.as_deref() == Some(&format!("orb:{k}"))),
-            Source::Close(k) => {
-                json!(self.companion_hover.as_deref() == Some(&format!("close:{k}")))
-            }
-            Source::Minimize(k) => {
-                json!(self.companion_hover.as_deref() == Some(&format!("minimize:{k}")))
-            }
-            Source::Curve(k) => {
-                json!(self.companion_hover.as_deref() == Some(&format!("curve:{k}")))
-            }
-            Source::Resize(k, left) => json!(
-                self.companion_hover.as_deref()
-                    == Some(&format!(
-                        "resize-{}:{k}",
-                        if *left { "left" } else { "right" }
-                    ))
-            ),
+            Source::Grab(_) => Value::Null,
+            Source::Orb(_) => json!("more"),
+            Source::Close(_) => json!("close"),
+            Source::Minimize(_) => json!("minimize"),
+            Source::Curve(_) => json!("curve"),
+            Source::Resize(_, left) => json!(left),
             Source::Shadow(_) => Value::Null,
         };
         json!([draw.frame.logical, state])
@@ -524,13 +528,6 @@ impl Desktop {
                 Source::Node(id, node) => {
                     let p = &self.peers[id];
                     let n = &p.nodes[node];
-                    let pressed = self.capture.as_ref().is_some_and(
-                        |c| matches!(&c.target,Target::Node(owner,key)if owner==id&&key==node),
-                    );
-                    let hovered = self
-                        .hover
-                        .as_ref()
-                        .is_some_and(|(owner, key)| owner == id && key == node);
                     if n.kind == "SurfaceReference" {
                         if let Some(w) = self
                             .windows
@@ -550,8 +547,8 @@ impl Desktop {
                             n,
                             [0., 0., width as f32, height as f32],
                             &theme,
-                            pressed,
-                            hovered,
+                            false,
+                            false,
                             true,
                         );
                     }
@@ -566,59 +563,12 @@ impl Desktop {
                         16.,
                     );
                 }
-                Source::Grab(k) => {
-                    let hover = self.companion_hover.as_deref() == Some(&format!("grab:{k}"));
-                    canvas.rounded(
-                        [0., 0., width as f32, height as f32],
-                        [1., 1., 1., if hover { 1. } else { 0.85 }],
-                        height as f32 / 2.,
-                    );
-                    canvas.skin(
-                        [0., 0., width as f32, height as f32],
-                        "capsule-normal",
-                        height as f32 / 2.,
-                        0.5,
-                    );
-                    canvas.rounded(
-                        [
-                            width as f32 * 0.2,
-                            (height as f32 - 5.) / 2.,
-                            width as f32 * 0.6,
-                            5.,
-                        ],
-                        theme.colour("accent"),
-                        2.5,
-                    );
-                }
-                Source::Resize(k, left) => {
-                    canvas.resize_handle(
-                        *left,
-                        self.companion_hover.as_deref()
-                            == Some(&format!(
-                                "resize-{}:{k}",
-                                if *left { "left" } else { "right" }
-                            )),
-                    );
+                Source::Grab(_) => { /* Capsule and grip mark are GPU geometry. */ }
+                Source::Resize(_k, left) => {
+                    canvas.resize_handle(*left, false);
                 }
                 Source::Shadow(_) => {}
                 source => {
-                    let id = match source {
-                        Source::Orb(k) => format!("orb:{k}"),
-                        Source::Close(k) => format!("close:{k}"),
-                        Source::Minimize(k) => format!("minimize:{k}"),
-                        Source::Curve(k) => format!("curve:{k}"),
-                        _ => unreachable!(),
-                    };
-                    let hover = self.companion_hover.as_deref() == Some(&id);
-                    canvas.rounded(
-                        [0., 0., width as f32, height as f32],
-                        if hover {
-                            [0.216, 0.565, 0.98, 1.]
-                        } else {
-                            theme.colour("card")
-                        },
-                        16.,
-                    );
                     let icon = match source {
                         Source::Orb(_) => "ukui-xr-more",
                         Source::Close(_) => "ukui-xr-close",
@@ -626,15 +576,7 @@ impl Desktop {
                         Source::Curve(_) => "ukui-xr-curve",
                         _ => "",
                     };
-                    canvas.symbolic(
-                        [5., 5., 22., 22.],
-                        icon,
-                        if hover {
-                            [1.; 4]
-                        } else {
-                            theme.colour("foreground")
-                        },
-                    );
+                    canvas.symbolic([5., 5., 22., 22.], icon, theme.colour("foreground"));
                 }
             }
             let pixels: Arc<[u8]> = canvas.rgba().into();
@@ -709,7 +651,28 @@ impl Desktop {
                 if matches!(d.source, Source::Shadow(_)) && matches!(original, Source::Window(_)) {
                     layer -= 0.01;
                 }
+                let theme = Theme::default();
+                let (tint, controls) = match original {
+                    Source::Node(id,key) => {
+                        let n = &self.peers[id].nodes[key];
+                        let hovered = self.hovers.values().any(|v| v == &(*id,key.clone()));
+                        let pressed = self.captures.values().any(|c| matches!(&c.target,Target::Node(owner,node) if owner==id && node==key));
+                        let tint = theme.colour(&n.style_id);
+                        (tint, [if hovered {1.} else {0.}, if pressed {1.} else {0.}, ((n.value-n.min)/(n.max-n.min).max(0.0001)).clamp(0.,1.), 0.])
+                    }
+                    _ => {
+                        let hovered = self.companion_hovers.values().any(|id| id == &d.id);
+                        let pressed = self.captures.values().any(|c| match (&c.target,original) {
+                            (Target::Move(a),Source::Grab(b)) | (Target::Orb(a),Source::Orb(b)) |
+                            (Target::Close(a),Source::Close(b)) | (Target::Minimize(a),Source::Minimize(b)) |
+                            (Target::Curve(a),Source::Curve(b)) => a==b,
+                            _ => false,
+                        });
+                        (theme.colour("card"), [if hovered {1.} else {0.},if pressed {1.} else {0.},0.,if matches!(original,Source::Grab(_)){1.}else{0.}])
+                    }
+                };
                 Geometry {
+                    tint, controls,
                     id: d.id,
                     frame: d.frame,
                     radius: d.radius,
@@ -732,9 +695,16 @@ impl Desktop {
                 .filter(|n| ["Button", "Slider", "SurfaceReference"].contains(&n.kind.as_str()))
             {
                 let id = (p.id, n.node_id.clone());
-                let hovered = self.hover.as_ref() == Some(&id);
+                let hovered = self.hovers.values().any(|v| v == &id);
+                let pressed = self.captures.values().any(|c| matches!(&c.target, Target::Node(owner,key) if (*owner,key)==(p.id,&n.node_id)));
                 let value = self.lifts.entry(id).or_insert(0.);
-                let target = if hovered { 0.012 } else { 0. };
+                let target = if pressed {
+                    -0.006
+                } else if hovered {
+                    0.010
+                } else {
+                    0.
+                };
                 let step = (target - *value) * (1. - (-dt / 0.075).exp());
                 if step.abs() > 0.000001 {
                     *value += step;
@@ -775,13 +745,49 @@ impl Desktop {
             Target::Minimize(k) => self.companion_frame(k, "minimize"),
             Target::Curve(k) => self.companion_frame(k, "curve"),
             Target::Orb(k) => self.companion_frame(k, "orb"),
-            Target::Move(k) => {
-                let mut f = self.companion_frame(k, "grab")?;
-                let w = self.windows.get(k)?;
-                f.position = add(f.position, sub(c.position, w.position));
-                Some(f)
-            }
+            Target::Move(k) => self.companion_frame(k, "grab"),
             Target::Resize(_, _) => c.resize_frame,
+        }
+    }
+    fn hit_local(
+        &self,
+        frame: Frame,
+        xy: [f32; 2],
+        distance: f32,
+        radius: f32,
+        interactive: bool,
+    ) -> Option<[f32; 2]> {
+        if frame.inside_rounded(xy, radius) {
+            return Some(xy);
+        }
+        if !interactive {
+            return None;
+        }
+        let toward_eye = self
+            .horizon_head
+            .map(|(eye, _)| sub(eye, frame.point(xy, 0.)));
+        let distance = toward_eye.map_or(distance, |v| dot(v, v).sqrt());
+        let minimum = xr_spatial_kit::min_ray_target_m(distance);
+        let slop = std::array::from_fn::<_, 2, _>(|i| {
+            let axis = if i == 0 { frame.right } else { frame.down };
+            let projected = toward_eye.map_or(1., |v| {
+                (1. - (dot(axis, v) / distance.max(0.001)).powi(2))
+                    .max(0.01)
+                    .sqrt()
+            });
+            ((minimum / projected - frame.size[i]).max(0.) * 0.5) * frame.logical[i] / frame.size[i]
+        });
+        if xy[0] >= -slop[0]
+            && xy[1] >= -slop[1]
+            && xy[0] <= frame.logical[0] + slop[0]
+            && xy[1] <= frame.logical[1] + slop[1]
+        {
+            Some([
+                xy[0].clamp(0.001, frame.logical[0] - 0.001),
+                xy[1].clamp(0.001, frame.logical[1] - 0.001),
+            ])
+        } else {
+            None
         }
     }
     // One occlusion/rounding/curve query serves input and visible feedback.
@@ -820,7 +826,9 @@ impl Desktop {
                 draw.frame
             };
             if let Some((xy, t)) = hit_frame.project(origin, direction) {
-                if t < nearest && hit_frame.inside_rounded(xy, draw.radius) {
+                let effective = self.hit_local(hit_frame, xy, t, draw.radius, target.is_some());
+                if t < nearest && effective.is_some() {
+                    let xy = effective.unwrap();
                     nearest = t;
                     let companion =
                         (!matches!(draw.source, Source::Node(_, _) | Source::Window(_)))
@@ -829,6 +837,7 @@ impl Desktop {
                         target,
                         xy,
                         distance: t,
+                        normal: hit_frame.normal_at(xy),
                         companion,
                     });
                 }
@@ -837,6 +846,22 @@ impl Desktop {
         pick
     }
 
+    pub fn pointer_target(
+        &self,
+        source: &str,
+        origin: [f32; 3],
+        direction: [f32; 3],
+    ) -> Option<String> {
+        if self.captures.contains_key(source) {
+            return Some(format!("capture:{source}"));
+        }
+        let pick = self.nearest_ray_pick(sub(origin, self.ui_offset), direction)?;
+        match pick.target? {
+            Target::Node(owner, id) => Some(format!("node:{owner}:{id}")),
+            Target::Window(id) => Some(format!("window:{id}")),
+            _ => pick.companion,
+        }
+    }
     pub fn ray_feedback(
         &self,
         origin: [f32; 3],
@@ -847,21 +872,25 @@ impl Desktop {
             return None;
         }
         let local_origin = sub(origin, self.ui_offset);
-        let (distance, interactive, captured) =
-            if let Some(c) = self.capture.as_ref().filter(|c| c.source == source) {
-                let frame = self.capture_frame(c)?;
-                let (_, distance) = frame.project(local_origin, direction)?;
-                (distance, true, true)
+        let (distance, normal, interactive, captured) = if let Some(c) = self.captures.get(source) {
+            let frame = self.capture_frame(c)?;
+            if let Some(g) = &c.grab {
+                (g.distance, frame.normal(), true, true)
             } else {
-                let hit = self.nearest_ray_pick(local_origin, direction)?;
-                (hit.distance, hit.target.is_some(), false)
-            };
+                let (xy, distance) = frame.project(local_origin, direction)?;
+                (distance, frame.normal_at(xy), true, true)
+            }
+        } else {
+            let hit = self.nearest_ray_pick(local_origin, direction)?;
+            (hit.distance, hit.normal, hit.target.is_some(), false)
+        };
         if !distance.is_finite() || distance <= 0. {
             return None;
         }
         Some(crate::spatial::RayFeedback {
             distance_m: distance,
             point_m: add(origin, scale(direction, distance)),
+            normal,
             interactive,
             captured,
         })
@@ -882,19 +911,27 @@ impl Desktop {
             return Ok(());
         }
         let origin = sub(origin, self.ui_offset);
-        if phase == "hover" && self.capture.as_ref().is_some_and(|c| c.source != source) {
-            return Ok(());
-        }
-        if let Some(c) = self.capture.clone() {
-            if c.source == source && phase != "press" && phase != "hover" {
+        if let Some(c) = self.captures.get(source).cloned() {
+            if phase != "press" && phase != "hover" {
+                if let Target::Move(ref key) = c.target {
+                    self.update_grab(source, key, origin, direction);
+                    return self.pointer(Some((c.target, c.start)), phase, source);
+                }
                 if let Some(frame) = self.capture_frame(&c) {
-                    if let Some((xy, _)) = frame.project(origin, direction) {
+                    if let Some((xy, distance)) = frame.project(origin, direction) {
+                        let xy = self.hit_local(frame, xy, distance, 0., true).unwrap_or(xy);
                         return self.pointer(Some((c.target, xy)), phase, source);
                     }
                 }
+                // Even if the ray no longer intersects, release the actual
+                // capture owner; never redirect a release to a different node.
+                return self.pointer(Some((c.target, [-1., -1.])), phase, source);
             }
         }
         let pick = self.nearest_ray_pick(origin, direction);
+        let grab_point = pick
+            .as_ref()
+            .map(|p| (p.distance, add(origin, scale(direction, p.distance))));
         let (hit, hover_companion) = pick
             .map(|p| (p.target.map(|t| (t, p.xy)), p.companion))
             .unwrap_or((None, None));
@@ -911,14 +948,156 @@ impl Desktop {
                     self.dirty = true;
                 }
             }
-            if self.companion_hover != hover_companion {
-                self.companion_hover = hover_companion;
+            if self.companion_hovers.get(source) != hover_companion.as_ref() {
+                if let Some(v) = hover_companion {
+                    self.companion_hovers.insert(source.into(), v);
+                } else {
+                    self.companion_hovers.remove(source);
+                }
                 self.dirty = true;
             }
-            if !matches!(&hit, Some((Target::Node(_, _), _))) && self.hover.take().is_some() {
+            if !matches!(&hit, Some((Target::Node(_, _), _)))
+                && self.hovers.remove(source).is_some()
+            {
                 self.dirty = true;
             }
         }
-        self.pointer(hit, phase, source)
+        self.pointer(hit, phase, source)?;
+        if phase == "press" {
+            if let Some((distance, point)) = grab_point {
+                let key = self.captures.get(source).and_then(|c| {
+                    if let Target::Move(k) = &c.target {
+                        Some(k.clone())
+                    } else {
+                        None
+                    }
+                });
+                if let Some(key) = key {
+                    if let Some(f) = self.window_frame(&key, 0) {
+                        let delta = sub(point, f.position);
+                        let local_anchor = [
+                            dot(delta, f.right),
+                            dot(delta, f.down),
+                            dot(delta, f.normal()),
+                        ];
+                        self.captures.get_mut(source).unwrap().grab = Some(Grab {
+                            distance,
+                            point,
+                            local_anchor,
+                        });
+                        let grabs: Vec<_> = self
+                            .captures
+                            .values()
+                            .filter(|c| matches!(&c.target,Target::Move(k) if k==&key))
+                            .filter_map(|c| c.grab.as_ref())
+                            .collect();
+                        if grabs.len() == 2 {
+                            let span = dot(
+                                sub(grabs[0].point, grabs[1].point),
+                                sub(grabs[0].point, grabs[1].point),
+                            )
+                            .sqrt();
+                            if span > 0.02 {
+                                self.bimanual.insert(
+                                    key.clone(),
+                                    Bimanual {
+                                        span,
+                                        size: self.windows[&key].size,
+                                        anchor: scale(
+                                            add(grabs[0].local_anchor, grabs[1].local_anchor),
+                                            0.5,
+                                        ),
+                                    },
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    pub(super) fn finish_grab(&mut self, key: &str) {
+        self.bimanual.remove(key);
+        let Some(f) = self.window_frame(key, 0) else {
+            return;
+        };
+        for c in self
+            .captures
+            .values_mut()
+            .filter(|c| matches!(&c.target,Target::Move(k) if k==key))
+        {
+            if let Some(g) = c.grab.as_mut() {
+                let delta = sub(g.point, f.position);
+                g.local_anchor = [
+                    dot(delta, f.right),
+                    dot(delta, f.down),
+                    dot(delta, f.normal()),
+                ];
+            }
+        }
+    }
+    /// Joystick Y changes reach while physical controller translation naturally
+    /// pushes/pulls the grab point. Bounds refer to distance from the eyes.
+    pub fn grab_depth(&mut self, source: &str, delta: f32) -> bool {
+        if let Some(g) = self.captures.get_mut(source).and_then(|c| c.grab.as_mut()) {
+            g.distance = (g.distance + delta).clamp(0.1, 5.);
+            true
+        } else {
+            false
+        }
+    }
+    fn update_grab(&mut self, source: &str, key: &str, origin: [f32; 3], direction: [f32; 3]) {
+        let Some((eye, _)) = self.horizon_head else {
+            return;
+        };
+        let Some(g) = self.captures.get_mut(source).and_then(|c| c.grab.as_mut()) else {
+            return;
+        };
+        g.point = add(origin, scale(direction, g.distance));
+        let mut point = g.point;
+        let mut anchor = g.local_anchor;
+        let mut size = self.windows[key].size;
+        if let Some(b) = self.bimanual.get(key) {
+            let grabs: Vec<_> = self
+                .captures
+                .values()
+                .filter(|c| matches!(&c.target,Target::Move(k) if k==key))
+                .filter_map(|c| c.grab.as_ref())
+                .collect();
+            if grabs.len() == 2 {
+                let d = sub(grabs[0].point, grabs[1].point);
+                let ratio = (dot(d, d).sqrt() / b.span).clamp(
+                    (0.3 / b.size[0]).max(0.2 / b.size[1]),
+                    (3. / b.size[0]).min(2.5 / b.size[1]),
+                );
+                point = scale(add(grabs[0].point, grabs[1].point), 0.5);
+                anchor = scale(b.anchor, ratio);
+                size = b.size.map(|v| v * ratio);
+            }
+        }
+        let w = self.windows.get_mut(key).unwrap();
+        let mut position = w.position;
+        for _ in 0..3 {
+            let rotation = crate::spatial::user_facing(position, eye);
+            let f = Frame::new(position, size, [1.; 2], rotation);
+            position = sub(
+                point,
+                add(
+                    scale(f.right, anchor[0]),
+                    add(scale(f.down, anchor[1]), scale(f.normal(), anchor[2])),
+                ),
+            );
+        }
+        let delta = sub(position, eye);
+        let distance = dot(delta, delta).sqrt();
+        if distance < 0.0001 {
+            return;
+        }
+        w.position = add(eye, scale(delta, distance.clamp(0.6, 4.) / distance));
+        w.rotation = crate::spatial::user_facing(w.position, eye);
+        w.size = size;
+        self.dirty = true;
     }
 }

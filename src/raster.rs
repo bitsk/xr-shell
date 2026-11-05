@@ -550,7 +550,7 @@ pub fn paint_node(
     theme: &Theme,
     pressed: bool,
     hovered: bool,
-    _dark: bool,
+    spatial: bool,
 ) {
     let [x, y, w, h] = rect;
     let primary = theme.colour("text.primary");
@@ -559,6 +559,9 @@ pub fn paint_node(
     match node.kind.as_str() {
         "Group" => {}
         "Card" => {
+            if spatial {
+                return;
+            }
             let capsule = node.style_id == "dock.background";
             let radius = if capsule { h / 2. } else { 20. };
             canvas.rounded(rect, theme.colour(&node.style_id), radius);
@@ -596,9 +599,11 @@ pub fn paint_node(
             } else {
                 12.
             };
-            canvas.rounded(rect, colour, radius);
+            if !spatial {
+                canvas.rounded(rect, colour, radius);
+            }
             let key = node.style_id == "keyboard.key";
-            if !app_icon && !status_icon && w >= 24. && h >= 24. {
+            if !spatial && !app_icon && !status_icon && w >= 24. && h >= 24. {
                 let skin = match (key, active, pressed, hovered) {
                     (true, true, _, _) => "key-selected",
                     (true, _, true, _) => "key-pressed",
@@ -655,6 +660,10 @@ pub fn paint_node(
             }
         }
         "Slider" => {
+            if spatial {
+                canvas.speaker(x + 7., y + (h - 22.) / 2.);
+                return;
+            }
             let track = [x, y + (h - 22.) / 2., w, 22.];
             canvas.rounded(track, [0.75, 0.82, 0.92, 1.], 11.);
             let value = ((node.value - node.min) / (node.max - node.min).max(0.0001)).clamp(0., 1.);

@@ -2,7 +2,7 @@ Source: xr-shell
 Section: x11
 Priority: optional
 Maintainer: openKylin XR SIG <xr@lists.openkylin.top>
-Build-Depends: debhelper-compat (= 13), cargo (>= 1.88), rustc (>= 1.88), glslang-tools, librust-xr-spatial-kit-dev (>= 0.2.4), libcairo2-dev, libpango1.0-dev, librsvg2-dev
+Build-Depends: debhelper-compat (= 13), cargo (>= 1.88), rustc (>= 1.88), glslang-tools, librust-xr-spatial-kit-dev (>= 0.2.5), libcairo2-dev, libpango1.0-dev, librsvg2-dev
 Standards-Version: 4.7.0
 Rules-Requires-Root: no
 

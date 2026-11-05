@@ -89,6 +89,7 @@ pub struct Gpu {
     pub queue: vk::Queue,
     pub memory: vk::PhysicalDeviceMemoryProperties,
     pub name: String,
+    pub anisotropy: f32,
     _loader: ash::Entry,
 }
 
@@ -173,7 +174,17 @@ impl Gpu {
             let queues = [vk::DeviceQueueCreateInfo::default()
                 .queue_family_index(family)
                 .queue_priorities(&priorities)];
-            let create = vk::DeviceCreateInfo::default().queue_create_infos(&queues);
+            let features = instance.get_physical_device_features(physical);
+            let enabled = vk::PhysicalDeviceFeatures::default()
+                .sampler_anisotropy(features.sampler_anisotropy != 0);
+            let anisotropy = if features.sampler_anisotropy != 0 {
+                properties.limits.max_sampler_anisotropy.min(2.)
+            } else {
+                1.
+            };
+            let create = vk::DeviceCreateInfo::default()
+                .queue_create_infos(&queues)
+                .enabled_features(&enabled);
             let raw = xr
                 .create_vulkan_device(
                     system,
@@ -192,6 +203,9 @@ impl Gpu {
                 .to_string_lossy()
                 .into_owned();
             println!("XR_VULKAN_DEVICE={name}");
+            eprintln!(
+                "XR_TEXTURE_FILTER mipmap=linear anisotropy={anisotropy} atlas_max_lod=3 atlas_edge_padding=16"
+            );
             Ok(Rc::new(Self {
                 device,
                 instance,
@@ -200,6 +214,7 @@ impl Gpu {
                 queue,
                 memory,
                 name,
+                anisotropy,
                 _loader: entry,
             }))
         }
