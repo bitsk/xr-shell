@@ -23,6 +23,15 @@ pub struct Frame {
     pub runtime_now_mono_bracket_ns: [i64; 2],
     pub layers: u32,
     pub capture: bool,
+    pub input_mono_ns: [i64; 5],
+    pub head_pose: [f32; 7],
+    pub head_flags: u64,
+    pub controller_grip: [Option<[f32; 7]>; 2],
+    pub controller_aim: [Option<[f32; 7]>; 2],
+    pub controller_draw_mask: u8,
+    pub spatial_fast_path: bool,
+    // regions, source bytes, full replacement; sampled before GPU submission.
+    pub atlas_update: (usize, u64, bool),
 }
 #[derive(Default, Serialize)]
 pub struct Timeline {
@@ -65,7 +74,20 @@ impl Timeline {
         }
         json!({"observed":self.observed,"retained":self.frames.len(),"clock":"CLOCK_MONOTONIC",
             "xr_clock":"runtime XrTime; paired now only with XR_KHR_convert_timespec_time",
+            "input_stage_boundaries":["actions_and_routing","animate_and_raster","geometry_upload","ray_feedback"],
             "stage_boundaries":labels,"stages":stages,
             "scope":"application CPU wall time, not compositor timing, GPU execution time, scanout or physical MTP"})
     }
+}
+
+pub fn pose(p: openxr::Posef) -> [f32; 7] {
+    [
+        p.position.x,
+        p.position.y,
+        p.position.z,
+        p.orientation.x,
+        p.orientation.y,
+        p.orientation.z,
+        p.orientation.w,
+    ]
 }

@@ -281,7 +281,7 @@ impl Desktop {
     fn draws(&self) -> Vec<Draw> {
         let mut out = Vec::new();
         for p in self.peers.values() {
-            for node in Self::ordered_nodes(p) {
+            for node in self.ordered_nodes(p) {
                 let Some(frame) = self.node_frame(p, node) else {
                     continue;
                 };
@@ -730,26 +730,61 @@ impl Desktop {
                 }
             }
         }
-        let controls: Vec<_> = self
-            .panel_poses()
-            .into_iter()
-            .filter(|g| {
-                ["grab:", "orb:", "close:", "minimize:", "curve:"]
-                    .iter()
-                    .any(|p| g.id.starts_with(p))
-            })
-            .collect();
+        let controls: Vec<(String, bool, bool)> = if self.spatial_fast_path {
+            // Companion animation needs only visible window controls. Building
+            // all UI draw geometry (and its theme/hover state) here repeated
+            // the whole scene traversal before the actual render preparation.
+            let mut controls = Vec::new();
+            for (key, window) in &self.windows {
+                if !self.visible_window(window)
+                    || !window.has_window_controls()
+                    || self.window_frame(key, 0).is_none()
+                {
+                    continue;
+                }
+                for kind in ["grab", "orb", "close", "minimize", "curve"] {
+                    if !["grab", "orb"].contains(&kind)
+                        && self.focus.as_ref() != Some(key)
+                        && self.expanded_orb.as_ref() != Some(key)
+                    {
+                        continue;
+                    }
+                    let id = format!("{kind}:{key}");
+                    let hovered = self.companion_hovers.values().any(|v| v == &id);
+                    let pressed = self.captures.values().any(|c| match (&c.target, kind) {
+                        (Target::Move(k), "grab")
+                        | (Target::Orb(k), "orb")
+                        | (Target::Close(k), "close")
+                        | (Target::Minimize(k), "minimize")
+                        | (Target::Curve(k), "curve") => k == key,
+                        _ => false,
+                    });
+                    controls.push((id, hovered, pressed));
+                }
+            }
+            controls
+        } else {
+            self.panel_poses()
+                .into_iter()
+                .filter(|g| {
+                    ["grab:", "orb:", "close:", "minimize:", "curve:"]
+                        .iter()
+                        .any(|p| g.id.starts_with(p))
+                })
+                .map(|g| (g.id, g.controls[0] > 0., g.controls[1] > 0.))
+                .collect()
+        };
         self.companion_lifts
-            .retain(|id, _| controls.iter().any(|g| &g.id == id));
-        for g in controls {
-            let target = if g.controls[1] > 0. {
+            .retain(|id, _| controls.iter().any(|g| &g.0 == id));
+        for (id, hovered, pressed) in controls {
+            let target = if pressed {
                 -0.006
-            } else if g.controls[0] > 0. {
+            } else if hovered {
                 0.010
             } else {
                 0.
             };
-            let value = self.companion_lifts.entry(g.id).or_insert(0.);
+            let value = self.companion_lifts.entry(id).or_insert(0.);
             let next = *value + (target - *value) * (1. - (-dt / 0.075).exp());
             let next = if (target - next).abs() < 0.000001 {
                 target

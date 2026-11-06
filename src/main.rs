@@ -529,8 +529,13 @@ fn frame_loop(
         times[0] = timeline::now();
         if let Some(d) = desktop {
             d.tick()?;
-            if let Some(panels) = d.panels()? {
-                renderer.update_panels(&panels)?;
+            // Collect peer updates now, then prepare pixels once after input.
+            // Preparing here and again after a hover change forced a complete
+            // replacement upload for the still-pending atlas batch.
+            if !d.spatial_fast_path {
+                if let Some(panels) = d.panels()? {
+                    renderer.update_panels(&panels)?;
+                }
             }
         }
         times[1] = timeline::now();
@@ -640,16 +645,21 @@ fn frame_loop(
                 d.invalidate_horizon_head();
             }
         }
+        let mut input_times = [timeline::now(); 5];
         if let (Some(i), Some(d)) = (input.as_mut(), desktop.as_mut()) {
             i.update(session, space, state.predicted_display_time, d)?;
             renderer.update_controllers(i.controllers());
         }
+        input_times[1] = timeline::now();
         if let Some(d) = desktop.as_mut() {
             d.animate(dt);
             if let Some(panels) = d.panels()? {
                 renderer.update_panels(&panels)?;
             }
+            input_times[2] = timeline::now();
             renderer.update_panel_poses(&d.panel_poses(), head_position)?;
+            input_times[3] = timeline::now();
+            renderer.controller_visuals = d.controller_visuals;
             if let Some(i) = input.as_ref() {
                 renderer.update_ray_feedback(std::array::from_fn(|hand| {
                     let (origin, direction) = i.controllers()[hand].aim_ray()?;
@@ -666,6 +676,11 @@ fn frame_loop(
             }
         }
 
+        input_times[4] = timeline::now();
+        if desktop.is_none() {
+            input_times[2] = input_times[1];
+            input_times[3] = input_times[1];
+        }
         renderer.prepare_focus_quad(
             session,
             desktop.as_ref().and_then(|d| d.focus_quad_window()),
@@ -674,6 +689,7 @@ fn frame_loop(
             summary.layer_limits,
         );
         summary.focus_quad = renderer.quad_status();
+        let atlas_update = renderer.pending_atlas_stats();
         let capture = capture_request(options.capture_dir.as_deref())?;
         times[4] = timeline::now();
         let mut indices = Vec::new();
@@ -795,6 +811,32 @@ fn frame_loop(
             runtime_now_mono_bracket_ns: clock_bracket,
             layers: if renderer.focus_quad.is_some() { 3 } else { 1 },
             capture: capture.is_some(),
+            input_mono_ns: input_times,
+            head_pose: {
+                let mut p = views[0].pose;
+                p.position = xr::Vector3f {
+                    x: head_position[0],
+                    y: head_position[1],
+                    z: head_position[2],
+                };
+                timeline::pose(p)
+            },
+            head_flags: flags.into_raw(),
+            controller_grip: std::array::from_fn(|h| {
+                input
+                    .as_ref()
+                    .and_then(|i| i.controllers()[h].grip)
+                    .map(timeline::pose)
+            }),
+            controller_aim: std::array::from_fn(|h| {
+                input
+                    .as_ref()
+                    .and_then(|i| i.controllers()[h].aim)
+                    .map(timeline::pose)
+            }),
+            controller_draw_mask: renderer.controller_visuals,
+            spatial_fast_path: desktop.as_ref().is_some_and(|d| d.spatial_fast_path),
+            atlas_update,
         });
         summary.frames += 1;
         for n in &mut summary.eye_submissions {

@@ -349,3 +349,27 @@ record/submit/completion wait, release and end. An XrTime/monotonic clock pair i
 recorded only when KHR_convert_timespec_time is available. CPU wait duration is
 not GPU execution time, end-frame return is not scanout, and these observations
 do not establish physical motion-to-photon latency.
+
+### Controller rendering investigation
+
+With `--debug-input` and the existing `debug.v1` capability, `DebugInput`
+`{"kind":"controller_visuals","mode":"rays"}` hides the model while retaining
+its rays. Mode `none` hides both; `all` restores both.
+These switches preserve real action sampling, grip/aim poses, hit routing and
+captures. Default `all` is restored on restart. Never treat hidden geometry as
+loss of tracking or as physical controller acceptance.
+
+`{"kind":"spatial_fast_path","enabled":false}` selects the previous preparation
+path for same-session A/B/A measurements; default `true` prepares the UI atlas
+once after input per rendered frame, traverses node siblings once, and animates
+window companions without rebuilding all scene geometry. Atlas updates remain
+complete when a pending upload must be replaced; upload fences, native pixels,
+mipmaps and controller calibration are unchanged. Restore `true` after testing.
+
+Timeline samples also contain located head/grip/aim poses, the draw mask,
+four input/preparation stage durations (five monotonic boundaries), the selected
+preparation path and `atlas_update` as `[regions, source_bytes, full_replacement]`.
+`head_pose` uses the binocular midpoint position and left-view orientation;
+`head_flags` retains the runtime validity bits. The last field describes the
+pending upload before submission, not GPU traffic
+or execution time. Samples remain bounded and are written only on capture/exit.

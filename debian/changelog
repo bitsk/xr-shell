@@ -1,3 +1,17 @@
+xr-shell (0.2.24) unstable; urgency=medium
+
+  * Coalesce UI atlas preparation after input into one batch per rendered frame.
+  * Avoid repeated full scene traversal for companion animation and node order.
+  * Retain developer A/B/A reference path and bounded atlas/pose timing evidence.
+
+ -- bits <bigbits@hackx.cc>  Fri, 06 Nov 2026 16:39:27 +0800
+
+xr-shell (0.2.23) unstable; urgency=medium
+
+  * Add bounded controller pose/stage observations and developer-only draw isolation.
+
+ -- bits <bigbits@hackx.cc>  Fri, 06 Nov 2026 16:15:16 +0800
+
 xr-shell (0.2.22) unstable; urgency=medium
 
   * Crop foreground projection sub-images at native density for opt-in Quad.

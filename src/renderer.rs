@@ -122,6 +122,7 @@ pub struct Renderer {
     pub quad: Option<Eye>,
     pub focus_quad: Option<FocusQuad>,
     pub quad_reason: String,
+    pub controller_visuals: u8,
     geometry: Vec<crate::desktop::spatial_ui::Geometry>,
     partition: Vec<i8>,
     quad_disabled: bool,
@@ -185,6 +186,7 @@ impl Renderer {
             quad: None,
             focus_quad: None,
             quad_reason: "no-focus".into(),
+            controller_visuals: 3,
             geometry: Vec::new(),
             partition: Vec::new(),
             quad_disabled: false,
@@ -650,11 +652,12 @@ impl Renderer {
     pub fn controller_status(&self) -> serde_json::Value {
         serde_json::json!({
             "source": "OpenXR action grip/aim spaces at predicted display time",
+            "draw_mask":self.controller_visuals,
             "model_to_grip_calibrated": false,
             "model_binding_source": "Resource controller-anchors.json; model-only rotation, tracked grip and aim unchanged",
             "hands": self.controllers.iter().zip(&self.controller_states).enumerate().map(|(hand,(model,state))| {
                 let pose = |p: xr::Posef| serde_json::json!({"position_m":[p.position.x,p.position.y,p.position.z],"orientation_xyzw":[p.orientation.x,p.orientation.y,p.orientation.z,p.orientation.w]});
-                serde_json::json!({"hand":if hand==0 {"left"} else {"right"}, "loaded":model.is_some(), "directory":model.as_ref().map(|m|&m.directory), "visible":model.is_some() && state.grip.is_some(), "grip":state.grip.map(pose), "aim":state.aim.map(pose), "ray_feedback":self.ray_feedback[hand], "ray_length_m":self.ray_feedback[hand].map_or(crate::spatial::IDLE_RAY_LENGTH_M, |h|h.distance_m), "source_binding_present":model.as_ref().is_some_and(|m|m.source_binding_present), "source_rotation_xyzw":model.as_ref().map(|m|{let q=m.source_rotation;[q.x,q.y,q.z,q.w]}), "model_pose":model.as_ref().and_then(|m|state.grip.map(|p|pose(m.model_pose(p)))), "select":state.select,"trigger":state.trigger,"squeeze":state.squeeze,"menu":state.menu,"stick":state.stick})
+                serde_json::json!({"hand":if hand==0 {"left"} else {"right"}, "loaded":model.is_some(), "directory":model.as_ref().map(|m|&m.directory), "visible":self.controller_visuals & 1 != 0 && model.is_some() && state.grip.is_some(), "rays_visible":self.controller_visuals & 2 != 0 && model.is_some() && state.aim.is_some(), "grip":state.grip.map(pose), "aim":state.aim.map(pose), "ray_feedback":self.ray_feedback[hand], "ray_length_m":self.ray_feedback[hand].map_or(crate::spatial::IDLE_RAY_LENGTH_M, |h|h.distance_m), "source_binding_present":model.as_ref().is_some_and(|m|m.source_binding_present), "source_rotation_xyzw":model.as_ref().map(|m|{let q=m.source_rotation;[q.x,q.y,q.z,q.w]}), "model_pose":model.as_ref().and_then(|m|state.grip.map(|p|pose(m.model_pose(p)))), "select":state.select,"trigger":state.trigger,"squeeze":state.squeeze,"menu":state.menu,"stick":state.stick})
             }).collect::<Vec<_>>()
         })
     }
@@ -798,7 +801,11 @@ impl Renderer {
                         .color_attachment(0)
                         .clear_value(vk::ClearValue::default())],
                     &[vk::ClearRect::default()
-                        .rect(if capture { rect } else { region.unwrap_or(rect) })
+                        .rect(if capture {
+                            rect
+                        } else {
+                            region.unwrap_or(rect)
+                        })
                         .base_array_layer(0)
                         .layer_count(1)],
                 );
@@ -861,7 +868,10 @@ impl Renderer {
                 .zip(&self.controller_states)
                 .enumerate()
             {
-                if let Some(model) = model.as_ref().filter(|_| matches!(pass, DrawPass::All)) {
+                if let Some(model) = model
+                    .as_ref()
+                    .filter(|_| matches!(pass, DrawPass::All) && self.controller_visuals & 1 != 0)
+                {
                     model.draw(
                         self.cmd,
                         view,
@@ -921,7 +931,10 @@ impl Renderer {
                 .zip(&self.controller_states)
                 .enumerate()
             {
-                if let Some(model) = model.as_ref().filter(|_| matches!(pass, DrawPass::All)) {
+                if let Some(model) = model
+                    .as_ref()
+                    .filter(|_| matches!(pass, DrawPass::All) && self.controller_visuals & 2 != 0)
+                {
                     model.draw(
                         self.cmd,
                         view,
@@ -1453,6 +1466,18 @@ impl Renderer {
             vk::BufferUsageFlags::STORAGE_BUFFER,
         )?);
         self.update_panels(&[])
+    }
+    pub fn pending_atlas_stats(&self) -> (usize, u64, bool) {
+        self.atlas_upload.as_ref().map_or((0, 0, false), |u| {
+            (
+                u.copies.len(),
+                u.copies
+                    .iter()
+                    .map(|c| c.image_extent.width as u64 * c.image_extent.height as u64 * 4)
+                    .sum(),
+                u.clear,
+            )
+        })
     }
     pub fn update_panels(&mut self, panels: &[crate::desktop::Panel]) -> Result<()> {
         let started = std::time::Instant::now();

@@ -201,6 +201,8 @@ pub struct Desktop {
     state_dirty: bool,
     pending_pointer: Option<Value>,
     pub focused: bool,
+    pub controller_visuals: u8,
+    pub spatial_fast_path: bool,
     taskbar_follow: crate::taskbar_follow::TaskbarFollow,
     ui_offset: [f32; 3],
     ui_anchor_ready: bool,
@@ -300,6 +302,8 @@ impl Desktop {
             hovers: BTreeMap::new(),
             bimanual: BTreeMap::new(),
             event: 0,
+            controller_visuals: 3,
+            spatial_fast_path: true,
             debug,
             dirty: true,
             state_dirty: false,
@@ -354,7 +358,7 @@ impl Desktop {
                 components.push(component.clone());
             }
         }
-        json!({"state_revision":self.revision.to_string(),"windows":windows,"components":components,"active_workspace":self.workspace,"focus_epoch":self.focus_epoch.to_string(),"focus":self.focus,"focus_applied":self.focus_applied,"system":self.system,"clipboard":self.clipboard_summary(),"stats":self.stats,"taskbar_mode":self.taskbar_follow.mode(),"taskbar_follow":self.taskbar_follow,"taskbar_capture_frozen":self.taskbar_captured(),"pointer_captures":self.captures.keys().collect::<Vec<_>>(),"pointer_hovers":self.hovers})
+        json!({"spatial_fast_path":self.spatial_fast_path,"controller_visuals":self.controller_visuals,"state_revision":self.revision.to_string(),"windows":windows,"components":components,"active_workspace":self.workspace,"focus_epoch":self.focus_epoch.to_string(),"focus":self.focus,"focus_applied":self.focus_applied,"system":self.system,"clipboard":self.clipboard_summary(),"stats":self.stats,"taskbar_mode":self.taskbar_follow.mode(),"taskbar_follow":self.taskbar_follow,"taskbar_capture_frozen":self.taskbar_captured(),"pointer_captures":self.captures.keys().collect::<Vec<_>>(),"pointer_hovers":self.hovers})
     }
     fn clipboard_summary(&self) -> Value {
         if self.clipboard.is_null() {
@@ -1540,12 +1544,12 @@ impl Desktop {
         }
         rect
     }
-    fn hit_node(p: &Peer, x: f32, y: f32) -> Option<(String, [f32; 2])> {
+    fn hit_node(&self, p: &Peer, x: f32, y: f32) -> Option<(String, [f32; 2])> {
         if x < 0. || y < 0. || x > p.root.logical[0] || y > p.root.logical[1] {
             return None;
         }
         let mut hit = None;
-        for n in Self::ordered_nodes(p) {
+        for n in self.ordered_nodes(p) {
             let r = Self::node_rect(p, n);
             if n.enabled
                 && ["Button", "Slider", "SurfaceReference"].contains(&n.kind.as_str())
@@ -1559,7 +1563,31 @@ impl Desktop {
         }
         hit
     }
-    fn ordered_nodes(p: &Peer) -> Vec<&Node> {
+    fn ordered_nodes<'a>(&self, p: &'a Peer) -> Vec<&'a Node> {
+        if self.spatial_fast_path {
+            // Preserve BTreeMap sibling order and depth-first preorder without
+            // scanning all N nodes again for each of their N parents.
+            let mut children: BTreeMap<&str, Vec<&Node>> = BTreeMap::new();
+            for node in p.nodes.values() {
+                children
+                    .entry(node.parent_id.as_str())
+                    .or_default()
+                    .push(node);
+            }
+            let mut pending = children
+                .get("root")
+                .map(|v| v.iter().rev().copied().collect::<Vec<_>>())
+                .unwrap_or_default();
+            let mut out = Vec::with_capacity(p.nodes.len());
+            while let Some(node) = pending.pop() {
+                out.push(node);
+                if let Some(next) = children.get(node.node_id.as_str()) {
+                    pending.extend(next.iter().rev().copied());
+                }
+            }
+            return out;
+        }
+        // Developer A/B/A reference; same live scene, no cached geometry.
         fn walk<'a>(p: &'a Peer, parent: &str, out: &mut Vec<&'a Node>) {
             for node in p.nodes.values().filter(|n| n.parent_id == parent) {
                 out.push(node);
@@ -1602,6 +1630,22 @@ impl Desktop {
     }
     fn debug_input(&mut self, payload: &Value) -> Result<()> {
         match payload["kind"].as_str().unwrap_or("pointer") {
+            "spatial_fast_path" => {
+                self.spatial_fast_path = payload["enabled"]
+                    .as_bool()
+                    .context("enabled must be bool")?;
+                Ok(())
+            }
+            "controller_visuals" => {
+                self.controller_visuals = match payload["mode"].as_str() {
+                    Some("all") => 3,
+                    Some("rays") => 2,
+                    Some("none") => 0,
+                    _ => bail!("controller visuals must be all, rays or none"),
+                };
+                // Diagnostic drawing only. Real input, poses and hit routing run.
+                Ok(())
+            }
             "cancel" => {
                 let reason = payload["reason"].as_str().unwrap_or("developer cancel");
                 if let Some(source) = payload["source"].as_str() {
@@ -1672,13 +1716,13 @@ impl Desktop {
                             );
                             Some((node.clone(), [x - r[0], y - r[1]]))
                         } else {
-                            Self::hit_node(peer, x, y)
+                            self.hit_node(peer, x, y)
                         }
                     } else {
-                        Self::hit_node(peer, x, y)
+                        self.hit_node(peer, x, y)
                     }
                 } else {
-                    Self::hit_node(peer, x, y)
+                    self.hit_node(peer, x, y)
                 };
                 self.pointer(hit.map(|(n, xy)| (Target::Node(id, n), xy)), phase, "mouse")
             }
