@@ -118,6 +118,14 @@ pub struct Renderer {
     gpu: Rc<Gpu>,
     pub eyes: Vec<Eye>,
     pub format: vk::Format,
+    pub foreground: Vec<Eye>,
+    pub quad: Option<Eye>,
+    pub focus_quad: Option<FocusQuad>,
+    pub quad_reason: String,
+    geometry: Vec<crate::desktop::spatial_ui::Geometry>,
+    partition: Vec<i8>,
+    quad_disabled: bool,
+
     pass: vk::RenderPass,
     pipeline: vk::Pipeline,
     spatial_pipeline: vk::Pipeline,
@@ -171,6 +179,13 @@ impl Renderer {
             gpu,
             eyes: Vec::new(),
             format,
+            foreground: Vec::new(),
+            quad: None,
+            focus_quad: None,
+            quad_reason: "no-focus".into(),
+            geometry: Vec::new(),
+            partition: Vec::new(),
+            quad_disabled: false,
             pass: vk::RenderPass::null(),
             pipeline: vk::Pipeline::null(),
             spatial_pipeline: vk::Pipeline::null(),
@@ -248,75 +263,7 @@ impl Renderer {
                 v.recommended_swapchain_sample_count,
                 v.max_swapchain_sample_count
             );
-            let swapchain = session.create_swapchain(&xr::SwapchainCreateInfo {
-                create_flags: xr::SwapchainCreateFlags::EMPTY,
-                usage_flags: xr::SwapchainUsageFlags::COLOR_ATTACHMENT
-                    | xr::SwapchainUsageFlags::TRANSFER_SRC,
-                format: format.as_raw() as _,
-                sample_count: 1,
-                width: extent.width,
-                height: extent.height,
-                face_count: 1,
-                array_size: 1,
-                mip_count: 1,
-            }).with_context(|| format!("xrCreateSwapchain(eye={index}, {}x{}, format={format:?}, samples=1, array=1, usage=COLOR_ATTACHMENT|TRANSFER_SRC)", extent.width, extent.height))?;
-            eprintln!("XR_INIT_STAGE=swapchain-create STATUS=complete EYE={index}");
-            let mut eye = Eye {
-                gpu: r.gpu.clone(),
-                swapchain,
-                extent,
-                images: Vec::new(),
-            };
-            eprintln!("XR_INIT_STAGE=swapchain-images STATUS=begin EYE={index}");
-            let images = eye
-                .swapchain
-                .enumerate_images()
-                .with_context(|| format!("xrEnumerateSwapchainImages(eye={index})"))?;
-            eprintln!(
-                "XR_INIT_STAGE=swapchain-images STATUS=complete EYE={index} IMAGES={}",
-                images.len()
-            );
-            for (image_index, image) in images.into_iter().enumerate() {
-                eye.images.push(ImageTarget {
-                    image: vk::Image::from_raw(image),
-                    view: vk::ImageView::null(),
-                    framebuffer: vk::Framebuffer::null(),
-                    depth: None,
-                });
-                let target = eye.images.last_mut().unwrap();
-                target.depth = Some(DepthTarget::new(r.gpu.clone(), extent)?);
-                unsafe {
-                    target.view = r
-                        .gpu
-                        .device
-                        .create_image_view(
-                            &vk::ImageViewCreateInfo::default()
-                                .image(target.image)
-                                .view_type(vk::ImageViewType::TYPE_2D)
-                                .format(format)
-                                .subresource_range(colour_range()),
-                            None,
-                        )
-                        .with_context(|| {
-                            format!("vkCreateImageView(eye={index}, image={image_index})")
-                        })?;
-                    target.framebuffer = r
-                        .gpu
-                        .device
-                        .create_framebuffer(
-                            &vk::FramebufferCreateInfo::default()
-                                .render_pass(r.pass)
-                                .attachments(&[target.view, target.depth.as_ref().unwrap().view])
-                                .width(extent.width)
-                                .height(extent.height)
-                                .layers(1),
-                            None,
-                        )
-                        .with_context(|| {
-                            format!("vkCreateFramebuffer(eye={index}, image={image_index})")
-                        })?;
-                }
-            }
+            let eye = r.create_target(session, extent)?;
             println!(
                 "XR_EYE={index} SIZE={}x{} IMAGES={} FORMAT={format:?}",
                 extent.width,
@@ -708,14 +655,92 @@ impl Renderer {
         })
     }
 
+    fn create_target(
+        &self,
+        session: &xr::Session<xr::Vulkan>,
+        extent: vk::Extent2D,
+    ) -> Result<Eye> {
+        let index = "layer";
+        let format = self.format;
+        let swapchain = session.create_swapchain(&xr::SwapchainCreateInfo {
+                create_flags: xr::SwapchainCreateFlags::EMPTY,
+                usage_flags: xr::SwapchainUsageFlags::COLOR_ATTACHMENT
+                    | xr::SwapchainUsageFlags::TRANSFER_SRC,
+                format: format.as_raw() as _,
+                sample_count: 1,
+                width: extent.width,
+                height: extent.height,
+                face_count: 1,
+                array_size: 1,
+                mip_count: 1,
+            }).with_context(|| format!("xrCreateSwapchain(eye={index}, {}x{}, format={format:?}, samples=1, array=1, usage=COLOR_ATTACHMENT|TRANSFER_SRC)", extent.width, extent.height))?;
+        eprintln!("XR_INIT_STAGE=swapchain-create STATUS=complete EYE={index}");
+        let mut eye = Eye {
+            gpu: self.gpu.clone(),
+            swapchain,
+            extent,
+            images: Vec::new(),
+        };
+        eprintln!("XR_INIT_STAGE=swapchain-images STATUS=begin EYE={index}");
+        let images = eye
+            .swapchain
+            .enumerate_images()
+            .with_context(|| format!("xrEnumerateSwapchainImages(eye={index})"))?;
+        eprintln!(
+            "XR_INIT_STAGE=swapchain-images STATUS=complete EYE={index} IMAGES={}",
+            images.len()
+        );
+        for (image_index, image) in images.into_iter().enumerate() {
+            eye.images.push(ImageTarget {
+                image: vk::Image::from_raw(image),
+                view: vk::ImageView::null(),
+                framebuffer: vk::Framebuffer::null(),
+                depth: None,
+            });
+            let target = eye.images.last_mut().unwrap();
+            target.depth = Some(DepthTarget::new(self.gpu.clone(), extent)?);
+            unsafe {
+                target.view = self
+                    .gpu
+                    .device
+                    .create_image_view(
+                        &vk::ImageViewCreateInfo::default()
+                            .image(target.image)
+                            .view_type(vk::ImageViewType::TYPE_2D)
+                            .format(format)
+                            .subresource_range(colour_range()),
+                        None,
+                    )
+                    .with_context(|| {
+                        format!("vkCreateImageView(eye={index}, image={image_index})")
+                    })?;
+                target.framebuffer = self
+                    .gpu
+                    .device
+                    .create_framebuffer(
+                        &vk::FramebufferCreateInfo::default()
+                            .render_pass(self.pass)
+                            .attachments(&[target.view, target.depth.as_ref().unwrap().view])
+                            .width(extent.width)
+                            .height(extent.height)
+                            .layers(1),
+                        None,
+                    )
+                    .with_context(|| {
+                        format!("vkCreateFramebuffer(eye={index}, image={image_index})")
+                    })?;
+            }
+        }
+        Ok(eye)
+    }
     fn record_eye(
         &self,
-        eye: usize,
+        target: &Eye,
+        pass: DrawPass,
         image_index: usize,
         view: &xr::View,
         capture: bool,
     ) -> Result<Option<Buffer>> {
-        let target = &self.eyes[eye];
         ensure!(
             image_index < target.images.len(),
             "XR swapchain index out of bounds"
@@ -802,14 +827,16 @@ impl Renderer {
                 0,
                 bytes,
             );
-            d.cmd_draw(self.cmd, 3, 1, 0, 0);
+            if matches!(pass, DrawPass::All | DrawPass::Background) {
+                d.cmd_draw(self.cmd, 3, 1, 0, 0);
+            }
             for (hand, (model, state)) in self
                 .controllers
                 .iter()
                 .zip(&self.controller_states)
                 .enumerate()
             {
-                if let Some(model) = model {
+                if let Some(model) = model.as_ref().filter(|_| matches!(pass, DrawPass::All)) {
                     model.draw(
                         self.cmd,
                         view,
@@ -841,7 +868,26 @@ impl Renderer {
                 // depend on their centre-distance order.
                 for pipeline in [self.opaque_pipeline, self.spatial_pipeline] {
                     d.cmd_bind_pipeline(self.cmd, vk::PipelineBindPoint::GRAPHICS, pipeline);
-                    d.cmd_draw(self.cmd, 192 + 36 * 6, self.draw_count, 0, 0);
+                    if matches!(pass, DrawPass::All) {
+                        d.cmd_draw(self.cmd, 192 + 36 * 6, self.draw_count, 0, 0);
+                    } else {
+                        let desired = match pass {
+                            DrawPass::Background => -1,
+                            DrawPass::Foreground => 1,
+                            _ => 0,
+                        };
+                        for (index, part) in self.partition.iter().enumerate() {
+                            if *part == desired {
+                                d.cmd_draw(
+                                    self.cmd,
+                                    if desired == 0 { 192 } else { 192 + 36 * 6 },
+                                    1,
+                                    0,
+                                    index as u32,
+                                );
+                            }
+                        }
+                    }
                 }
             }
             for (hand, (model, state)) in self
@@ -850,7 +896,7 @@ impl Renderer {
                 .zip(&self.controller_states)
                 .enumerate()
             {
-                if let Some(model) = model {
+                if let Some(model) = model.as_ref().filter(|_| matches!(pass, DrawPass::All)) {
                     model.draw(
                         self.cmd,
                         view,
@@ -930,15 +976,45 @@ impl Renderer {
     /// protects XR release and optional readback; no CPU wait splits the eyes.
     pub fn render_stereo(
         &mut self,
-        indices: [u32; 2],
+        indices: &[u32],
         views: &[xr::View],
         capture: bool,
     ) -> Result<Vec<Option<Vec<u8>>>> {
         self.begin()?;
         self.record_atlas_upload();
-        let readbacks: Vec<_> = (0..2)
-            .map(|eye| self.record_eye(eye, indices[eye] as usize, &views[eye], capture))
+        let mut readbacks: Vec<_> = (0..2)
+            .map(|eye| {
+                self.record_eye(
+                    &self.eyes[eye],
+                    if self.focus_quad.is_some() {
+                        DrawPass::Background
+                    } else {
+                        DrawPass::All
+                    },
+                    indices[eye] as usize,
+                    &views[eye],
+                    capture,
+                )
+            })
             .collect::<Result<_>>()?;
+        if let Some(focus) = &self.focus_quad {
+            for eye in 0..2 {
+                readbacks.push(self.record_eye(
+                    &self.foreground[eye],
+                    DrawPass::Foreground,
+                    indices[eye + 2] as usize,
+                    &views[eye],
+                    capture,
+                )?);
+            }
+            readbacks.push(self.record_eye(
+                self.quad.as_ref().unwrap(),
+                DrawPass::Quad,
+                indices[4] as usize,
+                &focus.view(),
+                capture,
+            )?);
+        }
         self.submit()?;
         if self.atlas_upload.take().is_some() {
             self.atlas.as_mut().unwrap().initialized = true;
@@ -966,6 +1042,8 @@ impl Drop for Renderer {
     fn drop(&mut self) {
         unsafe {
             let _ = self.gpu.device.device_wait_idle();
+            self.foreground.clear();
+            self.quad = None;
             self.eyes.clear();
             self.controllers = [None, None];
             let d = &self.gpu.device;
@@ -1556,6 +1634,7 @@ impl Renderer {
                     .then(a.group.cmp(&b.group))
             }
         });
+        self.geometry = order.iter().map(|p| (*p).clone()).collect();
         self.draw_count = order.len() as u32;
         let mut values = Vec::with_capacity(order.len() * 32);
         for p in order {
@@ -1697,3 +1776,5 @@ impl Renderer {
         }
     }
 }
+
+include!("focus_quad.rs");

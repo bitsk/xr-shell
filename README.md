@@ -310,3 +310,33 @@ No new group draws before a valid finite stereo pose is available. Existing
 world-locked and taskbar-follow policies retain their own anchors. Raster/quad
 placement and ray picking share the same frozen frame. This protocol support
 requires separate rendered and physical-device acceptance.
+
+### Focus Quad and frame timeline
+
+`--focus-quad=auto` (or `XR_FOCUS_QUAD=auto`) experimentally promotes an acknowledged, visible flat focus window
+when the runtime permits three layers and every other surface can be placed
+entirely before or behind its plane. `--focus-quad=off` retains the original
+projection for A/B comparisons. Projection remains the default: the first native
+three-layer trial increased compositor GPU cost. Cadence also degraded after
+restarting the projection baseline, so the cadence change is not isolated to Quad. Background projection, focused Quad and alpha
+foreground projection share the same reference space and display time. The
+window is sampled at its content resolution using the existing linear-light,
+rounded-alpha shader; input geometry is unchanged. Focus changes and resize
+replace only the required texture target. Curves, intersecting/coplanar geometry,
+back-facing views, unavailable resources, and controller poses whose depth has
+not been partitioned use the original projection. This conservative controller
+fallback is intentional; native Quad with physical controllers is not accepted.
+
+Capture metadata reports active layers and fallback reasons. With Quad active,
+`left/right.png` contain the background projection; `foreground-left/right.png`
+and `focus-quad.png` are separate GPU readbacks of the other submitted layers.
+They must not be represented as a final compositor/headset image.
+
+The bounded timeline retains the latest 4096 rendered frames. Capture requests
+write `timeline.json`; normal frames do not write telemetry to disk. Final
+`summary.json` also contains the samples. CLOCK_MONOTONIC stage boundaries cover
+application work, wait/begin, locate, input/atlas preparation, acquire/wait,
+record/submit/completion wait, release and end. An XrTime/monotonic clock pair is
+recorded only when KHR_convert_timespec_time is available. CPU wait duration is
+not GPU execution time, end-frame return is not scanout, and these observations
+do not establish physical motion-to-photon latency.

@@ -200,6 +200,17 @@ impl Desktop {
         }
         Some(frame.rect(rect, depth))
     }
+    /// Only acknowledged, visible, flat top-level focus can become a native layer.
+    pub fn focus_quad_window(&self) -> Option<String> {
+        if !self.focus_applied {
+            return None;
+        }
+        let key = self.focus.as_ref()?;
+        let w = self.windows.get(key)?;
+        (self.visible_window(w) && w.has_window_controls() && !w.curved)
+            .then(|| format!("window:{key}"))
+    }
+
     fn window_frame(&self, k: &str, level: u32) -> Option<Frame> {
         let w = self.windows.get(k)?;
         let logical = Self::logical(w);

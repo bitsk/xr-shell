@@ -11,6 +11,7 @@ mod recenter;
 mod renderer;
 mod spatial;
 mod taskbar_follow;
+mod timeline;
 mod ui_anchor;
 
 use anyhow::{Context, Result, bail, ensure};
@@ -43,6 +44,7 @@ struct Options {
     debug_input: bool,
     socket: Option<PathBuf>,
     ui_anchor: ui_anchor::Mode,
+    focus_quad: bool,
 }
 impl Options {
     fn parse() -> Result<Option<Self>> {
@@ -56,6 +58,7 @@ impl Options {
             debug_input: false,
             socket: None,
             ui_anchor: ui_anchor::Mode::Stage,
+            focus_quad: env::var("XR_FOCUS_QUAD").is_ok_and(|v| v == "auto"),
         };
         let mut args = env::args().skip(1);
         while let Some(arg) = args.next() {
@@ -76,6 +79,8 @@ impl Options {
                             .into(),
                     )
                 }
+                "--focus-quad=auto" => o.focus_quad = true,
+                "--focus-quad=off" => o.focus_quad = false,
                 "--components" => o.components = true,
                 "--debug-input" => {
                     o.components = true;
@@ -103,7 +108,7 @@ impl Options {
                 }
                 "--help" | "-h" => {
                     println!(
-                        "xr-shell [--environment FILE] [--seconds N] [--capture-dir DIR] [--validation] [--view-scale 0.1..1] [--ui-anchor=stage|head]\n\
+                        "xr-shell [--environment FILE] [--seconds N] [--capture-dir DIR] [--validation] [--view-scale 0.1..1] [--ui-anchor=stage|head] [--focus-quad=auto|off]\n\
                               --seconds 0 runs until SIGINT/SIGTERM or runtime session shutdown.\n\
                               Write an ASCII label to DIR/capture.request to save that frame's two eyes and metadata."
                     );
@@ -245,6 +250,10 @@ struct Summary {
     outcome: String,
     error: Option<String>,
     desktop: Value,
+    timeline: timeline::Timeline,
+    focus_quad: Value,
+    native_quad_frames: u64,
+    layer_limits: [u32; 3],
 }
 
 fn main() {
@@ -303,6 +312,7 @@ fn run(options: &Options, summary: &mut Summary) -> Result<()> {
     );
     let mut extensions = xr::ExtensionSet::default();
     extensions.khr_vulkan_enable2 = true;
+    extensions.khr_convert_timespec_time = available.khr_convert_timespec_time;
     let instance = entry.create_instance(
         &xr::ApplicationInfo {
             application_name: "UKUI XR Shell",
@@ -322,6 +332,12 @@ fn run(options: &Options, summary: &mut Summary) -> Result<()> {
     ));
     println!("XR_RUNTIME={}", summary.runtime.as_ref().unwrap());
     let system = instance.system(xr::FormFactor::HEAD_MOUNTED_DISPLAY)?;
+    let graphics = instance.system_properties(system)?.graphics_properties;
+    summary.layer_limits = [
+        graphics.max_layer_count,
+        graphics.max_swapchain_image_width,
+        graphics.max_swapchain_image_height,
+    ];
     let config = instance
         .enumerate_view_configuration_views(system, VIEW_TYPE)
         .context("xrEnumerateViewConfigurationViews(PRIMARY_STEREO)")?;
@@ -509,14 +525,24 @@ fn frame_loop(
             std::thread::sleep(Duration::from_millis(20));
             continue;
         }
+        let mut times = [0i64; 9];
+        times[0] = timeline::now();
         if let Some(d) = desktop {
             d.tick()?;
             if let Some(panels) = d.panels()? {
                 renderer.update_panels(&panels)?;
             }
         }
+        times[1] = timeline::now();
         let state = waiter.wait()?;
         stream.begin()?;
+        times[2] = timeline::now();
+        let runtime_now_xr_ns = if instance.exts().khr_convert_timespec_time.is_some() {
+            instance.now().ok().map(|t| t.as_nanos())
+        } else {
+            None
+        };
+        let clock_bracket = [times[2], timeline::now()];
         summary.waited_frames += 1;
         // Clear visibility even while the runtime suspends scene rendering.
         renderer.update_controllers(&[input::HandState::default(); 2]);
@@ -598,6 +624,7 @@ fn frame_loop(
             continue;
         }
         ensure!(views.len() == 2, "runtime changed stereo view count");
+        times[3] = timeline::now();
         let head_position = [
             (views[0].pose.position.x + views[1].pose.position.x) / 2.,
             (views[0].pose.position.y + views[1].pose.position.y) / 2.,
@@ -639,24 +666,34 @@ fn frame_loop(
             }
         }
 
+        renderer.prepare_focus_quad(
+            session,
+            desktop.as_ref().and_then(|d| d.focus_quad_window()),
+            &views,
+            options.focus_quad,
+            summary.layer_limits,
+        );
+        summary.focus_quad = renderer.quad_status();
         let capture = capture_request(options.capture_dir.as_deref())?;
-        let mut indices = [0u32; 2];
-        for eye in 0..2 {
-            indices[eye] = renderer.eyes[eye].swapchain.acquire_image()?;
-            renderer.eyes[eye]
-                .swapchain
-                .wait_image(xr::Duration::INFINITE)?;
+        times[4] = timeline::now();
+        let mut indices = Vec::new();
+        for target in renderer.targets_mut() {
+            indices.push(target.swapchain.acquire_image()?);
+            target.swapchain.wait_image(xr::Duration::INFINITE)?;
         }
-        let result = renderer.render_stereo(indices, &views, capture.is_some());
+        times[5] = timeline::now();
+        let result = renderer.render_stereo(&indices, &views, capture.is_some());
+        times[6] = timeline::now();
         let releases: Vec<_> = renderer
-            .eyes
-            .iter_mut()
+            .targets_mut()
+            .into_iter()
             .map(|eye| eye.swapchain.release_image())
             .collect();
         let pixels = result?;
         for release in releases {
             release?;
         }
+        times[7] = timeline::now();
         let layers: Vec<_> = renderer
             .eyes
             .iter()
@@ -679,13 +716,81 @@ fn frame_loop(
                     )
             })
             .collect();
-        stream.end(
-            state.predicted_display_time,
-            xr::EnvironmentBlendMode::OPAQUE,
-            &[&xr::CompositionLayerProjection::new()
+        let background = xr::CompositionLayerProjection::new()
+            .space(space)
+            .views(&layers);
+        if let Some(focus) = &renderer.focus_quad {
+            let target = renderer.quad.as_ref().unwrap();
+            let quad = xr::CompositionLayerQuad::new()
                 .space(space)
-                .views(&layers)],
-        )?;
+                .layer_flags(xr::CompositionLayerFlags::BLEND_TEXTURE_SOURCE_ALPHA)
+                .eye_visibility(xr::EyeVisibility::BOTH)
+                .pose(focus.pose())
+                .size(xr::Extent2Df {
+                    width: focus.frame.size[0],
+                    height: focus.frame.size[1],
+                })
+                .sub_image(
+                    xr::SwapchainSubImage::new()
+                        .swapchain(&target.swapchain)
+                        .image_array_index(0)
+                        .image_rect(xr::Rect2Di {
+                            offset: xr::Offset2Di { x: 0, y: 0 },
+                            extent: xr::Extent2Di {
+                                width: target.extent.width as i32,
+                                height: target.extent.height as i32,
+                            },
+                        }),
+                );
+            let front_views: Vec<_> = renderer
+                .foreground
+                .iter()
+                .zip(&views)
+                .map(|(eye, view)| {
+                    xr::CompositionLayerProjectionView::new()
+                        .pose(view.pose)
+                        .fov(view.fov)
+                        .sub_image(
+                            xr::SwapchainSubImage::new()
+                                .swapchain(&eye.swapchain)
+                                .image_array_index(0)
+                                .image_rect(xr::Rect2Di {
+                                    offset: xr::Offset2Di { x: 0, y: 0 },
+                                    extent: xr::Extent2Di {
+                                        width: eye.extent.width as i32,
+                                        height: eye.extent.height as i32,
+                                    },
+                                }),
+                        )
+                })
+                .collect();
+            let foreground = xr::CompositionLayerProjection::new()
+                .space(space)
+                .layer_flags(xr::CompositionLayerFlags::BLEND_TEXTURE_SOURCE_ALPHA)
+                .views(&front_views);
+            stream.end(
+                state.predicted_display_time,
+                xr::EnvironmentBlendMode::OPAQUE,
+                &[&background, &quad, &foreground],
+            )?;
+            summary.native_quad_frames += 1;
+        } else {
+            stream.end(
+                state.predicted_display_time,
+                xr::EnvironmentBlendMode::OPAQUE,
+                &[&background],
+            )?;
+        }
+        times[8] = timeline::now();
+        summary.timeline.push(timeline::Frame {
+            number: summary.frames + 1,
+            mono_ns: times,
+            predicted_display_xr_ns: state.predicted_display_time.as_nanos(),
+            runtime_now_xr_ns,
+            runtime_now_mono_bracket_ns: clock_bracket,
+            layers: if renderer.focus_quad.is_some() { 3 } else { 1 },
+            capture: capture.is_some(),
+        });
         summary.frames += 1;
         for n in &mut summary.eye_submissions {
             *n += 1;
@@ -700,8 +805,12 @@ fn frame_loop(
                 &views,
                 flags,
                 &summary.ui_anchor,
-                indices,
+                &indices,
                 pixels,
+            )?;
+            atomic_json(
+                &options.summary_dir().join("timeline.json"),
+                &json!({"summary":summary.timeline.summary(),"samples":summary.timeline.frames,"focus_quad":summary.focus_quad,"native_quad_frames":summary.native_quad_frames}),
             )?;
             summary.captures.push(tag.clone());
             println!("XR_CAPTURE={tag} FRAME={} VIEWS=2", summary.frames);
@@ -747,10 +856,15 @@ fn write_capture(
     views: &[xr::View],
     flags: xr::ViewStateFlags,
     ui_anchor: &ui_anchor::UiAnchor,
-    indices: [u32; 2],
-    pixels: Vec<Option<Vec<u8>>>,
+    indices: &[u32],
+    mut pixels: Vec<Option<Vec<u8>>>,
 ) -> Result<()> {
     let mut eyes = Vec::new();
+    let extra = if pixels.len() > 2 {
+        pixels.split_off(2)
+    } else {
+        Vec::new()
+    };
     for (eye, (view, bytes)) in views.iter().zip(pixels).enumerate() {
         let target = &renderer.eyes[eye];
         let name = format!("{tag}-{}.png", if eye == 0 { "left" } else { "right" });
@@ -774,6 +888,28 @@ fn write_capture(
             "position_m": [p.x,p.y,p.z], "orientation_xyzw": [q.x,q.y,q.z,q.w],
             "fov_radians": {"left":f.angle_left,"right":f.angle_right,"up":f.angle_up,"down":f.angle_down}}));
     }
+    let mut layer_images = Vec::new();
+    for (n, bytes) in extra.into_iter().enumerate() {
+        let target = if n < 2 {
+            &renderer.foreground[n]
+        } else {
+            renderer.quad.as_ref().unwrap()
+        };
+        let suffix = ["foreground-left", "foreground-right", "focus-quad"][n];
+        let name = format!("{tag}-{suffix}.png");
+        let mut encoder = png::Encoder::new(
+            BufWriter::new(fs::File::create(dir.join(&name))?),
+            target.extent.width,
+            target.extent.height,
+        );
+        encoder.set_color(png::ColorType::Rgba);
+        encoder.set_depth(png::BitDepth::Eight);
+        encoder.set_source_srgb(png::SrgbRenderingIntent::Perceptual);
+        let mut writer = encoder.write_header()?;
+        writer.write_image_data(&bytes.context("missing layer readback")?)?;
+        writer.finish()?;
+        layer_images.push(json!({"role":suffix,"png":name,"width":target.extent.width,"height":target.extent.height,"image_index":indices[n+2]}));
+    }
     atomic_json(
         &dir.join(format!("{tag}.json")),
         &json!({"schema":1,"tag":tag,"frame":frame,
@@ -781,7 +917,8 @@ fn write_capture(
         "view_state_flags": ViewFlags::from(flags),
         "ui_anchor": ui_anchor,
         "controllers": renderer.controller_status(),
-        "pixels":"actual GPU swapchain readback after rendering","panorama_translation":"ignored", "eyes":eyes}),
+        "focus_quad":renderer.quad_status(),"extra_layer_images":layer_images,
+        "pixels":"actual GPU swapchain readback; when Quad is active eyes are background-only and extra_layer_images contain foreground and Quad; not final compositor output","panorama_translation":"ignored", "eyes":eyes}),
     )
 }
 fn atomic_json(path: &Path, value: &Value) -> Result<()> {

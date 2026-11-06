@@ -1,3 +1,15 @@
+xr-shell (0.2.21) unstable; urgency=medium
+
+  * Keep native Quad opt-in after measured compositor cost; retain frame audit.
+
+ -- bits <bigbits@hackx.cc>  Fri, 06 Nov 2026 13:03:23 +0800
+
+xr-shell (0.2.20) unstable; urgency=medium
+
+  * Audit application frame timing and add guarded focused Quad composition.
+
+ -- bits <bigbits@hackx.cc>  Fri, 06 Nov 2026 12:49:33 +0800
+
 xr-shell (0.2.19) unstable; urgency=medium
 
   * Fix spatial hit arbitration, window resize/reflow and companion feedback.
