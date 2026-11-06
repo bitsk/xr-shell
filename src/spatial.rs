@@ -202,6 +202,24 @@ impl Frame {
     pub fn inside(&self, xy: [f32; 2]) -> bool {
         xy[0] >= 0. && xy[1] >= 0. && xy[0] <= self.logical[0] && xy[1] <= self.logical[1]
     }
+    /// Distance to the rounded face, in metres (not clamped hit coordinates).
+    pub fn rounded_distance_m(&self, xy: [f32; 2], radius: f32) -> f32 {
+        if self.inside_rounded(xy, radius) {
+            return 0.;
+        }
+        let r = radius
+            .max(0.)
+            .min(self.logical[0].min(self.logical[1]) * 0.5);
+        let c = [
+            xy[0].clamp(r, self.logical[0] - r),
+            xy[1].clamp(r, self.logical[1] - r),
+        ];
+        let delta = [xy[0] - c[0], xy[1] - c[1]];
+        let length = delta[0].hypot(delta[1]);
+        let edge = [c[0] + delta[0] * r / length, c[1] + delta[1] * r / length];
+        let d = sub(self.point(xy, 0.), self.point(edge, 0.));
+        dot(d, d).sqrt()
+    }
     pub fn inside_rounded(&self, xy: [f32; 2], radius: f32) -> bool {
         if !self.inside(xy) {
             return false;

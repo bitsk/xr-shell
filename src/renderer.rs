@@ -108,6 +108,12 @@ struct AtlasEntry {
     pixels: Arc<[u8]>,
 }
 
+struct AtlasUpload {
+    staging: Option<Buffer>,
+    copies: Vec<vk::BufferImageCopy>,
+    gutters: Vec<vk::ImageBlit>,
+    clear: bool,
+}
 pub struct Renderer {
     gpu: Rc<Gpu>,
     pub eyes: Vec<Eye>,
@@ -136,6 +142,7 @@ pub struct Renderer {
     shaders: Vec<vk::ShaderModule>,
     yaw: f32,
     atlas: Option<Atlas>,
+    atlas_upload: Option<AtlasUpload>,
     atlas_entries: std::collections::BTreeMap<String, AtlasEntry>,
     ui_uniform: Option<Buffer>,
     panel_uniforms: Vec<f32>,
@@ -188,6 +195,7 @@ impl Renderer {
             shaders: Vec::new(),
             yaw: environment.yaw,
             atlas: None,
+            atlas_upload: None,
             atlas_entries: std::collections::BTreeMap::new(),
             ui_uniform: None,
             panel_uniforms: Vec::new(),
@@ -921,16 +929,20 @@ impl Renderer {
     /// Both eyes share one recording/submission. The single completion wait
     /// protects XR release and optional readback; no CPU wait splits the eyes.
     pub fn render_stereo(
-        &self,
+        &mut self,
         indices: [u32; 2],
         views: &[xr::View],
         capture: bool,
     ) -> Result<Vec<Option<Vec<u8>>>> {
         self.begin()?;
+        self.record_atlas_upload();
         let readbacks: Vec<_> = (0..2)
             .map(|eye| self.record_eye(eye, indices[eye] as usize, &views[eye], capture))
             .collect::<Result<_>>()?;
         self.submit()?;
+        if self.atlas_upload.take().is_some() {
+            self.atlas.as_mut().unwrap().initialized = true;
+        }
         readbacks
             .into_iter()
             .map(|buffer| {
@@ -984,19 +996,41 @@ fn mip_count(width: u32, height: u32) -> u32 {
 fn align_tile(n: u32) -> u32 {
     (n + 15) & !15
 }
-fn padded_pixels(p: &crate::desktop::Panel) -> Vec<u8> {
-    let width = align_tile(p.width + 32);
-    let height = align_tile(p.height + 32);
-    let mut tile = Vec::with_capacity((width * height * 4) as usize);
-    for y in 0..height {
-        for x in 0..width {
-            let px = x.saturating_sub(16).min(p.width - 1);
-            let py = y.saturating_sub(16).min(p.height - 1);
-            let offset = ((py * p.width + px) * 4) as usize;
-            tile.extend_from_slice(&p.rgba[offset..offset + 4]);
+// Eight non-overlapping destinations repeat the edge texels, including the
+// alignment tail. Sources are strictly inside the tile, so a same-image blit
+// never reads a destination region (including across other tiles).
+fn gutter_blits(x: u32, y: u32, w: u32, h: u32) -> Vec<vk::ImageBlit> {
+    let xs = [
+        (x, x + 1, x - 16, x),
+        (x, x + w, x, x + w),
+        (x + w - 1, x + w, x + w, x - 16 + align_tile(w + 32)),
+    ];
+    let ys = [
+        (y, y + 1, y - 16, y),
+        (y, y + h, y, y + h),
+        (y + h - 1, y + h, y + h, y - 16 + align_tile(h + 32)),
+    ];
+    let mut regions = Vec::with_capacity(8);
+    let offset = |x, y, z| vk::Offset3D {
+        x: x as i32,
+        y: y as i32,
+        z,
+    };
+    for (i, &(sx0, sx1, dx0, dx1)) in xs.iter().enumerate() {
+        for (j, &(sy0, sy1, dy0, dy1)) in ys.iter().enumerate() {
+            if i == 1 && j == 1 {
+                continue;
+            }
+            regions.push(
+                vk::ImageBlit::default()
+                    .src_subresource(colour_layers())
+                    .src_offsets([offset(sx0, sy0, 0), offset(sx1, sy1, 1)])
+                    .dst_subresource(colour_layers())
+                    .dst_offsets([offset(dx0, dy0, 0), offset(dx1, dy1, 1)]),
+            );
         }
     }
-    tile
+    regions
 }
 unsafe fn generate_mips(
     gpu: &Gpu,
@@ -1188,6 +1222,124 @@ impl Drop for Atlas {
 }
 const UI_UNIFORM_BYTES: u64 = 2048 * 128;
 impl Renderer {
+    fn record_atlas_upload(&self) {
+        let Some(upload) = &self.atlas_upload else {
+            return;
+        };
+        let a = self.atlas.as_ref().unwrap();
+        unsafe {
+            let d = &self.gpu.device;
+            d.cmd_pipeline_barrier(
+                self.cmd,
+                if a.initialized {
+                    vk::PipelineStageFlags::FRAGMENT_SHADER
+                } else {
+                    vk::PipelineStageFlags::TOP_OF_PIPE
+                },
+                vk::PipelineStageFlags::TRANSFER,
+                vk::DependencyFlags::empty(),
+                &[],
+                &[],
+                &[image_barrier(
+                    a.image,
+                    if a.initialized {
+                        vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL
+                    } else {
+                        vk::ImageLayout::UNDEFINED
+                    },
+                    vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                    if a.initialized {
+                        vk::AccessFlags::SHADER_READ
+                    } else {
+                        vk::AccessFlags::empty()
+                    },
+                    vk::AccessFlags::TRANSFER_WRITE,
+                )
+                .subresource_range(colour_range().level_count(mip_count(a.width, a.height)))],
+            );
+            if upload.clear {
+                d.cmd_clear_color_image(
+                    self.cmd,
+                    a.image,
+                    vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                    &vk::ClearColorValue { float32: [0.; 4] },
+                    &[colour_range()],
+                );
+                // Order the clear before interior writes to the same mip.
+                d.cmd_pipeline_barrier(
+                    self.cmd,
+                    vk::PipelineStageFlags::TRANSFER,
+                    vk::PipelineStageFlags::TRANSFER,
+                    vk::DependencyFlags::empty(),
+                    &[],
+                    &[],
+                    &[image_barrier(
+                        a.image,
+                        vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                        vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                        vk::AccessFlags::TRANSFER_WRITE,
+                        vk::AccessFlags::TRANSFER_WRITE,
+                    )],
+                );
+            }
+            if let Some(staging) = &upload.staging {
+                d.cmd_copy_buffer_to_image(
+                    self.cmd,
+                    staging.handle,
+                    a.image,
+                    vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                    &upload.copies,
+                );
+                d.cmd_pipeline_barrier(
+                    self.cmd,
+                    vk::PipelineStageFlags::TRANSFER,
+                    vk::PipelineStageFlags::TRANSFER,
+                    vk::DependencyFlags::empty(),
+                    &[],
+                    &[],
+                    &[image_barrier(
+                        a.image,
+                        vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                        vk::ImageLayout::GENERAL,
+                        vk::AccessFlags::TRANSFER_WRITE,
+                        vk::AccessFlags::TRANSFER_READ | vk::AccessFlags::TRANSFER_WRITE,
+                    )],
+                );
+                d.cmd_blit_image(
+                    self.cmd,
+                    a.image,
+                    vk::ImageLayout::GENERAL,
+                    a.image,
+                    vk::ImageLayout::GENERAL,
+                    &upload.gutters,
+                    vk::Filter::NEAREST,
+                );
+                d.cmd_pipeline_barrier(
+                    self.cmd,
+                    vk::PipelineStageFlags::TRANSFER,
+                    vk::PipelineStageFlags::TRANSFER,
+                    vk::DependencyFlags::empty(),
+                    &[],
+                    &[],
+                    &[image_barrier(
+                        a.image,
+                        vk::ImageLayout::GENERAL,
+                        vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                        vk::AccessFlags::TRANSFER_READ | vk::AccessFlags::TRANSFER_WRITE,
+                        vk::AccessFlags::TRANSFER_WRITE,
+                    )],
+                );
+            }
+            generate_mips(
+                &self.gpu,
+                self.cmd,
+                a.image,
+                a.width,
+                a.height,
+                mip_count(a.width, a.height),
+            );
+        }
+    }
     fn init_panels(&mut self) -> Result<()> {
         self.ui_uniform = Some(Buffer::host(
             self.gpu.clone(),
@@ -1221,10 +1373,13 @@ impl Renderer {
         }
         let height = (y + row).max(32).next_power_of_two();
         ensure!(height <= 8192, "spatial atlas capacity");
-        let full = self
-            .atlas
-            .as_ref()
-            .is_none_or(|a| a.width != width || a.height != height)
+        // A second update before a render replaces the pending batch with a
+        // complete snapshot; never lose a tile staged by the previous update.
+        let full = self.atlas_upload.is_some()
+            || self
+                .atlas
+                .as_ref()
+                .is_none_or(|a| a.width != width || a.height != height)
             || panels.len() != self.atlas_entries.len()
             || panels.iter().zip(&packing).any(|(p, position)| {
                 self.atlas_entries
@@ -1256,66 +1411,45 @@ impl Renderer {
             );
         }
         if !changed.is_empty() || self.atlas.as_ref().is_none_or(|a| !a.initialized) {
-            let mut pixels = if full {
-                vec![0u8; width as usize * height as usize * 4]
-            } else {
-                Vec::new()
-            };
+            let mut pixels = Vec::new();
             let mut copies = Vec::new();
-            if full {
-                for (p, (x, y)) in panels.iter().zip(&packing) {
-                    let tile = padded_pixels(p);
-                    let tile_width = align_tile(p.width + 32) as usize;
-                    for row in 0..align_tile(p.height + 32) as usize {
-                        let dst =
-                            (((*y - 16) as usize + row) * width as usize + (*x - 16) as usize) * 4;
-                        pixels[dst..dst + tile_width * 4].copy_from_slice(
-                            &tile[row * tile_width * 4..(row + 1) * tile_width * 4],
-                        );
-                    }
-                }
+            let mut gutters = Vec::new();
+            for &i in &changed {
+                let p = &panels[i];
+                let (x, y) = packing[i];
+                let offset = pixels.len() as u64;
+                pixels.extend_from_slice(&p.rgba);
                 copies.push(
                     vk::BufferImageCopy::default()
+                        .buffer_offset(offset)
                         .image_subresource(colour_layers())
+                        .image_offset(vk::Offset3D {
+                            x: x as i32,
+                            y: y as i32,
+                            z: 0,
+                        })
                         .image_extent(vk::Extent3D {
-                            width,
-                            height,
+                            width: p.width,
+                            height: p.height,
                             depth: 1,
                         }),
                 );
-            } else {
-                for &i in &changed {
-                    let p = &panels[i];
-                    let (x, y) = packing[i];
-                    let offset = pixels.len() as u64;
-                    pixels.extend_from_slice(&padded_pixels(p));
-                    copies.push(
-                        vk::BufferImageCopy::default()
-                            .buffer_offset(offset)
-                            .image_subresource(colour_layers())
-                            .image_offset(vk::Offset3D {
-                                x: (x - 16) as i32,
-                                y: (y - 16) as i32,
-                                z: 0,
-                            })
-                            .image_extent(vk::Extent3D {
-                                width: align_tile(p.width + 32),
-                                height: align_tile(p.height + 32),
-                                depth: 1,
-                            }),
-                    );
-                }
+                gutters.extend(gutter_blits(x, y, p.width, p.height));
             }
             let upload_bytes = pixels.len();
-            let staging = Buffer::host(
-                self.gpu.clone(),
-                upload_bytes as u64,
-                vk::BufferUsageFlags::TRANSFER_SRC,
-            )?;
-            staging.write(&pixels)?;
-            // Only this queue reads the private UI atlas. Its previous submission
-            // fence protects reuse/reallocation without idling the entire XR device.
-            self.begin()?;
+            let staging = if pixels.is_empty() {
+                None
+            } else {
+                let buffer = Buffer::host(
+                    self.gpu.clone(),
+                    upload_bytes as u64,
+                    vk::BufferUsageFlags::TRANSFER_SRC,
+                )?;
+                buffer.write(&pixels)?;
+                Some(buffer)
+            };
+            // The preceding render completed before XR release. Keep this batch
+            // alive through the next stereo submission and its completion fence.
             if self
                 .atlas
                 .as_ref()
@@ -1323,62 +1457,15 @@ impl Renderer {
             {
                 self.atlas = Some(Atlas::new(self.gpu.clone(), width, height)?);
             }
-            {
-                let a = self.atlas.as_ref().unwrap();
-                unsafe {
-                    let d = &self.gpu.device;
-                    d.cmd_pipeline_barrier(
-                        self.cmd,
-                        if a.initialized {
-                            vk::PipelineStageFlags::FRAGMENT_SHADER
-                        } else {
-                            vk::PipelineStageFlags::TOP_OF_PIPE
-                        },
-                        vk::PipelineStageFlags::TRANSFER,
-                        vk::DependencyFlags::empty(),
-                        &[],
-                        &[],
-                        &[image_barrier(
-                            a.image,
-                            if a.initialized {
-                                vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL
-                            } else {
-                                vk::ImageLayout::UNDEFINED
-                            },
-                            vk::ImageLayout::TRANSFER_DST_OPTIMAL,
-                            if a.initialized {
-                                vk::AccessFlags::SHADER_READ
-                            } else {
-                                vk::AccessFlags::empty()
-                            },
-                            vk::AccessFlags::TRANSFER_WRITE,
-                        )
-                        .subresource_range(
-                            colour_range().level_count(mip_count(a.width, a.height)),
-                        )],
-                    );
-                    d.cmd_copy_buffer_to_image(
-                        self.cmd,
-                        staging.handle,
-                        a.image,
-                        vk::ImageLayout::TRANSFER_DST_OPTIMAL,
-                        &copies,
-                    );
-                    generate_mips(
-                        &self.gpu,
-                        self.cmd,
-                        a.image,
-                        a.width,
-                        a.height,
-                        mip_count(a.width, a.height),
-                    );
-                }
-            }
-            self.submit()?;
-            self.atlas.as_mut().unwrap().initialized = true;
+            self.atlas_upload = Some(AtlasUpload {
+                staging,
+                copies,
+                gutters,
+                clear: full,
+            });
             if crate::ui_profile() || started.elapsed().as_millis() >= 8 {
                 eprintln!(
-                    "XR_UI_UPLOAD full={full} regions={} bytes={upload_bytes} atlas={}x{} elapsed_us={}",
+                    "XR_UI_UPLOAD staged=true full={full} regions={} bytes={upload_bytes} atlas={}x{} elapsed_us={}",
                     changed.len(),
                     width,
                     height,

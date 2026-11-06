@@ -258,7 +258,12 @@ impl Desktop {
         }
         let mut plane = frame;
         plane.curve = 0.;
-        let mut out = plane.rect(rect, 0.005);
+        let lift = self
+            .companion_lifts
+            .get(&format!("{kind}:{k}"))
+            .copied()
+            .unwrap_or(0.);
+        let mut out = plane.rect(rect, 0.008 + lift);
         out.size[1] = rect[3] * unit;
         Some(out)
     }
@@ -644,7 +649,7 @@ impl Desktop {
                     | Source::Curve(k)
                     | Source::Resize(k, _) => {
                         let (group, anchor, layer) = self.window_group(k);
-                        (anchor, group, layer + 0.005)
+                        (anchor, group, layer + 0.008 + self.companion_lifts.get(d.id.strip_prefix("shadow:").unwrap_or(&d.id)).copied().unwrap_or(0.))
                     }
                     Source::Shadow(_) => unreachable!(),
                 };
@@ -713,6 +718,35 @@ impl Desktop {
                     *value = target;
                 }
             }
+        }
+        let controls: Vec<_> = self
+            .panel_poses()
+            .into_iter()
+            .filter(|g| {
+                ["grab:", "orb:", "close:", "minimize:", "curve:"]
+                    .iter()
+                    .any(|p| g.id.starts_with(p))
+            })
+            .collect();
+        self.companion_lifts
+            .retain(|id, _| controls.iter().any(|g| &g.id == id));
+        for g in controls {
+            let target = if g.controls[1] > 0. {
+                -0.006
+            } else if g.controls[0] > 0. {
+                0.010
+            } else {
+                0.
+            };
+            let value = self.companion_lifts.entry(g.id).or_insert(0.);
+            let next = *value + (target - *value) * (1. - (-dt / 0.075).exp());
+            let next = if (target - next).abs() < 0.000001 {
+                target
+            } else {
+                next
+            };
+            changed |= next != *value;
+            *value = next;
         }
         changed
     }
@@ -794,6 +828,8 @@ impl Desktop {
     fn nearest_ray_pick(&self, origin: [f32; 3], direction: [f32; 3]) -> Option<RayPick> {
         let mut pick = None;
         let mut nearest = f32::MAX;
+        let mut nearest_direct = false;
+        let mut nearest_edge = f32::MAX;
         for draw in self.draws() {
             if matches!(draw.source, Source::Shadow(_)) {
                 continue;
@@ -827,9 +863,20 @@ impl Desktop {
             };
             if let Some((xy, t)) = hit_frame.project(origin, direction) {
                 let effective = self.hit_local(hit_frame, xy, t, draw.radius, target.is_some());
-                if t < nearest && effective.is_some() {
+                let direct = hit_frame.inside_rounded(xy, draw.radius);
+                let edge = hit_frame.rounded_distance_m(xy, draw.radius);
+                let coplanar = (t - nearest).abs() < 0.0001;
+                let better = if coplanar {
+                    (direct && !nearest_direct)
+                        || (direct == nearest_direct && !direct && edge < nearest_edge)
+                } else {
+                    t < nearest
+                };
+                if better && effective.is_some() {
                     let xy = effective.unwrap();
                     nearest = t;
+                    nearest_direct = direct;
+                    nearest_edge = edge;
                     let companion =
                         (!matches!(draw.source, Source::Node(_, _) | Source::Window(_)))
                             .then(|| draw.id.clone());
@@ -1003,6 +1050,7 @@ impl Desktop {
                                     Bimanual {
                                         span,
                                         size: self.windows[&key].size,
+                                        logical: Self::logical(&self.windows[&key]),
                                         anchor: scale(
                                             add(grabs[0].local_anchor, grabs[1].local_anchor),
                                             0.5,
@@ -1018,10 +1066,26 @@ impl Desktop {
         Ok(())
     }
 
-    pub(super) fn finish_grab(&mut self, key: &str) {
-        self.bimanual.remove(key);
+    pub(super) fn finish_grab(&mut self, key: &str, commit: bool) -> Result<()> {
+        if let Some(b) = self.bimanual.remove(key) {
+            if commit {
+                if let Some(w) = self.windows.get(key) {
+                    let logical: [u32; 2] = std::array::from_fn(|i| {
+                        (b.logical[i] * w.size[i] / b.size[i]).round() as u32
+                    });
+                    self.window_intent(
+                        json!({"intent":"resize", "surface_id":w.state["surface_id"],
+                        "window_server_generation":w.state["window_server_generation"],
+                        "width":logical[0], "height":logical[1]}),
+                    )?;
+                    self.changed();
+                }
+            } else if let Some(w) = self.windows.get_mut(key) {
+                w.size = b.size;
+            }
+        }
         let Some(f) = self.window_frame(key, 0) else {
-            return;
+            return Ok(());
         };
         for c in self
             .captures
@@ -1037,6 +1101,7 @@ impl Desktop {
                 ];
             }
         }
+        Ok(())
     }
     /// Joystick Y changes reach while physical controller translation naturally
     /// pushes/pulls the grab point. Bounds refer to distance from the eyes.
@@ -1069,8 +1134,14 @@ impl Desktop {
             if grabs.len() == 2 {
                 let d = sub(grabs[0].point, grabs[1].point);
                 let ratio = (dot(d, d).sqrt() / b.span).clamp(
-                    (0.3 / b.size[0]).max(0.2 / b.size[1]),
-                    (3. / b.size[0]).min(2.5 / b.size[1]),
+                    (0.3 / b.size[0])
+                        .max(0.2 / b.size[1])
+                        .max(160. / b.logical[0])
+                        .max(120. / b.logical[1]),
+                    (3. / b.size[0])
+                        .min(2.5 / b.size[1])
+                        .min(2048. / b.logical[0])
+                        .min(1536. / b.logical[1]),
                 );
                 point = scale(add(grabs[0].point, grabs[1].point), 0.5);
                 anchor = scale(b.anchor, ratio);

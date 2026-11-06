@@ -102,6 +102,7 @@ fn hover_reuses_other_rasters_without_freezing_text_or_window_updates() {
             target: Target::Node(1, "a".into()),
             surface: None,
             resize_frame: None,
+            resize_rotation: [0.; 3],
             size: [0.; 2],
             logical: [0.; 2],
             id: "1".into(),
@@ -132,6 +133,20 @@ fn hover_reuses_other_rasters_without_freezing_text_or_window_updates() {
     ));
     assert!(Arc::ptr_eq(&updated["node:1:a"], &normal["node:1:a"]));
     assert!(Arc::ptr_eq(&updated["node:1:bg"], &normal["node:1:bg"]));
+    // The audited adjacent-button case: slop from the earlier draw must
+    // not steal a real face hit or a nearer slop edge from the next button.
+    d.windows.clear();
+    for (id, x) in [("a", 10.), ("b", 32.)] {
+        d.peers.get_mut(&1).unwrap().nodes.get_mut(id).unwrap().rect = [x, 20., 20., 20.];
+    }
+    d.horizon_head = Some(([0., 1.6, 0.], [0., 0., 0., 1.]));
+    for x in [42., 31.8] {
+        let origin = [(x - 160.) * 0.001, 1.6 - (30. - 50.) * 0.001, 0.];
+        assert_eq!(
+            d.pointer_target("audit", origin, [0., 0., -1.]).as_deref(),
+            Some("node:1:b")
+        );
+    }
     drop(d);
     std::fs::remove_dir_all(dir).unwrap();
 }
@@ -249,6 +264,7 @@ fn islands_share_motion_capture_and_scene_refresh_without_moving_world_panels() 
             target: Target::Node(2, "status".into()),
             surface: None,
             resize_frame: None,
+            resize_rotation: [0.; 3],
             size: [0.; 2],
             logical: [0.; 2],
             id: "1".into(),

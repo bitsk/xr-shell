@@ -141,6 +141,7 @@ struct Grab {
 #[derive(Clone)]
 struct Bimanual {
     span: f32,
+    logical: [f32; 2],
     size: [f32; 2],
     anchor: [f32; 3],
 }
@@ -150,6 +151,7 @@ struct Capture {
     /// Real application surface bound at press, even when a UI node embeds it.
     surface: Option<String>,
     resize_frame: Option<crate::spatial::Frame>,
+    resize_rotation: [f32; 3],
     grab: Option<Grab>,
     size: [f32; 2],
     logical: [f32; 2],
@@ -206,6 +208,7 @@ pub struct Desktop {
     lifts: BTreeMap<(u64, String), f32>,
     expanded_orb: Option<String>,
     companion_hovers: BTreeMap<String, String>,
+    companion_lifts: BTreeMap<String, f32>,
     raster_cache: BTreeMap<String, VecDeque<(Value, Arc<[u8]>)>>,
     stats: Value,
 }
@@ -309,6 +312,7 @@ impl Desktop {
             lifts: BTreeMap::new(),
             expanded_orb: None,
             companion_hovers: BTreeMap::new(),
+            companion_lifts: BTreeMap::new(),
             raster_cache: BTreeMap::new(),
             stats: json!({"connections":0,"disconnects":0,"scene_transactions":0,"shm_commits":0,"buffer_releases":0,"input_events":0,"cancellations":0,"protocol_errors":0,"focus_changes":0}),
         })
@@ -1495,10 +1499,13 @@ impl Desktop {
                 if let Some(w) = self.windows.get_mut(key) {
                     w.size = c.size;
                     w.position = c.position;
+                    if let Some((eye, _)) = self.horizon_head {
+                        w.rotation = crate::spatial::user_facing(w.position, eye);
+                    }
                 }
             }
             if let Target::Move(key) = &c.target {
-                self.finish_grab(key);
+                let _ = self.finish_grab(key, false);
             }
             self.release_capture_surface(&c);
             if let Target::Node(id, node) = c.target {
@@ -1735,6 +1742,10 @@ impl Desktop {
                     source.into(),
                     Capture {
                         grab: None,
+                        resize_rotation: match target {
+                            Target::Resize(k, _) => self.windows[k].rotation,
+                            _ => [0.; 3],
+                        },
                         target: target.clone(),
                         resize_frame: match target {
                             Target::Resize(k, left) => self.companion_frame(
@@ -1869,7 +1880,10 @@ impl Desktop {
                                 0.
                             };
                             let f = crate::spatial::Frame::new(
-                                c.position, c.size, c.logical, w.rotation,
+                                c.position,
+                                c.size,
+                                c.logical,
+                                c.resize_rotation,
                             );
                             let offset = crate::spatial::add(
                                 crate::spatial::scale(
@@ -1885,6 +1899,9 @@ impl Desktop {
                                 ),
                             );
                             w.position = crate::spatial::add(c.position, offset);
+                            if let Some((eye, _)) = self.horizon_head {
+                                w.rotation = crate::spatial::user_facing(w.position, eye);
+                            }
                             self.dirty = true;
                             if phase == "release" {
                                 self.window_intent(json!({"intent":"resize","surface_id":self.windows[&k].state["surface_id"],"window_server_generation":self.windows[&k].state["window_server_generation"],"width":width as u32,"height":height as u32}))?;
@@ -1898,7 +1915,7 @@ impl Desktop {
         if phase == "release" {
             if let Some(c) = self.captures.remove(source) {
                 if let Target::Move(key) = c.target {
-                    self.finish_grab(&key);
+                    self.finish_grab(&key, true)?;
                 }
             }
         }
@@ -1993,19 +2010,47 @@ impl Desktop {
         self.horizon_head = Some(head);
         // A window may arrive before the first valid stereo pose. Leave it
         // invisible until it can be placed in a real horizon frame.
-        let mut index = self
+        let mut occupied: Vec<_> = self
             .windows
             .values()
             .filter(|w| {
                 w.placed && w.has_window_controls() && w.state["workspace"] == self.workspace
             })
-            .count();
+            .map(|w| (w.position, w.size))
+            .collect();
         for w in self.windows.values_mut().filter(|w| !w.placed) {
-            let yaw = [0., -24., 24.][index % 3];
-            w.position = crate::spatial::horizon_spawn(head.0, head.1, yaw, 0., 1.8);
-            w.rotation = crate::spatial::user_facing(w.position, head.0);
+            // Pack by angular extent within a tier. When the central field is
+            // full, use a distinct depth and pitch instead of cycling coplanar slots.
+            let mut slot = 0usize;
+            let position = loop {
+                let tier = slot / 3;
+                let distance = 1.8 + tier as f32 * 0.20;
+                let yaw = [0., -35., 35.][slot % 3];
+                let pitch = -(tier as f32 * 1.5).min(15.);
+                let candidate = crate::spatial::horizon_spawn(head.0, head.1, yaw, pitch, distance);
+                let v = crate::spatial::sub(candidate, head.0);
+                let blocked = occupied.iter().any(|(pos, size)| {
+                    let other = crate::spatial::sub(*pos, head.0);
+                    let d = crate::spatial::dot(other, other).sqrt();
+                    if (d - distance).abs() >= 0.15 {
+                        return false;
+                    }
+                    let separation = (crate::spatial::dot(v, other) / (distance * d).max(0.001))
+                        .clamp(-1., 1.)
+                        .acos();
+                    let widths = (w.size[0] / (2. * distance)).atan()
+                        + (size[0] / (2. * d.max(0.001))).atan();
+                    separation < widths + 3f32.to_radians()
+                });
+                if !blocked {
+                    break candidate;
+                }
+                slot += 1;
+            };
+            w.position = position;
+            w.rotation = crate::spatial::user_facing(position, head.0);
             w.placed = true;
-            index += 1;
+            occupied.push((position, w.size));
             self.dirty = true;
         }
         for peer in self.peers.values_mut() {
