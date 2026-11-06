@@ -125,6 +125,8 @@ pub struct Renderer {
     geometry: Vec<crate::desktop::spatial_ui::Geometry>,
     partition: Vec<i8>,
     quad_disabled: bool,
+    quad_crop_enabled: bool,
+    pub foreground_regions: Vec<(vk::Rect2D, xr::Fovf)>,
 
     pass: vk::RenderPass,
     pipeline: vk::Pipeline,
@@ -186,6 +188,8 @@ impl Renderer {
             geometry: Vec::new(),
             partition: Vec::new(),
             quad_disabled: false,
+            quad_crop_enabled: std::env::var("XR_FOCUS_QUAD_CROP").as_deref() != Ok("off"),
+            foreground_regions: Vec::new(),
             pass: vk::RenderPass::null(),
             pipeline: vk::Pipeline::null(),
             spatial_pipeline: vk::Pipeline::null(),
@@ -740,6 +744,7 @@ impl Renderer {
         image_index: usize,
         view: &xr::View,
         capture: bool,
+        region: Option<vk::Rect2D>,
     ) -> Result<Option<Buffer>> {
         ensure!(
             image_index < target.images.len(),
@@ -766,7 +771,11 @@ impl Renderer {
                 &vk::RenderPassBeginInfo::default()
                     .render_pass(self.pass)
                     .framebuffer(image.framebuffer)
-                    .render_area(rect)
+                    .render_area(if capture {
+                        rect
+                    } else {
+                        region.unwrap_or(rect)
+                    })
                     .clear_values(&[
                         vk::ClearValue::default(),
                         vk::ClearValue {
@@ -778,6 +787,22 @@ impl Renderer {
                     ]),
                 vk::SubpassContents::INLINE,
             );
+            if matches!(pass, DrawPass::Foreground | DrawPass::Quad) {
+                // The shared pass uses DONT_CARE for the opaque panorama.
+                // Alpha layers must explicitly clear reused swapchain images;
+                // unwritten pixels otherwise retain undefined/previous content.
+                d.cmd_clear_attachments(
+                    self.cmd,
+                    &[vk::ClearAttachment::default()
+                        .aspect_mask(vk::ImageAspectFlags::COLOR)
+                        .color_attachment(0)
+                        .clear_value(vk::ClearValue::default())],
+                    &[vk::ClearRect::default()
+                        .rect(if capture { rect } else { region.unwrap_or(rect) })
+                        .base_array_layer(0)
+                        .layer_count(1)],
+                );
+            }
             d.cmd_set_viewport(
                 self.cmd,
                 0,
@@ -790,7 +815,7 @@ impl Renderer {
                     max_depth: 1.0,
                 }],
             );
-            d.cmd_set_scissor(self.cmd, 0, &[rect]);
+            d.cmd_set_scissor(self.cmd, 0, &[region.unwrap_or(rect)]);
             d.cmd_bind_pipeline(self.cmd, vk::PipelineBindPoint::GRAPHICS, self.pipeline);
             d.cmd_bind_descriptor_sets(
                 self.cmd,
@@ -994,6 +1019,7 @@ impl Renderer {
                     indices[eye] as usize,
                     &views[eye],
                     capture,
+                    None,
                 )
             })
             .collect::<Result<_>>()?;
@@ -1005,6 +1031,7 @@ impl Renderer {
                     indices[eye + 2] as usize,
                     &views[eye],
                     capture,
+                    Some(self.foreground_regions[eye].0),
                 )?);
             }
             readbacks.push(self.record_eye(
@@ -1013,6 +1040,7 @@ impl Renderer {
                 indices[4] as usize,
                 &focus.view(),
                 capture,
+                None,
             )?);
         }
         self.submit()?;

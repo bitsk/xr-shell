@@ -746,19 +746,24 @@ fn frame_loop(
                 .foreground
                 .iter()
                 .zip(&views)
-                .map(|(eye, view)| {
+                .enumerate()
+                .map(|(index, (eye, view))| {
+                    let (region, fov) = renderer.foreground_regions[index];
                     xr::CompositionLayerProjectionView::new()
                         .pose(view.pose)
-                        .fov(view.fov)
+                        .fov(fov)
                         .sub_image(
                             xr::SwapchainSubImage::new()
                                 .swapchain(&eye.swapchain)
                                 .image_array_index(0)
                                 .image_rect(xr::Rect2Di {
-                                    offset: xr::Offset2Di { x: 0, y: 0 },
+                                    offset: xr::Offset2Di {
+                                        x: region.offset.x,
+                                        y: region.offset.y,
+                                    },
                                     extent: xr::Extent2Di {
-                                        width: eye.extent.width as i32,
-                                        height: eye.extent.height as i32,
+                                        width: region.extent.width as i32,
+                                        height: region.extent.height as i32,
                                     },
                                 }),
                         )

@@ -327,7 +327,16 @@ back-facing views, unavailable resources, and controller poses whose depth has
 not been partitioned use the original projection. This conservative controller
 fallback is intentional; native Quad with physical controllers is not accepted.
 
-Capture metadata reports active layers and fallback reasons. With Quad active,
+The foreground projection renders and submits a per-eye rectangle enclosing all
+foreground geometry, including thickness and two native pixels of padding. Its
+sub-image and FOV are cropped together, preserving pixel density, real eye poses
+and three-layer ordering. Near-plane crossings retain the full eye.
+`XR_FOCUS_QUAD_CROP=off` retains full foreground images for A/B/A measurement.
+Transparent foreground and Quad targets are cleared before drawing, including
+when a swapchain image is reused after a resize. Swapchain allocations and the
+completion fence remain unchanged.
+
+Capture metadata reports active layers, crop rectangles/FOVs and fallback reasons. With Quad active,
 `left/right.png` contain the background projection; `foreground-left/right.png`
 and `focus-quad.png` are separate GPU readbacks of the other submitted layers.
 They must not be represented as a final compositor/headset image.

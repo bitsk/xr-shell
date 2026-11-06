@@ -1,3 +1,10 @@
+xr-shell (0.2.22) unstable; urgency=medium
+
+  * Crop foreground projection sub-images at native density for opt-in Quad.
+  * Clear transparent layer contents before reusing swapchain images.
+
+ -- bits <bigbits@hackx.cc>  Fri, 06 Nov 2026 14:58:01 +0800
+
 xr-shell (0.2.21) unstable; urgency=medium
 
   * Keep native Quad opt-in after measured compositor cost; retain frame audit.
