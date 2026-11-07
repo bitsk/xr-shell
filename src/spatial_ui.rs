@@ -14,6 +14,7 @@ enum Source {
     Shadow(Box<Source>),
 }
 struct RayPick {
+    node: Option<(u64, String)>,
     target: Option<Target>,
     xy: [f32; 2],
     distance: f32,
@@ -235,7 +236,7 @@ impl Desktop {
         }
         Some(frame)
     }
-    fn visible_window(&self, w: &Window) -> bool {
+    pub(super) fn visible_window(&self, w: &Window) -> bool {
         !w.minimized
             && w.placed
             && w.state["mapped"] != false
@@ -927,6 +928,10 @@ impl Desktop {
                         (!matches!(draw.source, Source::Node(_, _) | Source::Window(_)))
                             .then(|| draw.id.clone());
                     pick = Some(RayPick {
+                        node: match &draw.source {
+                            Source::Node(id, n) => Some((*id, n.clone())),
+                            _ => None,
+                        },
                         target,
                         xy,
                         distance: t,
@@ -989,6 +994,143 @@ impl Desktop {
         })
     }
 
+    /// Page an existing component control only when the ray hits its panel.
+    /// The producer remains responsible for bounds/disabled state and content.
+    pub fn controller_page_at(
+        &mut self,
+        source: &str,
+        origin: [f32; 3],
+        direction: [f32; 3],
+        stick: [f32; 2],
+    ) -> Result<bool> {
+        if !self.focused || !self.ui_anchor_ready || !self.captures.is_empty() {
+            return Ok(false);
+        }
+        let Some(pick) = self.nearest_ray_pick(sub(origin, self.ui_offset), direction) else {
+            return Ok(false);
+        };
+        let Some((owner, node)) = pick.node else {
+            return Ok(false);
+        };
+        if pick
+            .target
+            .as_ref()
+            .and_then(|t| self.target_surface(t))
+            .is_some()
+        {
+            return Ok(false);
+        }
+        let axis = if stick[0].abs() >= stick[1].abs() {
+            stick[0]
+        } else {
+            -stick[1]
+        };
+        if !axis.is_finite()
+            || axis.abs() < 0.65
+            || self
+                .last_page
+                .get(source)
+                .is_some_and(|t| t.elapsed() < Duration::from_millis(280))
+        {
+            return Ok(true);
+        }
+        let peer = &self.peers[&owner];
+        let mut parents = BTreeSet::new();
+        let mut parent = node.as_str();
+        for _ in 0..512 {
+            if parent == "root" {
+                break;
+            }
+            parents.insert(parent);
+            let Some(n) = peer.nodes.get(parent) else {
+                break;
+            };
+            parent = &n.parent_id;
+        }
+        let ids = if axis > 0. {
+            ["page-next", "wifi-next"]
+        } else {
+            ["page-prev", "wifi-prev"]
+        };
+        let target = ids
+            .iter()
+            .filter_map(|id| peer.nodes.get(*id))
+            .find(|n| {
+                n.visible
+                    && n.enabled
+                    && parents.contains(n.parent_id.as_str())
+                    && self.node_frame(peer, n).is_some()
+            })
+            .map(|n| (n.node_id.clone(), [n.rect[2] * 0.5, n.rect[3] * 0.5]));
+        if let Some((node, xy)) = target {
+            self.last_page.insert(source.into(), Instant::now());
+            for phase in ["press", "release"] {
+                self.pointer(Some((Target::Node(owner, node.clone()), xy)), phase, source)?;
+            }
+        }
+        Ok(true)
+    }
+
+    /// Move the legacy seat to the hovered surface before scrolling. A capture
+    /// owns that seat; another hand must not steal its focus or cursor.
+    pub fn controller_scroll_at(
+        &mut self,
+        source: &str,
+        origin: [f32; 3],
+        direction: [f32; 3],
+        delta: [f32; 2],
+    ) -> Result<()> {
+        ensure!(self.focused, "XR session not focused");
+        ensure!(delta.iter().all(|v| v.is_finite()), "invalid scroll delta");
+        if !self.ui_anchor_ready
+            || self.captures.contains_key(source)
+            || self.captures.values().any(|c| c.surface.is_some())
+        {
+            return Ok(());
+        }
+        let pick = self.nearest_ray_pick(sub(origin, self.ui_offset), direction);
+        let hovered = pick
+            .as_ref()
+            .and_then(|p| p.target.as_ref())
+            .and_then(|t| self.target_surface(t));
+        // A UI/occluding panel consumes the ray, never scroll a window behind it.
+        if pick.is_some() && hovered.is_none() {
+            return Ok(());
+        }
+        let Some(key) = hovered.clone().or_else(|| self.focus.clone()) else {
+            return Ok(());
+        };
+        let mut payload = json!({"target":key,"dx":delta[0],"dy":delta[1]});
+        if let Some(pick) = pick {
+            let mut xy = pick.xy;
+            if let Some(Target::Node(owner, node)) = &pick.target {
+                let n = &self.peers[owner].nodes[node];
+                let size = Self::logical(&self.windows[&key]);
+                xy = [xy[0] * size[0] / n.rect[2], xy[1] * size[1] / n.rect[3]];
+            }
+            payload["x"] = json!(xy[0]);
+            payload["y"] = json!(xy[1]);
+        }
+        if self.focus.as_ref() != Some(&key) {
+            self.set_focus(Some(key))?;
+        }
+        if let Some(old) = &self.pending_scroll {
+            if old["target"] == payload["target"] {
+                for axis in ["dx", "dy"] {
+                    payload[axis] = json!(
+                        (old[axis].as_f64().unwrap_or(0.) + payload[axis].as_f64().unwrap_or(0.))
+                            .clamp(-1200., 1200.)
+                    );
+                }
+            }
+        }
+        self.pending_scroll = Some(payload);
+        if self.focus_applied {
+            self.flush_pending_surface_input()?;
+        }
+        Ok(())
+    }
+
     pub fn ray(
         &mut self,
         origin: [f32; 3],
@@ -996,11 +1138,56 @@ impl Desktop {
         phase: &str,
         source: &str,
     ) -> Result<()> {
+        self.ray_action(origin, direction, phase, source, 272, false)
+    }
+    pub fn ray_button(
+        &mut self,
+        origin: [f32; 3],
+        direction: [f32; 3],
+        phase: &str,
+        source: &str,
+        button: u32,
+    ) -> Result<()> {
+        self.ray_action(origin, direction, phase, source, button, false)
+    }
+    pub fn ray_squeeze(
+        &mut self,
+        origin: [f32; 3],
+        direction: [f32; 3],
+        phase: &str,
+        source: &str,
+    ) -> Result<()> {
+        self.ray_action(origin, direction, phase, source, 272, true)
+    }
+    fn ray_action(
+        &mut self,
+        origin: [f32; 3],
+        direction: [f32; 3],
+        phase: &str,
+        source: &str,
+        button: u32,
+        squeeze: bool,
+    ) -> Result<()> {
+        ensure!(
+            [272, 273, 274].contains(&button),
+            "unsupported mouse button"
+        );
+        self.pointer_ray = Some(direction);
         ensure!(
             ["hover", "press", "drag", "release"].contains(&phase),
             "unknown pointer phase"
         );
-        if !self.ui_anchor_ready {
+        if !self.ui_anchor_ready || !self.focused {
+            return Ok(());
+        }
+        if ["drag", "release"].contains(&phase) && !self.captures.contains_key(source) {
+            return Ok(());
+        }
+        if self
+            .captures
+            .get(source)
+            .is_some_and(|c| c.button != button)
+        {
             return Ok(());
         }
         let origin = sub(origin, self.ui_offset);
@@ -1008,26 +1195,42 @@ impl Desktop {
             if phase != "press" && phase != "hover" {
                 if let Target::Move(ref key) = c.target {
                     self.update_grab(source, key, origin, direction);
-                    return self.pointer(Some((c.target, c.start)), phase, source);
+                    return self.pointer_button(Some((c.target, c.start)), phase, source, c.button);
                 }
                 if let Some(frame) = self.capture_frame(&c) {
                     if let Some((xy, distance)) = frame.project(origin, direction) {
                         let xy = self.hit_local(frame, xy, distance, 0., true).unwrap_or(xy);
-                        return self.pointer(Some((c.target, xy)), phase, source);
+                        return self.pointer_button(Some((c.target, xy)), phase, source, c.button);
                     }
                 }
                 // Even if the ray no longer intersects, release the actual
                 // capture owner; never redirect a release to a different node.
-                return self.pointer(Some((c.target, [-1., -1.])), phase, source);
+                return self.pointer_button(Some((c.target, [-1., -1.])), phase, source, c.button);
             }
         }
         let pick = self.nearest_ray_pick(origin, direction);
         let grab_point = pick
             .as_ref()
             .map(|p| (p.distance, add(origin, scale(direction, p.distance))));
-        let (hit, hover_companion) = pick
+        let (mut hit, hover_companion) = pick
             .map(|p| (p.target.map(|t| (t, p.xy)), p.companion))
             .unwrap_or((None, None));
+        if phase == "press" {
+            let key = hit.as_ref().and_then(|(t, _)| self.target_surface(t));
+            let join_grab = key.as_ref().is_some_and(|k| {
+                self.captures
+                    .values()
+                    .any(|c| matches!(&c.target, Target::Move(other) if other == k))
+            });
+            if squeeze || (button == 272 && join_grab) {
+                hit = hit.and_then(|(target, xy)| {
+                    self.grabbable_window(&target)
+                        .map(|k| (Target::Move(k), xy))
+                });
+            } else if button != 272 {
+                hit = hit.filter(|(t, _)| self.target_surface(t).is_some());
+            }
+        }
         if phase == "hover" {
             if let Some(k) = self.expanded_orb.clone() {
                 let within = self.companion_frame(&k, "orb").is_some_and(|f| {
@@ -1055,7 +1258,15 @@ impl Desktop {
                 self.dirty = true;
             }
         }
-        self.pointer(hit, phase, source)?;
+        if phase == "press"
+            && hit
+                .as_ref()
+                .and_then(|(t, _)| self.target_surface(t))
+                .is_none()
+        {
+            self.last_clicks.remove(source);
+        }
+        self.pointer_button(hit, phase, source, button)?;
         if phase == "press" {
             if let Some((distance, point)) = grab_point {
                 let key = self.captures.get(source).and_then(|c| {

@@ -11,18 +11,21 @@ const SOURCES: [&str; 2] = ["controller_ray:left", "controller_ray:right"];
 #[derive(Clone, Copy, Default)]
 pub struct HandState {
     pub controls_active: bool,
+    pub channel_active: [bool; 4],
     pub grip: Option<xr::Posef>,
     pub aim: Option<xr::Posef>,
     pub select: bool,
     pub trigger: f32,
     pub squeeze: f32,
     pub menu: bool,
+    pub secondary: bool,
+    pub thumb_click: bool,
     pub stick: [f32; 2],
 }
 
 #[derive(Default)]
 struct Observation {
-    buttons: [bool; 4],
+    buttons: [bool; 6],
     state: Option<HandState>,
     logged: Option<Instant>,
 }
@@ -31,7 +34,8 @@ struct Observation {
 struct Ray {
     origin: [f32; 3],
     direction: [f32; 3],
-    pressed: bool,
+    channel: usize,
+    phase: &'static str,
 }
 
 impl HandState {
@@ -64,12 +68,16 @@ pub struct Input {
     squeeze: xr::Action<f32>,
     menu: xr::Action<bool>,
     back: xr::Action<bool>,
+    secondary: xr::Action<bool>,
+    thumb_click: xr::Action<bool>,
+    trigger_click: xr::Action<bool>,
+    squeeze_click: xr::Action<bool>,
     stick: xr::Action<xr::Vector2f>,
     spaces: [xr::Space; 2],
     grip_spaces: [xr::Space; 2],
     hands: [xr::Path; 2],
     pressed: [bool; 2],
-    require_release: [bool; 2],
+    gates: [ButtonGate; 2],
     haptic: xr::Action<xr::Haptic>,
     last_hover: [Option<String>; 2],
     controllers: [HandState; 2],
@@ -111,6 +119,11 @@ impl Input {
         let menu = set.create_action::<bool>("menu", "Application menu", &hands)?;
         let haptic = set.create_action::<xr::Haptic>("feedback", "Spatial feedback", &hands)?;
         let back = set.create_action::<bool>("back", "Back", &hands)?;
+        let secondary = set.create_action::<bool>("secondary", "Secondary click", &hands)?;
+        let thumb_click = set.create_action::<bool>("thumb_click", "Middle click", &hands)?;
+        let trigger_click =
+            set.create_action::<bool>("trigger_click", "Digital trigger", &hands)?;
+        let squeeze_click = set.create_action::<bool>("squeeze_click", "Digital grip", &hands)?;
         let stick = set.create_action::<xr::Vector2f>("scroll", "Scroll", &hands)?;
         eprintln!("XR_INIT_STAGE=input-action-select STATUS=begin");
         let select = set
@@ -135,6 +148,11 @@ impl Input {
             ),
             (
                 "/interaction_profiles/oculus/touch_controller",
+                "trigger/value",
+                true,
+            ),
+            (
+                "/interaction_profiles/valve/index_controller",
                 "trigger/value",
                 true,
             ),
@@ -164,24 +182,41 @@ impl Input {
                     .with_context(|| format!("xrStringToPath({button_path})"))?;
                 if profile == "/interaction_profiles/khr/simple_controller"
                     || profile == "/interaction_profiles/htc/vive_controller"
-                    || hand == "left"
+                    || (profile == "/interaction_profiles/oculus/touch_controller"
+                        && hand == "left")
                 {
                     let path = format!("/user/hand/{hand}/input/menu/click");
                     bindings.push(xr::Binding::new(&menu, instance.string_to_path(&path)?));
                 }
-                if profile == "/interaction_profiles/oculus/touch_controller" {
+                if [
+                    "/interaction_profiles/oculus/touch_controller",
+                    "/interaction_profiles/valve/index_controller",
+                ]
+                .contains(&profile)
+                {
                     let select_path = format!(
                         "/user/hand/{hand}/input/{}/click",
-                        if hand == "left" { "x" } else { "a" }
+                        if hand == "left"
+                            && profile == "/interaction_profiles/oculus/touch_controller"
+                        {
+                            "x"
+                        } else {
+                            "a"
+                        }
                     );
                     bindings.push(xr::Binding::new(
-                        &select,
+                        &secondary,
                         instance.string_to_path(&select_path)?,
                     ));
                     let squeeze_path = format!("/user/hand/{hand}/input/squeeze/value");
                     bindings.push(xr::Binding::new(
                         &squeeze,
                         instance.string_to_path(&squeeze_path)?,
+                    ));
+                    bindings.push(xr::Binding::new(
+                        &thumb_click,
+                        instance
+                            .string_to_path(&format!("/user/hand/{hand}/input/thumbstick/click"))?,
                     ));
                     let stick_path = format!("/user/hand/{hand}/input/thumbstick");
                     bindings.push(xr::Binding::new(
@@ -190,13 +225,29 @@ impl Input {
                     ));
                     let back_path = format!(
                         "/user/hand/{hand}/input/{}/click",
-                        if hand == "left" { "y" } else { "b" }
+                        if hand == "left"
+                            && profile == "/interaction_profiles/oculus/touch_controller"
+                        {
+                            "y"
+                        } else {
+                            "b"
+                        }
                     );
                     bindings.push(xr::Binding::new(
                         &back,
                         instance.string_to_path(&back_path)?,
                     ));
                 } else if profile == "/interaction_profiles/htc/vive_controller" {
+                    bindings.push(xr::Binding::new(
+                        &secondary,
+                        instance
+                            .string_to_path(&format!("/user/hand/{hand}/input/trackpad/click"))?,
+                    ));
+                    bindings.push(xr::Binding::new(
+                        &squeeze_click,
+                        instance
+                            .string_to_path(&format!("/user/hand/{hand}/input/squeeze/click"))?,
+                    ));
                     let stick_path = format!("/user/hand/{hand}/input/trackpad");
                     bindings.push(xr::Binding::new(
                         &stick,
@@ -205,8 +256,10 @@ impl Input {
                 }
                 if float {
                     bindings.push(xr::Binding::new(&trigger, path));
-                } else {
+                } else if profile == "/interaction_profiles/khr/simple_controller" {
                     bindings.push(xr::Binding::new(&select, path));
+                } else {
+                    bindings.push(xr::Binding::new(&trigger_click, path));
                 }
             }
             let profile_path = instance
@@ -249,12 +302,16 @@ impl Input {
             squeeze,
             menu,
             back,
+            secondary,
+            thumb_click,
+            trigger_click,
+            squeeze_click,
             stick,
             spaces,
             grip_spaces,
             hands,
             pressed: [false; 2],
-            require_release: [false; 2],
+            gates: std::array::from_fn(|_| ButtonGate::default()),
             haptic,
             last_hover: [None, None],
             controllers: [HandState::default(); 2],
@@ -314,6 +371,10 @@ impl Input {
         let menu = self.menu.state(session, path)?;
         let back = self.back.state(session, path)?;
         let stick = self.stick.state(session, path)?;
+        let secondary = self.secondary.state(session, path)?;
+        let thumb_click = self.thumb_click.state(session, path)?;
+        let trigger_click = self.trigger_click.state(session, path)?;
+        let squeeze_click = self.squeeze_click.state(session, path)?;
         let scalar = |active: bool, value: f32| {
             if active && value.is_finite() {
                 value.clamp(0., 1.)
@@ -322,12 +383,22 @@ impl Input {
             }
         };
         Ok(HandState {
+            channel_active: [
+                select.is_active || trigger.is_active || trigger_click.is_active,
+                squeeze.is_active || squeeze_click.is_active,
+                secondary.is_active,
+                thumb_click.is_active,
+            ],
             controls_active: select.is_active
                 || trigger.is_active
                 || squeeze.is_active
                 || menu.is_active
                 || back.is_active
-                || stick.is_active,
+                || stick.is_active
+                || secondary.is_active
+                || thumb_click.is_active
+                || trigger_click.is_active
+                || squeeze_click.is_active,
             grip: Self::pose(
                 &self.grip,
                 &self.grip_spaces[hand],
@@ -338,8 +409,18 @@ impl Input {
             )?,
             aim: Self::pose(&self.aim, &self.spaces[hand], path, session, base, time)?,
             select: select.is_active && select.current_state,
-            trigger: scalar(trigger.is_active, trigger.current_state),
-            squeeze: scalar(squeeze.is_active, squeeze.current_state),
+            trigger: if trigger_click.is_active && trigger_click.current_state {
+                1.
+            } else {
+                scalar(trigger.is_active, trigger.current_state)
+            },
+            squeeze: if squeeze_click.is_active && squeeze_click.current_state {
+                1.
+            } else {
+                scalar(squeeze.is_active, squeeze.current_state)
+            },
+            secondary: secondary.is_active && secondary.current_state,
+            thumb_click: thumb_click.is_active && thumb_click.current_state,
             menu: (menu.is_active && menu.current_state) || (back.is_active && back.current_state),
             stick: if stick.is_active
                 && stick.current_state.x.is_finite()
@@ -362,7 +443,7 @@ impl Input {
         self.menu_pressed[hand] = false;
         self.require_menu_release[hand] = true;
         // A held trigger after tracking/focus loss must not become a new press.
-        self.require_release[hand] = true;
+        self.gates[hand].cancel();
     }
 
     pub fn cancel_for_recenter(&mut self, desktop: &mut Desktop) {
@@ -400,9 +481,11 @@ impl Input {
             let state = self.controllers[hand];
             let buttons = [
                 state.select,
-                state.trigger > 0.5,
-                state.squeeze > 0.5,
+                self.gates[hand].latched[0],
+                self.gates[hand].latched[1],
                 state.menu,
+                state.secondary,
+                state.thumb_click,
             ];
             let observation = &mut self.observations[hand];
             let edge = observation.buttons != buttons;
@@ -436,12 +519,13 @@ impl Input {
                         "controls_active": state.controls_active,
                         "grip_valid": state.grip.is_some(), "aim_valid": state.aim.is_some(),
                         "select": state.select, "trigger": state.trigger, "squeeze": state.squeeze,
+                        "secondary": state.secondary, "thumb_click": state.thumb_click,
                         "menu": state.menu, "stick": state.stick,
                         "route_phase": self.routes[hand], "route_completed": self.route_ok[hand],
                         "back_routed": self.back_routed[hand], "capture_cancelled": self.cancelled[hand],
                         "scroll_delta": self.scroll_delta[hand], "scroll_completed": self.scroll_ok[hand],
                         "captured": desktop.has_pointer_capture(SOURCES[hand]),
-                        "require_release": self.require_release[hand]
+                        "require_release": self.gates[hand].blocked
                     })
                 );
                 observation.state = Some(state);
@@ -474,10 +558,8 @@ impl Input {
             return Err(error.into());
         }
 
-        let mut previous = self.pressed;
         let mut menu_cancelled = false;
         let mut rays = [None; 2];
-        let mut new_press = [false; 2];
         // Read BOTH subaction paths even during a capture. Ignored presses from
         // the other hand must not be replayed when the current owner releases.
         for hand in 0..2 {
@@ -512,21 +594,36 @@ impl Input {
                 menu_cancelled = true;
             }
             self.menu_pressed[hand] = menu;
-            let pressed = state.select || state.trigger > 0.5;
-            if self.require_release[hand] {
-                self.pressed[hand] = false;
-                if pressed {
-                    continue;
-                }
-                self.require_release[hand] = false;
-                previous[hand] = false;
+            if !state.controls_active {
+                self.cancel_hand(hand, desktop, "controller controls inactive");
+                continue;
             }
-            self.pressed[hand] = pressed;
-            new_press[hand] = pressed && !previous[hand];
+            if self.gates[hand]
+                .owner
+                .is_some_and(|i| !state.channel_active[i])
+            {
+                self.cancel_hand(hand, desktop, "captured action inactive");
+                continue;
+            }
+            let values = [
+                if state.select { 1. } else { state.trigger },
+                state.squeeze,
+                if state.secondary { 1. } else { 0. },
+                if state.thumb_click { 1. } else { 0. },
+            ];
+            let (channel, phase) = self.gates[hand].sample(std::array::from_fn(|i| {
+                if state.channel_active[i] {
+                    values[i]
+                } else {
+                    f32::NAN
+                }
+            }));
+            self.pressed[hand] = self.gates[hand].latched[0];
             rays[hand] = Some(Ray {
                 origin,
                 direction,
-                pressed,
+                channel,
+                phase,
             });
         }
 
@@ -535,7 +632,9 @@ impl Input {
             // pending ray in this frame and clear accepted press history, so a
             // cancelled drag cannot emit a synthetic release or resume held.
             self.pressed = [false; 2];
-            self.require_release = [true; 2];
+            for gate in &mut self.gates {
+                gate.cancel();
+            }
             return Ok(());
         }
 
@@ -543,28 +642,26 @@ impl Input {
             let Some(ray) = rays[hand] else {
                 continue;
             };
-            let phase = if new_press[hand] {
-                "press"
-            } else if !ray.pressed && previous[hand] {
-                "release"
-            } else if ray.pressed {
-                "drag"
-            } else {
-                "hover"
-            };
-            let stick = self.controllers[hand].stick;
-            let axis = |v: f32| {
-                if v.abs() <= 0.18 {
-                    0.
-                } else {
-                    v.signum() * (v.abs() - 0.18) / 0.82
-                }
-            };
+            let phase = ray.phase;
+            let stick = stick_curve(self.controllers[hand].stick);
             // Depth takes priority only for this hand's actual grab.
-            let grabbing = desktop.grab_depth(SOURCES[hand], -axis(stick[1]) * dt);
+            let grabbing = desktop.grab_depth(SOURCES[hand], -stick[1] * 1.2 * dt);
             self.routes[hand] = phase;
             let had_capture = desktop.has_pointer_capture(SOURCES[hand]);
-            let result = desktop.ray(ray.origin, ray.direction, phase, SOURCES[hand]);
+            let result = if ray.channel == 1 {
+                desktop.ray_squeeze(ray.origin, ray.direction, phase, SOURCES[hand])
+            } else {
+                let button = match ray.channel {
+                    2 => 273,
+                    3 => 274,
+                    _ => 272,
+                };
+                if button == 272 {
+                    desktop.ray(ray.origin, ray.direction, phase, SOURCES[hand])
+                } else {
+                    desktop.ray_button(ray.origin, ray.direction, phase, SOURCES[hand], button)
+                }
+            };
             self.route_ok[hand] = result.is_ok();
             if let Err(error) = result {
                 eprintln!("XR_INPUT_ROUTE={} {error:#}", SOURCES[hand]);
@@ -572,7 +669,13 @@ impl Input {
             let hover = desktop.pointer_target(SOURCES[hand], ray.origin, ray.direction);
             let accepted = desktop.has_pointer_capture(SOURCES[hand]);
             let pulse = if phase == "press" && accepted {
-                Some((0.45, 18))
+                Some(if ray.channel == 1 {
+                    (0.55, 22)
+                } else if ray.channel == 2 {
+                    (0.45, 18)
+                } else {
+                    (0.35, 12)
+                })
             } else if phase == "release" && had_capture {
                 Some((0.25, 10))
             } else if hover.is_some() && hover != self.last_hover[hand] {
@@ -596,10 +699,28 @@ impl Input {
                 }
             }
             self.last_hover[hand] = hover;
-            let scroll = [axis(stick[0]) * 600. * dt, -axis(stick[1]) * 600. * dt];
+            let scroll = [stick[0] * 600. * dt, -stick[1] * 600. * dt];
             if !grabbing && scroll != [0., 0.] {
                 self.scroll_delta[hand] = scroll;
-                let result = desktop.controller_scroll(scroll);
+                let result = desktop
+                    .controller_page_at(
+                        SOURCES[hand],
+                        ray.origin,
+                        ray.direction,
+                        self.controllers[hand].stick,
+                    )
+                    .and_then(|handled| {
+                        if handled {
+                            Ok(())
+                        } else {
+                            desktop.controller_scroll_at(
+                                SOURCES[hand],
+                                ray.origin,
+                                ray.direction,
+                                scroll,
+                            )
+                        }
+                    });
                 self.scroll_ok[hand] = result.is_ok();
                 if let Err(error) = result {
                     eprintln!("XR_INPUT_SCROLL={} {error:#}", SOURCES[hand]);
@@ -607,5 +728,117 @@ impl Input {
             }
         }
         Ok(())
+    }
+}
+
+/// Each hand owns one interaction at a time. Consume other button edges even
+/// when refused, so releasing the owner never replays a held secondary press.
+struct ButtonGate {
+    latched: [bool; 4],
+    blocked: [bool; 4],
+    owner: Option<usize>,
+}
+impl Default for ButtonGate {
+    fn default() -> Self {
+        Self {
+            latched: [false; 4],
+            blocked: [true; 4],
+            owner: None,
+        }
+    }
+}
+impl ButtonGate {
+    fn cancel(&mut self) {
+        self.latched = [false; 4];
+        self.blocked = [true; 4];
+        self.owner = None;
+    }
+    fn sample(&mut self, values: [f32; 4]) -> (usize, &'static str) {
+        let previous = self.latched;
+        for (i, value) in values.into_iter().enumerate() {
+            if !value.is_finite() {
+                self.latched[i] = false;
+                self.blocked[i] = true;
+                continue;
+            }
+            if self.blocked[i] {
+                if value.is_finite() && value <= 0.35 {
+                    self.blocked[i] = false;
+                }
+                self.latched[i] = false;
+            } else {
+                let press = [0.65, 0.60, 0.5, 0.5][i];
+                if !value.is_finite() || value <= 0.35 {
+                    self.latched[i] = false;
+                } else if value >= press {
+                    self.latched[i] = true;
+                }
+            }
+        }
+        if let Some(i) = self.owner {
+            if !self.latched[i] {
+                self.owner = None;
+                return (i, "release");
+            }
+            return (i, "drag");
+        }
+        for i in [1, 0, 2, 3] {
+            if self.latched[i] && !previous[i] {
+                self.owner = Some(i);
+                return (i, "press");
+            }
+        }
+        (0, "hover")
+    }
+}
+fn stick_curve(v: [f32; 2]) -> [f32; 2] {
+    if !v.iter().all(|v| v.is_finite()) {
+        return [0.; 2];
+    }
+    let radius = v[0].hypot(v[1]);
+    if radius <= 0.18 {
+        return [0.; 2];
+    }
+    let n = (radius.min(1.) - 0.18) / 0.82;
+    let gain = (0.35 * n + 0.65 * n * n) / radius;
+    v.map(|x| x * gain)
+}
+
+#[cfg(test)]
+mod interaction_tests {
+    use super::*;
+    #[test]
+    fn chatter_squeeze_priority_and_held_buttons_never_replay() {
+        let mut gate = ButtonGate::default();
+        assert_eq!(gate.sample([1., 0., 0., 0.]).1, "hover"); // startup held
+        gate.sample([0.; 4]);
+        for v in [0.45, 0.55, 0.64, 0.50] {
+            assert_eq!(gate.sample([v, 0., 0., 0.]).1, "hover");
+        }
+        assert_eq!(gate.sample([0.65, 0., 0., 0.]), (0, "press"));
+        for v in [0.64, 0.50, 0.36] {
+            assert_eq!(gate.sample([v, 0., 0., 0.]), (0, "drag"));
+        }
+        assert_eq!(gate.sample([0.35, 0., 1., 0.]), (0, "release"));
+        assert_eq!(gate.sample([0., 0., 1., 0.]).1, "hover"); // refused secondary not replayed
+        gate.sample([0.; 4]);
+        assert_eq!(gate.sample([0.8, 0.6, 0., 0.]), (1, "press"));
+        assert_eq!(gate.sample([0.8, 0.35, 0., 0.]), (1, "release"));
+        assert_eq!(gate.sample([0.8, 0., 0., 0.]).1, "hover");
+        gate.cancel();
+        assert_eq!(gate.sample([0.5, 0., 1., 1.]).1, "hover");
+        gate.sample([0.; 4]);
+        assert_eq!(gate.sample([0., 0., 0., 1.]), (3, "press"));
+        gate.cancel();
+        assert_eq!(gate.sample([0., 0., 0., 1.]).1, "hover");
+    }
+    #[test]
+    fn radial_stick_deadzone_finite_and_precision() {
+        assert_eq!(stick_curve([0.1, 0.1]), [0.; 2]);
+        assert_eq!(stick_curve([f32::NAN, 0.]), [0.; 2]);
+        let diagonal = stick_curve([1., 1.]);
+        assert!((diagonal[0].hypot(diagonal[1]) - 1.).abs() < 1e-6);
+        assert!(stick_curve([0.5, 0.])[0] < 0.4);
+        assert_eq!(stick_curve([1., 0.]), [1., 0.]);
     }
 }

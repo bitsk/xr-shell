@@ -223,26 +223,44 @@ Snapshots expose `taskbar_mode`; window/world-locked panel policies are unchange
 ## Controller input
 
 Shell reads both hands through OpenXR actions, using the runtime's current
-interaction profile. KHR simple and Vive select buttons, Touch A/X clicks and trigger
-values route the same ray press/drag/release path. Grip and aim are separate pose
-actions at the predicted display time; models use the grip pose, while pointer
-hit testing uses aim. Invalid, non-finite or inactive poses are omitted every
-frame. Pose freshness and the original hardware packet validity gates remain
-the runtime's responsibility.
+interaction profile. KHR simple select and Vive digital trigger remain primary
+clicks. Touch/Index analog trigger uses 0.65 press / 0.35 release hysteresis;
+grip uses 0.60 / 0.35. A/X (Index A, Vive trackpad click) is secondary/right
+button 273; thumbstick click is middle button 274. Trigger is left button 272.
 
-Touch thumbsticks (or Vive trackpads) scroll the focused application with a
-0.18 dead zone and elapsed-time scaling. Left menu and left Y/right B send a
-back action: release capture, then an Escape press/release to the acknowledged
-focused application. SteamVR may reserve its system key, so the application
-back binding does not depend on that key. Grip pressure is exposed in the
-controller state without assigning it an arbitrary desktop action.
+Grip over a toplevel window, embedded SurfaceReference or grab/orb companion
+starts spatial movement without sending a client mouse click. A second hand
+can join the grab to scale, including a trigger press on an already grabbed
+window. Cancellation restores the initial transform; normal release commits
+any bimanual application resize. Simultaneous grip wins over trigger. Each hand
+owns one interaction until release; refused held buttons never replay later.
 
-Input is routed only while the XR session is FOCUSED. Focus loss, invalid aim
-or a failed action query cancels the affected pointer; a held trigger/menu must
-be released before it can issue a new press after recovery. Both hands are
-sampled even when one owns a drag. The active capture remains authoritative;
-other-hand presses are not replayed when it releases. Physical controller
-motion, button mappings and grip/aim alignment require device acceptance.
+Spatial repeated clicks on the same surface and button within 40–420 ms snap
+to the first press coordinates when the ray differs by at most 1.5 degrees OR
+the local displacement is at most 24 pixels. The matching release stays fixed;
+a drag beyond 24 pixels resumes movement and cannot seed another click pair.
+Focus loss, cancellation, another target/button and surface size changes break
+the pair. Client double-click timing/settings still determine application behavior.
+
+The stick uses a radial 0.18 deadzone and quadratic precision response. Scroll
+prefers the hovered surface, applying its focus and pointer position before the
+scroll event; empty space falls back to keyboard focus. Occluding UI consumes
+the ray. Existing launcher/Wi-Fi paging controls use 0.65 raw deflection with a
+280 ms per-hand cooldown. A live surface capture prevents another hand from
+stealing the legacy seat. While grabbing, Y changes reach at up to 1.2 m/s;
+the window remains within the existing 0.6–4.0 m eye-distance bounds.
+
+Button identity is retained while waiting for FocusApplied and during cancel.
+Releasing before focus acknowledgement drops the pending click without sending
+an orphan release. Pose/action loss, recenter, back and session focus loss
+cancel the capture; held controls must return below release threshold before
+reactivation. Tracking validity and OEM grip/aim/model transforms are unchanged.
+
+With the existing debug guard, ray requests accept `button: 273` or `274`,
+`squeeze: true`, or `scroll: [dx, dy]`. These call the production routing paths;
+they do not inject a valid hardware pose. Optional trigger hold-to-right-click,
+companion double-click shortcuts and stick-click distance reset remain separate
+follow-ups; this implementation retains immediate trigger drag behavior.
 
 ## Original controller models
 

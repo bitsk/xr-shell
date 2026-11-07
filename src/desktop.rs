@@ -147,6 +147,9 @@ struct Bimanual {
 }
 #[derive(Clone)]
 struct Capture {
+    button: u32,
+    button_sent: bool,
+    click: Option<SurfacePress>,
     target: Target,
     /// Real application surface bound at press, even when a UI node embeds it.
     surface: Option<String>,
@@ -200,6 +203,10 @@ pub struct Desktop {
     dirty: bool,
     state_dirty: bool,
     pending_pointer: Option<Value>,
+    pending_scroll: Option<Value>,
+    last_clicks: BTreeMap<String, SurfaceClick>,
+    last_page: BTreeMap<String, Instant>,
+    pointer_ray: Option<[f32; 3]>,
     pub focused: bool,
     pub controller_visuals: u8,
     pub spatial_fast_path: bool,
@@ -308,6 +315,10 @@ impl Desktop {
             dirty: true,
             state_dirty: false,
             pending_pointer: None,
+            pending_scroll: None,
+            last_clicks: BTreeMap::new(),
+            last_page: BTreeMap::new(),
+            pointer_ray: None,
             focused: false,
             taskbar_follow: Default::default(),
             ui_offset: [0.; 3],
@@ -1194,16 +1205,7 @@ impl Desktop {
                     "wrong focus owner"
                 );
                 self.focus_applied = payload["success"].as_bool().unwrap_or(false);
-                if self.focus_applied {
-                    if let Some(press) = self.pending_pointer.take() {
-                        self.surface_input(
-                            json!({"kind":"pointer_motion","x":press["x"],"y":press["y"]}),
-                        )?;
-                        self.surface_input(
-                            json!({"kind":"pointer_button","button":272,"pressed":true}),
-                        )?;
-                    }
-                }
+                self.flush_pending_surface_input()?;
                 self.changed();
             }
             "ComponentIntent" => {
@@ -1321,6 +1323,30 @@ impl Desktop {
         Ok(())
     }
     fn remove_window(&mut self, k: &str) {
+        // A client popup can temporarily own the Wayland keyboard grab without
+        // changing Shell's focused toplevel. Reassert that owner on destruction.
+        // Keep the epoch: the ordered seat stream must still accept an Escape
+        // release or an in-flight pointer release while restoring the same owner.
+        let mut parent = self.windows.get(k).filter(|w| w.state["role"] == "popup");
+        let mut restore_focus = false;
+        let mut seen = BTreeSet::new();
+        while let Some(w) = parent {
+            let Some(id) = w.state["parent_surface_id"].as_str() else {
+                break;
+            };
+            let Some(generation) = w.state["window_server_generation"].as_str() else {
+                break;
+            };
+            let key = format!("{generation}:{id}");
+            if !seen.insert(key.clone()) {
+                break;
+            }
+            if self.focus.as_ref() == Some(&key) {
+                restore_focus = true;
+                break;
+            }
+            parent = self.windows.get(&key);
+        }
         let sources: Vec<_> = self
             .captures
             .iter()
@@ -1337,12 +1363,26 @@ impl Desktop {
         if self.windows.remove(k).is_some() {
             self.changed();
         }
+        if restore_focus {
+            if let Some(w) = self.focus.as_ref().and_then(|k| self.windows.get(k)) {
+                let _ = self.to_role(
+                    "window_server",
+                    "FocusChanged",
+                    json!({
+                        "focus_epoch":self.focus_epoch.to_string(),
+                        "surface_id":w.state["surface_id"],
+                        "window_server_generation":w.state["window_server_generation"]
+                    }),
+                );
+            }
+        }
     }
     fn set_focus(&mut self, k: Option<String>) -> Result<()> {
         if self.focus == k && self.focus_applied {
             return Ok(());
         }
         if self.focus != k {
+            self.last_clicks.clear();
             let sources: Vec<_> = self
                 .captures
                 .iter()
@@ -1358,6 +1398,7 @@ impl Desktop {
                 w.minimized = false;
             }
         }
+        self.pending_scroll = None;
         self.focus = k;
         self.focus_applied = false;
         self.pending_pointer = None;
@@ -1447,6 +1488,7 @@ impl Desktop {
     }
     pub fn cancel_pointer(&mut self, source: &str, reason: &str) {
         self.cancel_source(source, reason);
+        self.last_clicks.remove(source);
         self.hovers.remove(source);
         self.companion_hovers.remove(source);
     }
@@ -1457,14 +1499,6 @@ impl Desktop {
         if self.focus.is_some() && self.focus_applied {
             self.surface_input(json!({"kind":"key","keycode":1,"pressed":true}))?;
             self.surface_input(json!({"kind":"key","keycode":1,"pressed":false}))?;
-        }
-        Ok(())
-    }
-    pub fn controller_scroll(&mut self, delta: [f32; 2]) -> Result<()> {
-        ensure!(self.focused, "XR session not focused");
-        ensure!(delta.iter().all(|v| v.is_finite()), "invalid scroll delta");
-        if self.focus.is_some() && self.focus_applied {
-            self.surface_input(json!({"kind":"scroll","dx":delta[0],"dy":delta[1]}))?;
         }
         Ok(())
     }
@@ -1487,14 +1521,38 @@ impl Desktop {
         }
     }
     fn cancel(&mut self, reason: &str) {
+        self.last_clicks.clear();
+        self.pending_scroll = None;
+        let mut originals = BTreeMap::new();
+        let mut grabs: Vec<_> = self
+            .captures
+            .values()
+            .filter(|c| matches!(c.target, Target::Move(_)))
+            .collect();
+        grabs.sort_by_key(|c| c.id.parse::<u64>().unwrap_or(0));
+        for c in grabs {
+            if let Target::Move(k) = &c.target {
+                originals
+                    .entry(k.clone())
+                    .or_insert((c.position, c.size, c.resize_rotation));
+            }
+        }
         let sources: Vec<_> = self.captures.keys().cloned().collect();
         for source in sources {
             self.cancel_source(&source, reason);
+        }
+        for (k, (position, size, rotation)) in originals {
+            if let Some(w) = self.windows.get_mut(&k) {
+                w.position = position;
+                w.size = size;
+                w.rotation = rotation;
+            }
         }
         self.hovers.clear();
         self.companion_hovers.clear();
     }
     fn cancel_source(&mut self, source: &str, reason: &str) {
+        self.last_clicks.remove(source);
         if let Some(c) = self.captures.remove(source) {
             if c.surface.is_some() {
                 self.pending_pointer = None;
@@ -1509,6 +1567,11 @@ impl Desktop {
                 }
             }
             if let Target::Move(key) = &c.target {
+                if let Some(w) = self.windows.get_mut(key) {
+                    w.position = c.position;
+                    w.size = c.size;
+                    w.rotation = c.resize_rotation;
+                }
                 let _ = self.finish_grab(key, false);
             }
             self.release_capture_surface(&c);
@@ -1522,9 +1585,14 @@ impl Desktop {
         }
     }
     fn release_capture_surface(&self, capture: &Capture) {
-        if capture.surface.is_some() && capture.surface == self.focus && self.focus_applied {
-            let _ =
-                self.surface_input(json!({"kind":"pointer_button","button":272,"pressed":false}));
+        if capture.button_sent
+            && capture.surface.is_some()
+            && capture.surface == self.focus
+            && self.focus_applied
+        {
+            let _ = self.surface_input(
+                json!({"kind":"pointer_button","button":capture.button,"pressed":false}),
+            );
         }
     }
     fn node_rect(p: &Peer, node: &Node) -> [f32; 4] {
@@ -1678,12 +1746,16 @@ impl Desktop {
                     );
                     self.grab_depth(source, delta as f32);
                 }
-                self.ray(
-                    origin,
-                    direction,
-                    payload["phase"].as_str().context("phase missing")?,
-                    source,
-                )
+                let phase = payload["phase"].as_str().context("phase missing")?;
+                if payload["squeeze"].as_bool().unwrap_or(false) {
+                    self.ray_squeeze(origin, direction, phase, source)
+                } else if let Some(delta) = payload.get("scroll") {
+                    self.controller_scroll_at(source, origin, direction, vector::<2>(delta)?)
+                } else {
+                    let button = payload["button"].as_u64().unwrap_or(272);
+                    ensure!([272, 273, 274].contains(&button), "invalid mouse button");
+                    self.ray_button(origin, direction, phase, source, button as u32)
+                }
             }
             "focus_lost" => {
                 self.set_xr_focus(false);
@@ -1735,6 +1807,19 @@ impl Desktop {
         phase: &str,
         source: &str,
     ) -> Result<()> {
+        self.pointer_button(hit, phase, source, 272)
+    }
+    fn pointer_button(
+        &mut self,
+        hit: Option<(Target, [f32; 2])>,
+        phase: &str,
+        source: &str,
+        button: u32,
+    ) -> Result<()> {
+        ensure!(
+            [272, 273, 274].contains(&button),
+            "unsupported mouse button"
+        );
         ensure!(
             ["hover", "press", "drag", "release"].contains(&phase),
             "unknown pointer phase"
@@ -1785,9 +1870,12 @@ impl Desktop {
                 self.captures.insert(
                     source.into(),
                     Capture {
+                        button,
+                        button_sent: false,
+                        click: None,
                         grab: None,
                         resize_rotation: match target {
-                            Target::Resize(k, _) => self.windows[k].rotation,
+                            Target::Resize(k, _) | Target::Move(k) => self.windows[k].rotation,
                             _ => [0.; 3],
                         },
                         target: target.clone(),
@@ -1799,11 +1887,13 @@ impl Desktop {
                             _ => None,
                         },
                         size: match target {
-                            Target::Resize(k, _) => self.windows[k].size,
+                            Target::Resize(k, _) | Target::Move(k) => self.windows[k].size,
                             _ => [0.; 2],
                         },
                         logical: match target {
-                            Target::Resize(k, _) => Self::logical(&self.windows[k]),
+                            Target::Resize(k, _) | Target::Move(k) => {
+                                Self::logical(&self.windows[k])
+                            }
                             _ => [0.; 2],
                         },
                         surface,
@@ -1849,7 +1939,7 @@ impl Desktop {
                             .iter()
                             .any(|(owner, c)| owner != source && c.surface.is_some())
                         {
-                            self.pointer_surface(&key, local, phase)?;
+                            self.pointer_surface(&key, local, phase, source, button)?;
                         }
                     } else {
                         self.emit_node(id, &n, phase, xy, source)?;
@@ -1861,7 +1951,7 @@ impl Desktop {
                         .iter()
                         .any(|(owner, c)| owner != source && c.surface.is_some())
                     {
-                        self.pointer_surface(&k, xy, phase)?;
+                        self.pointer_surface(&k, xy, phase, source, button)?;
                     }
                 }
                 Target::Orb(k) => {
@@ -1965,23 +2055,6 @@ impl Desktop {
         }
         if phase != "hover" {
             self.dirty = true;
-        }
-        Ok(())
-    }
-    fn pointer_surface(&mut self, key: &str, local: [f32; 2], phase: &str) -> Result<()> {
-        if phase == "press" {
-            self.set_focus(Some(key.to_owned()))?;
-            if !self.focus_applied {
-                self.pending_pointer = Some(json!({"x":local[0],"y":local[1]}));
-            }
-        }
-        if self.focus.as_deref() == Some(key) && self.focus_applied {
-            self.surface_input(json!({"kind":"pointer_motion","x":local[0],"y":local[1]}))?;
-            if phase == "press" || phase == "release" {
-                self.surface_input(
-                    json!({"kind":"pointer_button","button":272,"pressed":phase=="press"}),
-                )?;
-            }
         }
         Ok(())
     }
@@ -2171,3 +2244,7 @@ pub(crate) mod spatial_ui;
 #[cfg(test)]
 #[path = "taskbar_follow_test.rs"]
 mod taskbar_follow_test;
+
+#[path = "surface_interaction.rs"]
+mod surface_interaction;
+use surface_interaction::{SurfaceClick, SurfacePress};

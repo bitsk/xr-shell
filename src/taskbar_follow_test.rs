@@ -99,6 +99,9 @@ fn hover_reuses_other_rasters_without_freezing_text_or_window_updates() {
     d.captures.insert(
         "regression".into(),
         Capture {
+            button: 272,
+            button_sent: false,
+            click: None,
             target: Target::Node(1, "a".into()),
             surface: None,
             resize_frame: None,
@@ -261,6 +264,9 @@ fn islands_share_motion_capture_and_scene_refresh_without_moving_world_panels() 
     d.captures.insert(
         "regression".into(),
         Capture {
+            button: 272,
+            button_sent: false,
+            click: None,
             target: Target::Node(2, "status".into()),
             surface: None,
             resize_frame: None,
@@ -306,4 +312,247 @@ fn islands_share_motion_capture_and_scene_refresh_without_moving_world_panels() 
     close(frame(&d, 1, "center").normal(), current.normal());
     drop(d);
     std::fs::remove_dir_all(dir).unwrap();
+}
+
+fn interaction_desktop() -> Desktop {
+    let dir = std::env::temp_dir().join(format!(
+        "xr-input-regression-{}-{}",
+        std::process::id(),
+        monotonic()
+    ));
+    let mut d = Desktop::new(&dir.join("shell.sock"), true).unwrap();
+    d.ui_anchor_ready = true;
+    d.focused = true;
+    d.horizon_head = Some(([0., 1.5, 0.], [0., 0., 0., 1.]));
+    d.active_peer = Some((
+        9,
+        "window_server".into(),
+        Value::Null,
+        vec!["focus.v1".into(), "window.v1".into()],
+    ));
+    for (key, x, id) in [("test:1", 0., "1"), ("test:2", 1.2, "2")] {
+        d.windows.insert(key.into(),Window {owner:9,state:json!({"role":"toplevel","workspace":0,"width":800,"height":600,"surface_id":id,"window_server_generation":"test"}),width:800,height:600,pixels:vec![255;800*600*4],position:[x,1.5,-1.5],rotation:[0.;3],placed:true,size:[0.8,0.6],frame:1,minimized:false,curved:false});
+    }
+    d.focus = Some("test:1".into());
+    d.focus_applied = true;
+    d
+}
+fn inputs(d: &Desktop) -> Vec<Value> {
+    d.outbox
+        .borrow()
+        .iter()
+        .filter(|(_, kind, _)| kind == "SurfaceInput")
+        .map(|(_, _, p)| p.clone())
+        .collect()
+}
+#[test]
+fn popup_removal_reconciles_only_its_focused_ancestor() {
+    let mut d = interaction_desktop();
+    let mut popup = d.windows["test:1"].clone();
+    popup.state = json!({"role":"popup","surface_id":"3","parent_surface_id":"1","window_server_generation":"test"});
+    d.windows.insert("test:3".into(), popup.clone());
+    let epoch = d.focus_epoch;
+    d.remove_window("test:3");
+    assert_eq!(d.focus.as_deref(), Some("test:1"));
+    assert!(d.focus_applied);
+    assert_eq!(d.focus_epoch, epoch);
+    assert!(
+        d.outbox
+            .borrow()
+            .iter()
+            .any(|(_, kind, p)| kind == "FocusChanged" && p["surface_id"] == "1")
+    );
+    d.focus = Some("test:2".into());
+    d.focus_applied = true;
+    d.outbox.borrow_mut().clear();
+    d.windows.insert("test:3".into(), popup);
+    d.remove_window("test:3");
+    assert_eq!(d.focus_epoch, epoch);
+    assert!(d.focus_applied);
+    assert!(d.outbox.borrow().is_empty());
+}
+#[test]
+fn surface_buttons_pending_focus_cancel_and_double_click_coordinates() {
+    let mut d = interaction_desktop();
+    let source = "debug_ray:left";
+    let hit = |xy| Some((Target::Window("test:1".into()), xy));
+    for button in [272, 273, 274] {
+        d.outbox.borrow_mut().clear();
+        d.pointer_button(hit([110., 120.]), "press", source, button)
+            .unwrap();
+        d.cancel_pointer(source, "tracking lost");
+        let events = inputs(&d);
+        let buttons: Vec<_> = events
+            .iter()
+            .filter(|e| e["kind"] == "pointer_button")
+            .map(|e| {
+                (
+                    e["button"].as_u64().unwrap(),
+                    e["pressed"].as_bool().unwrap(),
+                )
+            })
+            .collect();
+        assert_eq!(buttons, vec![(button as u64, true), (button as u64, false)]);
+    }
+    // A pending right press retains its identity after asynchronous FocusApplied.
+    d.focus_applied = false;
+    d.pointer_button(hit([130., 140.]), "press", source, 273)
+        .unwrap();
+    d.outbox.borrow_mut().clear();
+    d.focus_applied = true;
+    d.flush_pending_surface_input().unwrap();
+    assert!(
+        inputs(&d)
+            .iter()
+            .any(|p| p["button"] == 273 && p["pressed"] == true)
+    );
+    d.cancel_pointer(source, "cancel");
+    // Release before focus ack must produce neither delayed press nor orphan release.
+    d.focus_applied = false;
+    d.pointer_button(hit([150., 160.]), "press", source, 274)
+        .unwrap();
+    d.pointer_button(hit([150., 160.]), "release", source, 274)
+        .unwrap();
+    d.outbox.borrow_mut().clear();
+    d.focus_applied = true;
+    d.flush_pending_surface_input().unwrap();
+    assert!(inputs(&d).is_empty());
+    d.pointer_button(hit([200., 220.]), "press", source, 272)
+        .unwrap();
+    d.pointer_button(hit([201., 220.]), "release", source, 272)
+        .unwrap();
+    d.last_clicks.get_mut(source).unwrap().at = Instant::now() - Duration::from_millis(220);
+    d.outbox.borrow_mut().clear();
+    d.pointer_button(hit([214., 220.]), "press", source, 272)
+        .unwrap();
+    d.pointer_button(hit([216., 221.]), "release", source, 272)
+        .unwrap();
+    let motions: Vec<_> = inputs(&d)
+        .into_iter()
+        .filter(|p| p["kind"] == "pointer_motion")
+        .collect();
+    assert_eq!(motions.len(), 2);
+    assert!(motions.iter().all(|p| p["x"] == 200. && p["y"] == 220.));
+    // A drag must not seed a stabilized click, and cancellation clears history.
+    d.pointer_button(hit([300., 220.]), "press", source, 272)
+        .unwrap();
+    d.pointer_button(hit([370., 220.]), "drag", source, 272)
+        .unwrap();
+    d.pointer_button(hit([370., 220.]), "release", source, 272)
+        .unwrap();
+    assert!(!d.last_clicks.contains_key(source));
+    d.pointer_button(hit([200., 220.]), "press", source, 272)
+        .unwrap();
+    d.pointer_button(hit([200., 220.]), "release", source, 272)
+        .unwrap();
+    d.set_xr_focus(false);
+    assert!(d.last_clicks.is_empty());
+}
+#[test]
+fn squeeze_moves_and_scales_without_client_click_and_hover_scroll_owns_target() {
+    let mut d = interaction_desktop();
+    let ray = [0., 0., -1.];
+    let origin = [-0.12, 1.5, 0.];
+    let initial = d.windows["test:1"].position;
+    let size = d.windows["test:1"].size;
+    d.ray_squeeze(origin, ray, "press", "debug_ray:left")
+        .unwrap();
+    assert!(matches!(
+        d.captures["debug_ray:left"].target,
+        Target::Move(_)
+    ));
+    d.ray_squeeze([0.12, 1.5, 0.], ray, "press", "debug_ray:right")
+        .unwrap();
+    assert!(d.bimanual.contains_key("test:1"));
+    d.ray_squeeze([0.25, 1.5, 0.], ray, "drag", "debug_ray:right")
+        .unwrap();
+    assert!(d.windows["test:1"].size[0] > size[0]);
+    assert!(inputs(&d).is_empty());
+    d.cancel("back");
+    assert_eq!(d.windows["test:1"].position, initial);
+    assert_eq!(d.windows["test:1"].size, size);
+    d.outbox.borrow_mut().clear();
+    d.controller_scroll_at("debug_ray:left", [1.2, 1.5, 0.], ray, [0., 12.])
+        .unwrap();
+    assert_eq!(d.focus.as_deref(), Some("test:2"));
+    assert!(inputs(&d).is_empty());
+    d.focus_applied = true;
+    d.flush_pending_surface_input().unwrap();
+    let events = inputs(&d);
+    assert!(
+        events
+            .iter()
+            .any(|p| p["kind"] == "scroll" && p["surface_id"] == "2" && p["dy"] == 12.)
+    );
+    // Other hand scrolling cannot steal a live legacy seat capture.
+    d.ray_button([1.2, 1.5, 0.], ray, "press", "debug_ray:right", 273)
+        .unwrap();
+    d.outbox.borrow_mut().clear();
+    d.controller_scroll_at("debug_ray:left", [0., 1.5, 0.], ray, [0., 12.])
+        .unwrap();
+    assert_eq!(d.focus.as_deref(), Some("test:2"));
+    assert!(inputs(&d).is_empty());
+    d.cancel("test complete");
+}
+
+#[test]
+fn component_scroll_requires_hovered_panel_threshold_and_cooldown() {
+    let mut d = interaction_desktop();
+    d.windows.clear();
+    let mut scene = Scene::new([320., 100.], [0.32, 0.1], [0., 1.6, -1.7], "world_locked");
+    scene.push(Widget::card(
+        "panel",
+        [0., 0., 320., 100.],
+        "panel.background",
+    ));
+    scene.push(
+        Widget::button(
+            "page-next",
+            [200., 20., 80., 50.],
+            "next",
+            "page-next",
+            "button.secondary",
+        )
+        .parent("panel"),
+    );
+    d.peers.insert(1, peer(&d, 1, scene));
+    let count = |d: &Desktop| d.stats["input_events"].as_u64().unwrap_or(0);
+    assert!(
+        d.controller_page_at(
+            "controller_ray:left",
+            [0., 1.6, 0.],
+            [0., 0., -1.],
+            [0.64, 0.]
+        )
+        .unwrap()
+    );
+    assert_eq!(count(&d), 0);
+    assert!(
+        d.controller_page_at(
+            "controller_ray:left",
+            [0., 1.6, 0.],
+            [0., 0., -1.],
+            [0.8, 0.]
+        )
+        .unwrap()
+    );
+    assert_eq!(count(&d), 2);
+    d.controller_page_at(
+        "controller_ray:left",
+        [0., 1.6, 0.],
+        [0., 0., -1.],
+        [0.8, 0.],
+    )
+    .unwrap();
+    assert_eq!(count(&d), 2);
+    assert!(
+        !d.controller_page_at(
+            "controller_ray:right",
+            [2., 1.6, 0.],
+            [0., 0., -1.],
+            [0.8, 0.]
+        )
+        .unwrap()
+    );
+    assert_eq!(count(&d), 2);
 }

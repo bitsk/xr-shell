@@ -1,3 +1,17 @@
+xr-shell (0.2.26) unstable; urgency=medium
+
+  * Reconcile acknowledged keyboard focus when a focused ancestor loses a popup.
+
+ -- bits <bigbits@hackx.cc>  Sat, 07 Nov 2026 15:19:00 +0800
+
+xr-shell (0.2.25) unstable; urgency=medium
+
+  * Separate trigger, grip, secondary and thumbstick click with hysteresis.
+  * Preserve mouse button identity across focus acknowledgement and cancellation.
+  * Stabilize repeated spatial clicks and route curved stick scroll to the hover target.
+
+ -- bits <bigbits@hackx.cc>  Sat, 07 Nov 2026 14:58:03 +0800
+
 xr-shell (0.2.24) unstable; urgency=medium
 
   * Coalesce UI atlas preparation after input into one batch per rendered frame.
