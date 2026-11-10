@@ -517,10 +517,10 @@ impl Renderer {
             );
             let fallback = Buffer::host(
                 self.gpu.clone(),
-                44 * 4,
+                48 * 4,
                 vk::BufferUsageFlags::STORAGE_BUFFER,
             )?;
-            fallback.write(&[0u8; 44 * 4])?;
+            fallback.write(&[0u8; 48 * 4])?;
             d.update_descriptor_sets(
                 &[
                     vk::WriteDescriptorSet::default()
