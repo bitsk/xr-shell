@@ -3,6 +3,7 @@ mod art;
 mod controller_model;
 mod desktop;
 mod environment;
+mod passthrough;
 mod gpu;
 mod home;
 mod input;
@@ -231,6 +232,7 @@ struct Summary {
     runtime: Option<String>,
     gpu: Option<String>,
     environment: Option<String>,
+    passthrough: Option<serde_json::Value>,
     asset_sha256: Option<String>,
     validation_enabled: bool,
     validation_errors: u64,
@@ -699,6 +701,7 @@ fn frame_loop(
         }
         times[5] = timeline::now();
         let result = renderer.render_stereo(&indices, &views, capture.is_some());
+        summary.passthrough = renderer.passthrough_status();
         times[6] = timeline::now();
         let releases: Vec<_> = renderer
             .targets_mut()

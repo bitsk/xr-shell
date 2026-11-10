@@ -152,6 +152,9 @@ pub struct Renderer {
     fence: vk::Fence,
     shaders: Vec<vk::ShaderModule>,
     yaw: f32,
+    passthrough: Option<crate::passthrough::Passthrough>,
+    passthrough_fallback: Option<Buffer>,
+    passthrough_active: bool,
     atlas: Option<Atlas>,
     atlas_upload: Option<AtlasUpload>,
     atlas_entries: std::collections::BTreeMap<String, AtlasEntry>,
@@ -215,6 +218,9 @@ impl Renderer {
             fence: vk::Fence::null(),
             shaders: Vec::new(),
             yaw: environment.yaw,
+            passthrough: None,
+            passthrough_fallback: None,
+            passthrough_active: false,
             atlas: None,
             atlas_upload: None,
             atlas_entries: std::collections::BTreeMap::new(),
@@ -251,6 +257,10 @@ impl Renderer {
         r.pipeline().context("create panorama Vulkan pipeline")?;
         r.create_spatial_pipeline()
             .context("create spatial Vulkan pipeline")?;
+        match crate::passthrough::Passthrough::from_environment(r.gpu.clone(), r.descriptor) {
+            Ok(passthrough) => r.passthrough = passthrough,
+            Err(error) => eprintln!("XR_PASSTHROUGH=disabled ERROR={error:#}"),
+        }
         r.controllers = crate::controller_model::load_models(r.gpu.clone(), r.pass);
         eprintln!("XR_INIT_STAGE=renderer-resources STATUS=complete");
         for (index, v) in views.iter().enumerate() {
@@ -460,6 +470,12 @@ impl Renderer {
                         .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
                         .descriptor_count(1)
                         .stage_flags(vk::ShaderStageFlags::FRAGMENT | vk::ShaderStageFlags::VERTEX),
+                    vk::DescriptorSetLayoutBinding::default().binding(3)
+                        .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER).descriptor_count(1)
+                        .stage_flags(vk::ShaderStageFlags::FRAGMENT),
+                    vk::DescriptorSetLayoutBinding::default().binding(4)
+                        .descriptor_type(vk::DescriptorType::STORAGE_BUFFER).descriptor_count(1)
+                        .stage_flags(vk::ShaderStageFlags::FRAGMENT),
                 ]),
                 None,
             )?;
@@ -469,11 +485,11 @@ impl Renderer {
                     .pool_sizes(&[
                         vk::DescriptorPoolSize {
                             ty: vk::DescriptorType::COMBINED_IMAGE_SAMPLER,
-                            descriptor_count: 2,
+                            descriptor_count: 3,
                         },
                         vk::DescriptorPoolSize {
                             ty: vk::DescriptorType::STORAGE_BUFFER,
-                            descriptor_count: 1,
+                            descriptor_count: 2,
                         },
                     ]),
                 None,
@@ -495,6 +511,16 @@ impl Renderer {
                     .image_info(&images)],
                 &[],
             );
+            let fallback = Buffer::host(self.gpu.clone(), 44*4, vk::BufferUsageFlags::STORAGE_BUFFER)?;
+            fallback.write(&[0u8;44*4])?;
+            d.update_descriptor_sets(&[
+                vk::WriteDescriptorSet::default().dst_set(self.descriptor).dst_binding(3)
+                    .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER).image_info(&images),
+                vk::WriteDescriptorSet::default().dst_set(self.descriptor).dst_binding(4)
+                    .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                    .buffer_info(&[vk::DescriptorBufferInfo::default().buffer(fallback.handle).range(fallback.size)])], &[]);
+            self.passthrough_fallback = Some(fallback);
+
         }
         Ok(())
     }
@@ -744,6 +770,7 @@ impl Renderer {
         &self,
         target: &Eye,
         pass: DrawPass,
+        eye_index: usize,
         image_index: usize,
         view: &xr::View,
         capture: bool,
@@ -844,8 +871,8 @@ impl Renderer {
                 q.w,
                 self.yaw.cos(),
                 self.yaw.sin(),
-                0.0,
-                0.0,
+                if self.passthrough_active { 1.0 } else { 0.0 },
+                eye_index as f32,
                 view.pose.position.x,
                 view.pose.position.y,
                 view.pose.position.z,
@@ -1012,6 +1039,9 @@ impl Renderer {
 
     /// Both eyes share one recording/submission. The single completion wait
     /// protects XR release and optional readback; no CPU wait splits the eyes.
+    pub fn passthrough_status(&self) -> Option<serde_json::Value> {
+        self.passthrough.as_ref().map(|p| p.status())
+    }
     pub fn render_stereo(
         &mut self,
         indices: &[u32],
@@ -1019,6 +1049,8 @@ impl Renderer {
         capture: bool,
     ) -> Result<Vec<Option<Vec<u8>>>> {
         self.begin()?;
+        if let Some(passthrough) = &mut self.passthrough { passthrough.prepare(self.cmd)?; }
+        self.passthrough_active = self.passthrough.as_ref().is_some_and(|p| p.active());
         self.record_atlas_upload();
         let mut readbacks: Vec<_> = (0..2)
             .map(|eye| {
@@ -1029,6 +1061,7 @@ impl Renderer {
                     } else {
                         DrawPass::All
                     },
+                    eye,
                     indices[eye] as usize,
                     &views[eye],
                     capture,
@@ -1041,6 +1074,7 @@ impl Renderer {
                 readbacks.push(self.record_eye(
                     &self.foreground[eye],
                     DrawPass::Foreground,
+                    eye,
                     indices[eye + 2] as usize,
                     &views[eye],
                     capture,
@@ -1050,6 +1084,7 @@ impl Renderer {
             readbacks.push(self.record_eye(
                 self.quad.as_ref().unwrap(),
                 DrawPass::Quad,
+                0,
                 indices[4] as usize,
                 &focus.view(),
                 capture,
@@ -1234,18 +1269,18 @@ unsafe fn generate_mips(
     }
 }
 
-fn colour_range() -> vk::ImageSubresourceRange {
+pub(crate) fn colour_range() -> vk::ImageSubresourceRange {
     vk::ImageSubresourceRange::default()
         .aspect_mask(vk::ImageAspectFlags::COLOR)
         .level_count(1)
         .layer_count(1)
 }
-fn colour_layers() -> vk::ImageSubresourceLayers {
+pub(crate) fn colour_layers() -> vk::ImageSubresourceLayers {
     vk::ImageSubresourceLayers::default()
         .aspect_mask(vk::ImageAspectFlags::COLOR)
         .layer_count(1)
 }
-fn image_barrier(
+pub(crate) fn image_barrier(
     image: vk::Image,
     old: vk::ImageLayout,
     new: vk::ImageLayout,

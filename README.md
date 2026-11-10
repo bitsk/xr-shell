@@ -391,3 +391,17 @@ preparation path and `atlas_update` as `[regions, source_bytes, full_replacement
 `head_flags` retains the runtime validity bits. The last field describes the
 pending upload before submission, not GPU traffic
 or execution time. Samples remain bounded and are written only on capture/exit.
+
+## 原生双目透视候选
+
+显式设置 `XR_PASSTHROUGH_CONFIG` 指向本机私有配置时，桌面从设备服务 QSP1
+共享快照消费左 slot5、右 slot4 的图像，不打开 V4L2、不经过调试后端。
+四路追踪、窗口和双手 6DoF 保持原路径。候选以 964×544/眼读取线性 Bayer
+单元，使用单眼内参与四参数鱼眼模型进行旋转校正；150ms 无新鲜双眼图像时
+回到原环境。快照时间是 DQ，不是曝光时间；目前没有相机到眼睛的深度重投影、
+运动时图像重投影、ISP/自动白平衡或佩戴几何验收。
+
+配置由设备服务的 `tools/export-passthrough-calibration.py` 从本机原厂校准和
+已核对的传感器模式生成。原厂 1728×1728 与当前 1928×1088 的裁切关系已明确
+计算；Rig 矩阵方向必须显式选择并另行实机确认，不把生成配置视为标定通过。
+默认环境保持原样，包安装不启用透视。
