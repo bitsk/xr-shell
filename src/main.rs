@@ -967,6 +967,7 @@ fn write_capture(
         "view_state_flags": ViewFlags::from(flags),
         "ui_anchor": ui_anchor,
         "controllers": renderer.controller_status(),
+        "passthrough": renderer.passthrough_status(),
         "focus_quad":renderer.quad_status(),"extra_layer_images":layer_images,
         "pixels":"actual GPU swapchain readback; when Quad is active eyes are background-only and extra_layer_images contain foreground and Quad; not final compositor output","panorama_translation":"ignored", "eyes":eyes}),
     )
