@@ -470,11 +470,15 @@ impl Renderer {
                         .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
                         .descriptor_count(1)
                         .stage_flags(vk::ShaderStageFlags::FRAGMENT | vk::ShaderStageFlags::VERTEX),
-                    vk::DescriptorSetLayoutBinding::default().binding(3)
-                        .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER).descriptor_count(1)
+                    vk::DescriptorSetLayoutBinding::default()
+                        .binding(3)
+                        .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+                        .descriptor_count(1)
                         .stage_flags(vk::ShaderStageFlags::FRAGMENT),
-                    vk::DescriptorSetLayoutBinding::default().binding(4)
-                        .descriptor_type(vk::DescriptorType::STORAGE_BUFFER).descriptor_count(1)
+                    vk::DescriptorSetLayoutBinding::default()
+                        .binding(4)
+                        .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                        .descriptor_count(1)
                         .stage_flags(vk::ShaderStageFlags::FRAGMENT),
                 ]),
                 None,
@@ -511,16 +515,30 @@ impl Renderer {
                     .image_info(&images)],
                 &[],
             );
-            let fallback = Buffer::host(self.gpu.clone(), 44*4, vk::BufferUsageFlags::STORAGE_BUFFER)?;
-            fallback.write(&[0u8;44*4])?;
-            d.update_descriptor_sets(&[
-                vk::WriteDescriptorSet::default().dst_set(self.descriptor).dst_binding(3)
-                    .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER).image_info(&images),
-                vk::WriteDescriptorSet::default().dst_set(self.descriptor).dst_binding(4)
-                    .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
-                    .buffer_info(&[vk::DescriptorBufferInfo::default().buffer(fallback.handle).range(fallback.size)])], &[]);
+            let fallback = Buffer::host(
+                self.gpu.clone(),
+                44 * 4,
+                vk::BufferUsageFlags::STORAGE_BUFFER,
+            )?;
+            fallback.write(&[0u8; 44 * 4])?;
+            d.update_descriptor_sets(
+                &[
+                    vk::WriteDescriptorSet::default()
+                        .dst_set(self.descriptor)
+                        .dst_binding(3)
+                        .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+                        .image_info(&images),
+                    vk::WriteDescriptorSet::default()
+                        .dst_set(self.descriptor)
+                        .dst_binding(4)
+                        .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                        .buffer_info(&[vk::DescriptorBufferInfo::default()
+                            .buffer(fallback.handle)
+                            .range(fallback.size)]),
+                ],
+                &[],
+            );
             self.passthrough_fallback = Some(fallback);
-
         }
         Ok(())
     }
@@ -1040,7 +1058,11 @@ impl Renderer {
     /// Both eyes share one recording/submission. The single completion wait
     /// protects XR release and optional readback; no CPU wait splits the eyes.
     pub fn passthrough_status(&self) -> Option<serde_json::Value> {
-        self.passthrough.as_ref().map(|p| p.status())
+        self.passthrough.as_ref().map(|p| {
+            let mut status = p.status();
+            status["render_active"] = self.passthrough_active.into();
+            status
+        })
     }
     pub fn render_stereo(
         &mut self,
@@ -1049,7 +1071,9 @@ impl Renderer {
         capture: bool,
     ) -> Result<Vec<Option<Vec<u8>>>> {
         self.begin()?;
-        if let Some(passthrough) = &mut self.passthrough { passthrough.prepare(self.cmd)?; }
+        if let Some(passthrough) = &mut self.passthrough {
+            passthrough.prepare(self.cmd)?;
+        }
         self.passthrough_active = self.passthrough.as_ref().is_some_and(|p| p.active());
         self.record_atlas_upload();
         let mut readbacks: Vec<_> = (0..2)

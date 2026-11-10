@@ -21,8 +21,6 @@ use std::{
     time::Duration,
 };
 
-const WIDTH: usize = 964;
-const HEIGHT: usize = 544;
 const MAX_AGE_NS: u64 = 150_000_000;
 fn now_ns() -> u64 {
     let mut t = libc::timespec {
@@ -50,6 +48,8 @@ struct Config {
     eyes: [EyeCalibration; 2],
     #[serde(default = "unit_gain")]
     colour_gain: [f32; 3],
+    black_level_10bit: u16,
+    white_balance: String,
 }
 fn unit_gain() -> [f32; 3] {
     [1.; 3]
@@ -59,12 +59,22 @@ struct Frame {
     sequence: u64,
     received: u64,
     rgba: Vec<u8>,
+    sums: [f64; 3],
+    count: u32,
 }
 struct Stereo {
     received: [u64; 2],
     rgba: Vec<u8>,
+    gains: [f32; 3],
 }
-fn snapshot(directory: &Path, slot: u32, previous: Option<&Frame>) -> Option<Frame> {
+fn snapshot(
+    directory: &Path,
+    slot: u32,
+    previous: Option<&Frame>,
+    width: usize,
+    height: usize,
+    black: u16,
+) -> Option<Frame> {
     let mut selected: Option<Frame> = None;
     for index in 0..3 {
         let mut f = match OpenOptions::new()
@@ -93,12 +103,12 @@ fn snapshot(directory: &Path, slot: u32, previous: Option<&Frame>) -> Option<Fra
             // the final eight bytes are reserved, not a timestamp.
             if word(0) != 0x31505351
                 || word(4) != 1
-                || word(8) != 1928
-                || word(12) != 1088
+                || word(8) as usize != width * 2
+                || word(12) as usize != height * 2
                 || word(20) != u32::from_le_bytes(*b"pRAA")
                 || word(24) != slot
-                || !(2410..=8192).contains(&stride)
-                || bytes != stride * 1088
+                || !(width * 2 * 5 / 4..=8192).contains(&stride)
+                || bytes != stride * height * 2
                 || meta.len() != 64 + bytes as u64
                 || received > now_ns()
                 || now_ns().saturating_sub(received) >= MAX_AGE_NS
@@ -113,19 +123,39 @@ fn snapshot(directory: &Path, slot: u32, previous: Option<&Frame>) -> Option<Fra
             let mut raw = vec![0u8; bytes];
             f.seek(SeekFrom::Start(64)).ok()?;
             f.read_exact(&mut raw).ok()?;
-            let mut rgba = vec![0u8; WIDTH * HEIGHT * 4];
-            for y in 0..HEIGHT {
-                for x in 0..WIDTH {
-                    let source = (x * 2 / 4) * 5 + (x * 2 % 4);
-                    let top = y * 2 * stride + source;
-                    let bottom = top + stride;
-                    let dest = (y * WIDTH + x) * 4;
-                    // A 2x2 RGGB Bayer cell. Values remain linear RAW; the
-                    // UNORM image is converted to sRGB by the output target.
-                    rgba[dest] = raw[top];
-                    rgba[dest + 1] = ((raw[top + 1] as u16 + raw[bottom] as u16) / 2) as u8;
-                    rgba[dest + 2] = raw[bottom + 1];
+            let mut rgba = vec![0u8; width * height * 4];
+            let mut sums = [0.; 3];
+            let mut count = 0;
+            let sample = |x: usize, y: usize| -> u16 {
+                let group = y * stride + (x / 4) * 5;
+                u16::from(raw[group + x % 4]) * 4 + u16::from((raw[group + 4] >> (2 * (x % 4))) & 3)
+            };
+            for y in 0..height {
+                for x in 0..width {
+                    let values = [
+                        sample(x * 2, y * 2),
+                        (sample(x * 2 + 1, y * 2) + sample(x * 2, y * 2 + 1)) / 2,
+                        sample(x * 2 + 1, y * 2 + 1),
+                    ];
+                    let dest = (y * width + x) * 4;
+                    for channel in 0..3 {
+                        rgba[dest + channel] = ((u32::from(values[channel].saturating_sub(black))
+                            * 255)
+                            / u32::from(1023 - black))
+                        .min(255) as u8;
+                    }
                     rgba[dest + 3] = 255;
+                    // Joint RGB mask excludes darkness and clipped highlights;
+                    // one shared estimate preserves stereo colour consistency.
+                    if x % 8 == 0
+                        && y % 8 == 0
+                        && rgba[dest..dest + 3].iter().all(|v| *v > 6 && *v < 225)
+                    {
+                        for channel in 0..3 {
+                            sums[channel] += f64::from(rgba[dest + channel]);
+                        }
+                        count += 1;
+                    }
                 }
             }
             Some(Frame {
@@ -133,6 +163,8 @@ fn snapshot(directory: &Path, slot: u32, previous: Option<&Frame>) -> Option<Fra
                 sequence,
                 received,
                 rgba,
+                sums,
+                count,
             })
         })();
         unsafe {
@@ -159,6 +191,11 @@ pub struct Passthrough {
     received: [u64; 2],
     initialized: bool,
     uploaded_frames: u64,
+    width: usize,
+    height: usize,
+    coefficients: Vec<f32>,
+    gains: [f32; 3],
+    white_balance: String,
 }
 impl Passthrough {
     pub fn from_environment(gpu: Rc<Gpu>, descriptor: vk::DescriptorSet) -> Result<Option<Self>> {
@@ -169,13 +206,20 @@ impl Passthrough {
             serde_json::from_reader(File::open(path).context("open passthrough configuration")?)?;
         ensure!(
             config.schema == "org.openkylin.xr.passthrough"
-                && config.version == 1
-                && config.source_size == [1928, 1088]
+                && config.version == 2
+                && matches!(config.source_size, [1928, 1088] | [1728, 1728])
                 && config.directory.is_absolute()
-                && config.eyes[0].slot == 5
-                && config.eyes[1].slot == 4,
+                && config.eyes[0].slot == 4
+                && config.eyes[1].slot == 5,
             "unsupported passthrough configuration"
         );
+        ensure!(
+            config.black_level_10bit < 256
+                && matches!(config.white_balance.as_str(), "gray-world" | "none"),
+            "unsupported RAW colour controls"
+        );
+        let width = config.source_size[0] as usize / 2;
+        let height = config.source_size[1] as usize / 2;
         let mut coefficients = Vec::<f32>::new();
         for eye in &config.eyes {
             ensure!(
@@ -207,9 +251,10 @@ impl Passthrough {
             config.colour_gain[2],
             0.,
         ]);
+        coefficients.extend([width as f32, height as f32, 0., 0.]);
         let staging = Buffer::host(
             gpu.clone(),
-            (WIDTH * 2 * HEIGHT * 4) as u64,
+            (width * 2 * height * 4) as u64,
             vk::BufferUsageFlags::TRANSFER_SRC,
         )?;
         let calibration = Buffer::host(
@@ -230,13 +275,19 @@ impl Passthrough {
             _calibration: calibration,
             latest: Arc::new(Mutex::new(Some(Stereo {
                 received: [0; 2],
-                rgba: vec![0u8; WIDTH * 2 * HEIGHT * 4],
+                rgba: vec![0u8; width * 2 * height * 4],
+                gains: config.colour_gain,
             }))),
             stop: Arc::new(AtomicBool::new(false)),
             worker: None,
             received: [0; 2],
             initialized: false,
             uploaded_frames: 0,
+            width,
+            height,
+            coefficients,
+            gains: config.colour_gain,
+            white_balance: config.white_balance.clone(),
         };
         unsafe {
             let d = &p.gpu.device;
@@ -245,8 +296,8 @@ impl Passthrough {
                     .image_type(vk::ImageType::TYPE_2D)
                     .format(vk::Format::R8G8B8A8_UNORM)
                     .extent(vk::Extent3D {
-                        width: (WIDTH * 2) as u32,
-                        height: HEIGHT as u32,
+                        width: (width * 2) as u32,
+                        height: height as u32,
                         depth: 1,
                     })
                     .mip_levels(1)
@@ -308,6 +359,7 @@ impl Passthrough {
         let stop = p.stop.clone();
         p.worker = Some(thread::spawn(move || {
             let mut frames: [Option<Frame>; 2] = [None, None];
+            let mut gains = config.colour_gain;
             while !stop.load(Ordering::Relaxed) {
                 let mut changed = false;
                 for eye in 0..2 {
@@ -315,6 +367,9 @@ impl Passthrough {
                         &config.directory,
                         config.eyes[eye].slot,
                         frames[eye].as_ref(),
+                        width,
+                        height,
+                        config.black_level_10bit,
                     ) {
                         frames[eye] = Some(f);
                         changed = true;
@@ -326,13 +381,31 @@ impl Passthrough {
                             .is_some_and(|f| now_ns().saturating_sub(f.received) < MAX_AGE_NS)
                     })
                 {
-                    let mut rgba = vec![0u8; WIDTH * 2 * HEIGHT * 4];
+                    if config.white_balance == "gray-world" {
+                        let sums: [f64; 3] = std::array::from_fn(|c| {
+                            frames.iter().map(|f| f.as_ref().unwrap().sums[c]).sum()
+                        });
+                        if frames
+                            .iter()
+                            .map(|f| f.as_ref().unwrap().count)
+                            .sum::<u32>()
+                            > 100
+                            && sums.iter().all(|v| *v > 0.)
+                        {
+                            for c in 0..3 {
+                                let target = (sums[1] / sums[c]).clamp(0.5, 4.) as f32
+                                    * config.colour_gain[c];
+                                gains[c] += 0.05 * (target - gains[c]);
+                            }
+                        }
+                    }
+                    let mut rgba = vec![0u8; width * 2 * height * 4];
                     for (eye, frame) in frames.iter().enumerate() {
                         let frame = frame.as_ref().unwrap();
-                        for y in 0..HEIGHT {
-                            let source = &frame.rgba[y * WIDTH * 4..(y + 1) * WIDTH * 4];
-                            let target = (y * WIDTH * 2 + eye * WIDTH) * 4;
-                            rgba[target..target + WIDTH * 4].copy_from_slice(source);
+                        for y in 0..height {
+                            let source = &frame.rgba[y * width * 4..(y + 1) * width * 4];
+                            let target = (y * width * 2 + eye * width) * 4;
+                            rgba[target..target + width * 4].copy_from_slice(source);
                         }
                     }
                     if let Ok(mut target) = latest.lock() {
@@ -342,6 +415,7 @@ impl Passthrough {
                                 frames[1].as_ref().unwrap().received,
                             ],
                             rgba,
+                            gains,
                         });
                     }
                 }
@@ -349,12 +423,13 @@ impl Passthrough {
             }
         }));
         eprintln!(
-            "XR_PASSTHROUGH=enabled SOURCE=QSP1 SIZE=964x544 STEREO=left5,right4 COLOUR=raw-linear GEOMETRY=rotation-only"
+            "XR_PASSTHROUGH=enabled SOURCE=QSP1 SIZE={}x{} STEREO=left4,right5 COLOUR=black-subtracted-linear GEOMETRY=OEM-camera-body-rotation",
+            width, height
         );
         Ok(Some(p))
     }
     pub fn status(&self) -> serde_json::Value {
-        serde_json::json!({"source":"QSP1", "size_per_eye":[WIDTH,HEIGHT], "slots_left_right":[5,4],
+        serde_json::json!({"source":"QSP1", "size_per_eye":[self.width,self.height], "slots_left_right":[4,5], "white_balance":self.white_balance, "colour_gain":self.gains,
             "active":self.active(), "uploaded_frames":self.uploaded_frames,
             "age_ms":self.received.map(|t| if t==0 {None} else {Some(now_ns().saturating_sub(t) as f64/1e6)}),
             "pair_dq_delta_ms":self.received[0].abs_diff(self.received[1]) as f64/1e6,
@@ -374,6 +449,14 @@ impl Passthrough {
         };
         if let Some(frame) = next {
             self.staging.write(&frame.rgba)?;
+            self.gains = frame.gains;
+            self.coefficients[40..43].copy_from_slice(&frame.gains);
+            self._calibration.write(unsafe {
+                std::slice::from_raw_parts(
+                    self.coefficients.as_ptr() as *const u8,
+                    self.coefficients.len() * 4,
+                )
+            })?;
             unsafe {
                 let d = &self.gpu.device;
                 let (old, source, stage) = if self.initialized {
@@ -412,8 +495,8 @@ impl Passthrough {
                     &[vk::BufferImageCopy::default()
                         .image_subresource(colour_layers())
                         .image_extent(vk::Extent3D {
-                            width: (WIDTH * 2) as u32,
-                            height: HEIGHT as u32,
+                            width: (self.width * 2) as u32,
+                            height: self.height as u32,
                             depth: 1,
                         })],
                 );
