@@ -1109,10 +1109,20 @@ impl Renderer {
         indices: &[u32],
         views: &[xr::View],
         capture: bool,
+        instance: &xr::Instance,
+        session: &xr::Session<xr::Vulkan>,
+        space: &xr::Space,
     ) -> Result<Vec<Option<Vec<u8>>>> {
         self.begin()?;
         if let Some(passthrough) = &mut self.passthrough {
-            passthrough.prepare(self.cmd, views)?;
+            passthrough.prepare(self.cmd)?;
+        }
+        // Latch the source first, then append a pose newer than that frame.
+        // Querying before RAW selection can leave a just-arrived frame without
+        // the upper interpolation bracket and make compensation intermittent.
+        self.sample_passthrough_pose(instance, session, space);
+        if let Some(passthrough) = &mut self.passthrough {
+            passthrough.update_projection(views)?;
         }
         self.passthrough_active = self.passthrough.as_ref().is_some_and(|p| p.active());
         self.record_atlas_upload();

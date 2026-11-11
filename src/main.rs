@@ -604,7 +604,6 @@ fn frame_loop(
         let space = centered_space.as_ref().unwrap_or(space);
         let (flags, views) =
             session.locate_views(VIEW_TYPE, state.predicted_display_time, space)?;
-        renderer.sample_passthrough_pose(instance, session, space);
         summary
             .view_state
             .observe(flags, &views, state.predicted_display_time);
@@ -702,7 +701,14 @@ fn frame_loop(
             target.swapchain.wait_image(xr::Duration::INFINITE)?;
         }
         times[5] = timeline::now();
-        let result = renderer.render_stereo(&indices, &views, capture.is_some());
+        let result = renderer.render_stereo(
+            &indices,
+            &views,
+            capture.is_some(),
+            instance,
+            session,
+            space,
+        );
         times[6] = timeline::now();
         let releases: Vec<_> = renderer
             .targets_mut()

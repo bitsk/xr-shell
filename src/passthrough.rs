@@ -744,31 +744,7 @@ impl Passthrough {
         self.pose_history.0.clear();
     }
 
-    pub fn prepare(&mut self, cmd: vk::CommandBuffer, views: &[openxr::View]) -> Result<()> {
-        let next = match self.latest.try_lock() {
-            Ok(mut f) => f.take(),
-            Err(_) => None,
-        };
-        let mut mask = if self.initialized { 0u32 } else { 3 };
-        if let Some(stereo) = next {
-            for (i, frame) in stereo.frames.iter().enumerate() {
-                let id = (frame.generation, frame.sequence);
-                if id != self.uploaded_ids[i] {
-                    ensure!(
-                        frame.raw.len() <= self.plane_bytes,
-                        "RAW plane exceeds allocated capacity"
-                    );
-                    self.staging.write_at(i * self.plane_bytes, &frame.raw)?;
-                    self.strides[i] = frame.stride as u32;
-                    self.received[i] = frame.received;
-                    self.uploaded_ids[i] = id;
-                    self.uploaded_distinct[i] += 1;
-                    mask |= 1 << i;
-                }
-            }
-            self.gains = stereo.gains;
-            self.coefficients[40..43].copy_from_slice(&stereo.gains);
-        }
+    pub fn update_projection(&mut self, views: &[openxr::View]) -> Result<()> {
         self.compensated = [false; 2];
         self.correction_degrees = [0.; 2];
         if self.motion_compensation == MotionCompensation::DequeueRotation {
@@ -796,13 +772,39 @@ impl Passthrough {
                 }
             }
         }
-        if mask != 0 || self.motion_compensation == MotionCompensation::DequeueRotation {
-            self._calibration.write(unsafe {
-                std::slice::from_raw_parts(
-                    self.coefficients.as_ptr() as *const u8,
-                    self.coefficients.len() * 4,
-                )
-            })?;
+        self._calibration.write(unsafe {
+            std::slice::from_raw_parts(
+                self.coefficients.as_ptr() as *const u8,
+                self.coefficients.len() * 4,
+            )
+        })?;
+        Ok(())
+    }
+
+    pub fn prepare(&mut self, cmd: vk::CommandBuffer) -> Result<()> {
+        let next = match self.latest.try_lock() {
+            Ok(mut f) => f.take(),
+            Err(_) => None,
+        };
+        let mut mask = if self.initialized { 0u32 } else { 3 };
+        if let Some(stereo) = next {
+            for (i, frame) in stereo.frames.iter().enumerate() {
+                let id = (frame.generation, frame.sequence);
+                if id != self.uploaded_ids[i] {
+                    ensure!(
+                        frame.raw.len() <= self.plane_bytes,
+                        "RAW plane exceeds allocated capacity"
+                    );
+                    self.staging.write_at(i * self.plane_bytes, &frame.raw)?;
+                    self.strides[i] = frame.stride as u32;
+                    self.received[i] = frame.received;
+                    self.uploaded_ids[i] = id;
+                    self.uploaded_distinct[i] += 1;
+                    mask |= 1 << i;
+                }
+            }
+            self.gains = stereo.gains;
+            self.coefficients[40..43].copy_from_slice(&stereo.gains);
         }
         if mask != 0 {
             unsafe {
