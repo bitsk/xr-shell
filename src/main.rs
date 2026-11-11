@@ -576,6 +576,7 @@ fn frame_loop(
                 match session.create_reference_space(kind, pose) {
                     Ok(new_space) => {
                         centered_space = Some(new_space);
+                        renderer.reset_passthrough_pose_history();
                         summary.home_recenter_count += 1;
                         summary.ui_anchor = ui_anchor::UiAnchor::new(options.ui_anchor);
                         renderer.set_ui_anchor(summary.ui_anchor.offset());
@@ -603,6 +604,7 @@ fn frame_loop(
         let space = centered_space.as_ref().unwrap_or(space);
         let (flags, views) =
             session.locate_views(VIEW_TYPE, state.predicted_display_time, space)?;
+        renderer.sample_passthrough_pose(instance, session, space);
         summary
             .view_state
             .observe(flags, &views, state.predicted_display_time);

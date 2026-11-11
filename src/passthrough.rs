@@ -7,6 +7,7 @@ use anyhow::{Context, Result, ensure};
 use ash::vk;
 use serde::Deserialize;
 use std::{
+    collections::VecDeque,
     fs::{File, OpenOptions},
     io::{Cursor, Read},
     os::fd::AsRawFd,
@@ -22,6 +23,123 @@ use std::{
 };
 
 const MAX_AGE_NS: u64 = 150_000_000;
+const MAX_POSE_GAP_NS: u64 = 40_000_000;
+
+#[derive(Clone, Copy, Default, Deserialize, PartialEq)]
+#[serde(rename_all = "kebab-case")]
+enum MotionCompensation {
+    #[default]
+    None,
+    DequeueRotation,
+}
+
+fn unit_quaternion(q: openxr::Quaternionf) -> Option<[f32; 4]> {
+    let q = [q.x, q.y, q.z, q.w];
+    let norm = q.iter().map(|x| x * x).sum::<f32>();
+    (q.iter().all(|x| x.is_finite()) && (norm - 1.).abs() < 0.01)
+        .then(|| q.map(|x| x / norm.sqrt()))
+}
+
+#[derive(Default)]
+struct PoseHistory(VecDeque<(u64, [[f32; 4]; 2])>);
+
+impl PoseHistory {
+    fn observe(&mut self, flags: openxr::ViewStateFlags, views: &[openxr::View], stamp: u64) {
+        let required =
+            openxr::ViewStateFlags::ORIENTATION_VALID | openxr::ViewStateFlags::ORIENTATION_TRACKED;
+        let poses = if flags.contains(required) && views.len() == 2 {
+            unit_quaternion(views[0].pose.orientation)
+                .zip(unit_quaternion(views[1].pose.orientation))
+                .map(|(left, right)| [left, right])
+        } else {
+            None
+        };
+        let Some(poses) = poses else {
+            self.0.clear();
+            return;
+        };
+        if self
+            .0
+            .back()
+            .is_some_and(|p| stamp <= p.0 || stamp - p.0 > MAX_POSE_GAP_NS)
+        {
+            self.0.clear();
+        }
+        if self.0.len() == 64 {
+            self.0.pop_front();
+        }
+        self.0.push_back((stamp, poses));
+    }
+
+    // No extrapolation: a missing bracket or a tracking gap uses the original
+    // projection. These are app-observed poses, not exposure-time measurements.
+    fn at(&self, eye: usize, stamp: u64) -> Option<[f32; 4]> {
+        let mut previous = None;
+        for (time, poses) in &self.0 {
+            if *time == stamp {
+                return Some(poses[eye]);
+            }
+            if *time > stamp {
+                let (before, q): (u64, [f32; 4]) = previous?;
+                if time - before > MAX_POSE_GAP_NS {
+                    return None;
+                }
+                let fraction = (stamp - before) as f32 / (time - before) as f32;
+                let sign = if q.iter().zip(poses[eye]).map(|(a, b)| a * b).sum::<f32>() < 0. {
+                    -1.
+                } else {
+                    1.
+                };
+                let result: [f32; 4] =
+                    std::array::from_fn(|i| q[i] + fraction * (sign * poses[eye][i] - q[i]));
+                let norm = result.iter().map(|x| x * x).sum::<f32>().sqrt();
+                return (norm > 0.5).then(|| result.map(|x| x / norm));
+            }
+            previous = Some((*time, poses[eye]));
+        }
+        None
+    }
+}
+
+// camera_from_view * inverse(world_from_capture_view) * world_from_current_view.
+// The base OEM camera rotation and each eye's own source timestamp are retained.
+fn compensated_rotation(
+    base: [[f32; 3]; 3],
+    capture: [f32; 4],
+    current: [f32; 4],
+) -> ([[f32; 3]; 3], f32) {
+    let [ax, ay, az, aw] = [-capture[0], -capture[1], -capture[2], capture[3]];
+    let [bx, by, bz, bw] = current;
+    let [x, y, z, w] = [
+        aw * bx + ax * bw + ay * bz - az * by,
+        aw * by - ax * bz + ay * bw + az * bx,
+        aw * bz + ax * by - ay * bx + az * bw,
+        aw * bw - ax * bx - ay * by - az * bz,
+    ];
+    let rotation = [
+        [
+            1. - 2. * (y * y + z * z),
+            2. * (x * y - z * w),
+            2. * (x * z + y * w),
+        ],
+        [
+            2. * (x * y + z * w),
+            1. - 2. * (x * x + z * z),
+            2. * (y * z - x * w),
+        ],
+        [
+            2. * (x * z - y * w),
+            2. * (y * z + x * w),
+            1. - 2. * (x * x + y * y),
+        ],
+    ];
+    (
+        std::array::from_fn(|row| {
+            std::array::from_fn(|col| (0..3).map(|k| base[row][k] * rotation[k][col]).sum())
+        }),
+        2. * (x * x + y * y + z * z).sqrt().atan2(w.abs()).to_degrees(),
+    )
+}
 fn now_ns() -> u64 {
     let mut t = libc::timespec {
         tv_sec: 0,
@@ -50,6 +168,8 @@ struct Config {
     colour_gain: [f32; 3],
     black_level_10bit: u16,
     white_balance: String,
+    #[serde(default)]
+    motion_compensation: MotionCompensation,
 }
 fn unit_gain() -> [f32; 3] {
     [1.; 3]
@@ -206,6 +326,12 @@ pub struct Passthrough {
     strides: [u32; 2],
     stats: Arc<WorkerStats>,
     last_report_ns: u64,
+    motion_compensation: MotionCompensation,
+    pose_history: PoseHistory,
+    camera_from_view: [[[f32; 3]; 3]; 2],
+    compensated: [bool; 2],
+    correction_degrees: [f32; 2],
+    compensated_render_frames: u64,
 }
 impl Passthrough {
     pub fn from_environment(gpu: Rc<Gpu>, descriptor: vk::DescriptorSet) -> Result<Option<Self>> {
@@ -312,6 +438,12 @@ impl Passthrough {
             strides: [(width * 2 * 5 / 4) as u32; 2],
             stats: Arc::new(WorkerStats::default()),
             last_report_ns: 0,
+            motion_compensation: config.motion_compensation,
+            pose_history: PoseHistory::default(),
+            camera_from_view: config.eyes.each_ref().map(|eye| eye.camera_from_view),
+            compensated: [false; 2],
+            correction_degrees: [0.; 2],
+            compensated_render_frames: 0,
         };
         unsafe {
             let d = &p.gpu.device;
@@ -560,6 +692,9 @@ impl Passthrough {
             "active":self.active(),"uploaded_frames":self.uploaded_frames,"uploaded_distinct_source_frames":self.uploaded_distinct,"submitted_distinct_source_frames":self.submitted_distinct,"submitted_render_frames":self.submitted_render_frames,
             "source_generation":self.uploaded_ids.map(|x|x.0),"source_sequence":self.uploaded_ids.map(|x|x.1),"raw_reads":reads,"average_raw_read_cpu_ms":std::array::from_fn::<_,2,_>(|i|if reads[i]==0 {0.}else{self.stats.cpu_ns[i].load(Ordering::Relaxed) as f64/reads[i] as f64/1e6}),
             "received_monotonic_ns":self.received,"age_ms":self.received.map(|t|if t==0 {None}else{Some(now_ns().saturating_sub(t) as f64/1e6)}),"pair_dq_delta_ms":self.received[0].abs_diff(self.received[1]) as f64/1e6,
+            "motion_compensation":if self.motion_compensation == MotionCompensation::DequeueRotation {"dequeue-rotation"}else{"none"},
+            "motion_compensated_eyes":self.compensated,"motion_correction_degrees":self.correction_degrees,"motion_compensated_render_frames":self.compensated_render_frames,
+            "motion_time_basis":"QSP1 dequeue CLOCK_MONOTONIC and app-observed OpenXR orientation; not exposure-time pose",
             "exposure_sync_verified":false,"physical_extrinsics_verified":false,"colour_calibrated":false})
     }
     pub fn active(&self) -> bool {
@@ -572,6 +707,9 @@ impl Passthrough {
     pub fn submitted(&mut self, active: bool) {
         if active {
             self.submitted_render_frames += 1;
+            if self.compensated.iter().all(|x| *x) {
+                self.compensated_render_frames += 1;
+            }
             for i in 0..2 {
                 if self.submitted_ids[i] != self.uploaded_ids[i] {
                     self.submitted_distinct[i] += 1;
@@ -587,7 +725,26 @@ impl Passthrough {
             eprintln!("XR_PASSTHROUGH_STATS {}", status);
         }
     }
-    pub fn prepare(&mut self, cmd: vk::CommandBuffer) -> Result<()> {
+    pub fn observe_views(
+        &mut self,
+        flags: openxr::ViewStateFlags,
+        views: &[openxr::View],
+        stamp: u64,
+    ) {
+        if self.motion_compensation == MotionCompensation::DequeueRotation {
+            self.pose_history.observe(flags, views, stamp);
+        }
+    }
+
+    pub fn motion_enabled(&self) -> bool {
+        self.motion_compensation == MotionCompensation::DequeueRotation
+    }
+
+    pub fn reset_pose_history(&mut self) {
+        self.pose_history.0.clear();
+    }
+
+    pub fn prepare(&mut self, cmd: vk::CommandBuffer, views: &[openxr::View]) -> Result<()> {
         let next = match self.latest.try_lock() {
             Ok(mut f) => f.take(),
             Err(_) => None,
@@ -611,6 +768,35 @@ impl Passthrough {
             }
             self.gains = stereo.gains;
             self.coefficients[40..43].copy_from_slice(&stereo.gains);
+        }
+        self.compensated = [false; 2];
+        self.correction_degrees = [0.; 2];
+        if self.motion_compensation == MotionCompensation::DequeueRotation {
+            for eye in 0..2 {
+                let base = self.camera_from_view[eye];
+                let correction = self
+                    .pose_history
+                    .at(eye, self.received[eye])
+                    .zip(
+                        views
+                            .get(eye)
+                            .and_then(|v| unit_quaternion(v.pose.orientation)),
+                    )
+                    .map(|(capture, current)| compensated_rotation(base, capture, current));
+                let matrix = if let Some((matrix, degrees)) = correction {
+                    self.compensated[eye] = true;
+                    self.correction_degrees[eye] = degrees;
+                    matrix
+                } else {
+                    base
+                };
+                for (row, values) in matrix.iter().enumerate() {
+                    let offset = eye * 20 + 8 + row * 4;
+                    self.coefficients[offset..offset + 3].copy_from_slice(values);
+                }
+            }
+        }
+        if mask != 0 || self.motion_compensation == MotionCompensation::DequeueRotation {
             self._calibration.write(unsafe {
                 std::slice::from_raw_parts(
                     self.coefficients.as_ptr() as *const u8,
@@ -722,5 +908,60 @@ impl Drop for Passthrough {
             d.destroy_image(self.image, None);
             d.free_memory(self.memory, None);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn dequeue_rotation_keeps_oem_axes_and_rotates_current_ray_into_capture() {
+        let base = [[1., 0., 0.], [0., -1., 0.], [0., 0., -1.]];
+        let identity = [0., 0., 0., 1.];
+        let half = std::f32::consts::FRAC_PI_4;
+        let yaw = [0., half.sin(), 0., half.cos()];
+        let (unchanged, degrees) = compensated_rotation(base, yaw, yaw.map(|v| -v));
+        for row in 0..3 {
+            for col in 0..3 {
+                assert!((unchanged[row][col] - base[row][col]).abs() < 0.00001);
+            }
+        }
+        assert!(degrees < 0.01);
+        let (matrix, degrees) = compensated_rotation(base, identity, yaw);
+        let forward: [f32; 3] = std::array::from_fn(|row| -matrix[row][2]);
+        assert!((forward[0] + 1.).abs() < 0.00001);
+        assert!(forward[1].abs() < 0.00001 && forward[2].abs() < 0.00001);
+        assert!((degrees - 90.).abs() < 0.01);
+    }
+
+    #[test]
+    fn dequeue_rotation_history_requires_a_valid_same_epoch_bracket() {
+        let flags =
+            openxr::ViewStateFlags::ORIENTATION_VALID | openxr::ViewStateFlags::ORIENTATION_TRACKED;
+        let mut history = PoseHistory::default();
+        let mut views = [openxr::View::default(); 2];
+        for v in &mut views {
+            v.pose.orientation.w = 1.;
+        }
+        history.observe(flags, &views, 10_000_000);
+        for v in &mut views {
+            let half = 10_f32.to_radians();
+            v.pose.orientation = openxr::Quaternionf {
+                x: 0.,
+                y: half.sin(),
+                z: 0.,
+                w: half.cos(),
+            };
+        }
+        history.observe(flags, &views, 30_000_000);
+        let q = history.at(0, 20_000_000).unwrap();
+        assert!((q[1] - 5_f32.to_radians().sin()).abs() < 0.00001);
+        assert!(history.at(0, 9_000_000).is_none());
+        assert!(history.at(1, 31_000_000).is_none());
+        history.observe(flags, &views, 100_000_000);
+        assert!(history.at(0, 20_000_000).is_none());
+        history.observe(openxr::ViewStateFlags::EMPTY, &views, 101_000_000);
+        assert!(history.at(0, 100_000_000).is_none());
     }
 }

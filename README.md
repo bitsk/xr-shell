@@ -418,3 +418,10 @@ or execution time. Samples remain bounded and are written only on capture/exit.
 双眼原始帧通过共享引用传递，仅上传发生变化的眼睛。每秒的
 `XR_PASSTHROUGH_STATS` 区分读取、GPU上传、不同源帧的OpenXR提交计数；
 OpenXR提交不是物理扫描呈现证明。摄像头/曝光同步与运动重投影仍需另行验收。
+
+可选的 `"motion_compensation": "dequeue-rotation"` 使用每眼自己的QSP1取帧
+时间，在本进程观测到的OpenXR姿态历史中插值，将当前视线旋转到取帧时的
+眼坐标，再应用原厂相机外参。它仅补偿取帧后的旋转延迟，不把DQ当作曝光，
+不添加虚构深度或平移，也不修改追踪生产者。无有效姿态括号、超过40ms采样
+间断或Home重置参考空间时，使用原投影，待历史重新覆盖源帧后恢复补偿。
+默认关闭；遥测分别记录每眼补偿是否应用、角度和累计渲染帧数。

@@ -1069,6 +1069,41 @@ impl Renderer {
             p.submitted(self.passthrough_active);
         }
     }
+    pub fn sample_passthrough_pose(
+        &mut self,
+        instance: &xr::Instance,
+        session: &xr::Session<xr::Vulkan>,
+        space: &xr::Space,
+    ) {
+        let Some(p) = self.passthrough.as_mut().filter(|p| p.motion_enabled()) else {
+            return;
+        };
+        // Sample "now", not predictedDisplayTime: associating a predicted pose
+        // with a current monotonic stamp would shift the entire pose history.
+        let before = crate::timeline::now() as u64;
+        let time = if instance.exts().khr_convert_timespec_time.is_some() {
+            instance.now().ok()
+        } else {
+            None
+        };
+        let after = crate::timeline::now() as u64;
+        if after.saturating_sub(before) > 1_000_000 {
+            p.reset_pose_history();
+            return;
+        }
+        if let Some((flags, views)) =
+            time.and_then(|t| session.locate_views(crate::VIEW_TYPE, t, space).ok())
+        {
+            p.observe_views(flags, &views, before + (after - before) / 2);
+        } else {
+            p.reset_pose_history();
+        }
+    }
+    pub fn reset_passthrough_pose_history(&mut self) {
+        if let Some(p) = &mut self.passthrough {
+            p.reset_pose_history();
+        }
+    }
     pub fn render_stereo(
         &mut self,
         indices: &[u32],
@@ -1077,7 +1112,7 @@ impl Renderer {
     ) -> Result<Vec<Option<Vec<u8>>>> {
         self.begin()?;
         if let Some(passthrough) = &mut self.passthrough {
-            passthrough.prepare(self.cmd)?;
+            passthrough.prepare(self.cmd, views)?;
         }
         self.passthrough_active = self.passthrough.as_ref().is_some_and(|p| p.active());
         self.record_atlas_upload();
