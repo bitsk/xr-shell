@@ -259,6 +259,7 @@ pub struct Buffer {
     gpu: Rc<Gpu>,
     pub handle: vk::Buffer,
     memory: vk::DeviceMemory,
+    mapped: *mut c_void,
     pub size: u64,
 }
 impl Buffer {
@@ -267,6 +268,7 @@ impl Buffer {
             gpu,
             handle: vk::Buffer::null(),
             memory: vk::DeviceMemory::null(),
+            mapped: std::ptr::null_mut(),
             size,
         };
         unsafe {
@@ -289,6 +291,14 @@ impl Buffer {
                 None,
             )?;
             b.gpu.device.bind_buffer_memory(b.handle, b.memory, 0)?;
+            // HOST_COHERENT buffers are written/read only after the existing
+            // submission fence. Keep one mapping for their entire lifetime:
+            // Turnip otherwise mmap/munmaps the BO on every small UI update
+            // and every full RAW upload, faulting the same pages repeatedly.
+            b.mapped = b
+                .gpu
+                .device
+                .map_memory(b.memory, 0, b.size, vk::MemoryMapFlags::empty())?;
         }
         Ok(b)
     }
@@ -303,32 +313,18 @@ impl Buffer {
             "staging buffer overflow"
         );
         unsafe {
-            let mapped = self.gpu.device.map_memory(
-                self.memory,
-                0,
-                self.size,
-                vk::MemoryMapFlags::empty(),
-            )?;
             std::ptr::copy_nonoverlapping(
                 data.as_ptr(),
-                (mapped as *mut u8).add(offset),
+                (self.mapped as *mut u8).add(offset),
                 data.len(),
             );
-            self.gpu.device.unmap_memory(self.memory);
         }
         Ok(())
     }
     pub fn read(&self) -> Result<Vec<u8>> {
         unsafe {
-            let mapped = self.gpu.device.map_memory(
-                self.memory,
-                0,
-                self.size,
-                vk::MemoryMapFlags::empty(),
-            )?;
             let result =
-                std::slice::from_raw_parts(mapped as *const u8, self.size as usize).to_vec();
-            self.gpu.device.unmap_memory(self.memory);
+                std::slice::from_raw_parts(self.mapped as *const u8, self.size as usize).to_vec();
             Ok(result)
         }
     }
@@ -336,6 +332,9 @@ impl Buffer {
 impl Drop for Buffer {
     fn drop(&mut self) {
         unsafe {
+            if !self.mapped.is_null() {
+                self.gpu.device.unmap_memory(self.memory);
+            }
             self.gpu.device.destroy_buffer(self.handle, None);
             self.gpu.device.free_memory(self.memory, None);
         }
