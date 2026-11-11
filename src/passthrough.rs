@@ -24,6 +24,23 @@ use std::{
 
 const MAX_AGE_NS: u64 = 150_000_000;
 const MAX_POSE_GAP_NS: u64 = 40_000_000;
+const RADIAL_LUT_INTERVALS: usize = 1024;
+
+fn radial_projection(k: [f32; 4], theta: f32) -> f32 {
+    let t2 = theta * theta;
+    theta * (1. + t2 * (k[0] + t2 * (k[1] + t2 * (k[2] + t2 * k[3]))))
+}
+
+fn radial_lut(k: [f32; 4]) -> Vec<f32> {
+    (0..=RADIAL_LUT_INTERVALS)
+        .map(|i| {
+            // r/(r+z) spans the complete forward hemisphere smoothly. Unlike
+            // r/z, this coordinate remains bounded at the edge of the fisheye.
+            let t = i as f32 / RADIAL_LUT_INTERVALS as f32;
+            radial_projection(k, t.atan2(1. - t))
+        })
+        .collect()
+}
 
 #[derive(Clone, Copy, Default, Deserialize, PartialEq)]
 #[serde(rename_all = "kebab-case")]
@@ -396,13 +413,22 @@ impl Passthrough {
             vk::BufferUsageFlags::STORAGE_BUFFER,
         )?;
         staging.write(&vec![0; plane_bytes * 2])?;
+        let mut calibration_data = coefficients.clone();
+        for eye in &config.eyes {
+            for value in radial_lut(eye.distortion) {
+                calibration_data.extend([value, 0., 0., 0.]);
+            }
+        }
         let calibration = Buffer::host(
             gpu.clone(),
-            (coefficients.len() * 4) as u64,
+            (calibration_data.len() * 4) as u64,
             vk::BufferUsageFlags::STORAGE_BUFFER,
         )?;
         calibration.write(unsafe {
-            std::slice::from_raw_parts(coefficients.as_ptr() as *const u8, coefficients.len() * 4)
+            std::slice::from_raw_parts(
+                calibration_data.as_ptr() as *const u8,
+                calibration_data.len() * 4,
+            )
         })?;
         let mut p = Self {
             gpu,
@@ -695,6 +721,7 @@ impl Passthrough {
             "motion_compensation":if self.motion_compensation == MotionCompensation::DequeueRotation {"dequeue-rotation"}else{"none"},
             "motion_compensated_eyes":self.compensated,"motion_correction_degrees":self.correction_degrees,"motion_compensated_render_frames":self.compensated_render_frames,
             "motion_time_basis":"QSP1 dequeue CLOCK_MONOTONIC and app-observed OpenXR orientation; not exposure-time pose",
+            "fisheye_projection":"oem-radial-lut-1024","fisheye_lut_intervals":RADIAL_LUT_INTERVALS,
             "exposure_sync_verified":false,"physical_extrinsics_verified":false,"colour_calibrated":false})
     }
     pub fn active(&self) -> bool {
@@ -916,6 +943,23 @@ impl Drop for Passthrough {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn radial_lut_interpolation_preserves_the_analytic_fisheye_projection() {
+        let k = [0.1, -0.025, 0.004, -0.0001];
+        let lut = radial_lut(k);
+        let mut worst_error = 0_f32;
+        for i in 0..=65536 {
+            let t = i as f32 / 65536.;
+            let x = t * RADIAL_LUT_INTERVALS as f32;
+            let lo = (x as usize).min(RADIAL_LUT_INTERVALS - 1);
+            let approximate = lut[lo] + (lut[lo + 1] - lut[lo]) * (x - lo as f32);
+            let analytic = radial_projection(k, t.atan2(1. - t));
+            worst_error = worst_error.max((approximate - analytic).abs());
+        }
+        // Even at 2048 px focal length the interpolation stays below .02 px.
+        assert!(worst_error * 2048. < 0.02, "{} pixels", worst_error * 2048.);
+    }
 
     #[test]
     fn dequeue_rotation_keeps_oem_axes_and_rotates_current_ray_into_capture() {
