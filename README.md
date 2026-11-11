@@ -173,10 +173,11 @@ does not establish a DMA-BUF or zero-copy implementation.
 Panels have rounded 6 mm sidewalls (3 mm client edges and 2 mm control relief).
 Glass uses linear-light premultiplied compositing with per-eye specular and
 Fresnel highlights. It does not sample the sky through overlapping windows.
-Dock capsules use an ice-blue tint at 0.55 alpha, a subtle vertical sheen and
-65%/18% top-left/bottom-right outer rim with a second inset highlight. Their
-soft blue ambient shadow has a 40 px spread and 12 mm rear/down offset;
-other controls retain a smaller 24 px shadow.
+Dock capsules use a neutral light tint at 0.68 alpha and a single thin
+28%/8% top-left/bottom-right rim. Face shading has no vertical tint gradient
+or inner glow. Shadows are neutral, limited to a 12 px spread, and fade out
+inside the face silhouette instead of tinting the translucent interior.
+Icon and battery trays do not cast individual shadows.
 
 The three taskbar centres follow a horizontal 1.72 m radius at the same height,
 with a common reading pitch. The centre is 620 px wide, the sides 340 px, and
@@ -184,7 +185,7 @@ the arc-length gaps are 24 px. Each capsule and its child geometry use the same
 1.72 m curve for rendering and ray projection. This is a horizontal radius:
 with the taskbar 0.74 m below the eye, centre viewing distance is about 1.87 m.
 App trays use 0.14 alpha (0.32 hovered), retain the existing 10 mm GPU hover
-lift and carry live 14x4 px running bars with a small blue halo.
+lift and carry live 14x4 px running bars without a surrounding glow.
 
 Client alpha is clipped twice: the complete surface is rounded in its Cairo
 snapshot and the Vulkan fragment shader applies the same 16 px SDF boundary.
