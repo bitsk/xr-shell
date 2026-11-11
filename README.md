@@ -170,12 +170,21 @@ does not establish a DMA-BUF or zero-copy implementation.
 
 ## Optical glass candidate
 
-Version 0.2.1 adds rounded 6 mm panel sidewalls (3 mm client edges and 2 mm
-control relief), back-face rejection, a diagonal 14%–2% display-value highlight,
-cool environment transmission and a directional 45%/12% rim. Soft SDF shadows
-extend 24 logical pixels at a 10 mm rear offset, retaining curved-window geometry.
-These are deliberately bounded UI materials; the frost samples the environment,
-not a general blur of arbitrary overlapping scene content.
+Panels have rounded 6 mm sidewalls (3 mm client edges and 2 mm control relief).
+Glass uses linear-light premultiplied compositing with per-eye specular and
+Fresnel highlights. It does not sample the sky through overlapping windows.
+Dock capsules use an ice-blue tint at 0.55 alpha, a subtle vertical sheen and
+65%/18% top-left/bottom-right outer rim with a second inset highlight. Their
+soft blue ambient shadow has a 40 px spread and 12 mm rear/down offset;
+other controls retain a smaller 24 px shadow.
+
+The three taskbar centres follow a horizontal 1.72 m radius at the same height,
+with a common reading pitch. The centre is 620 px wide, the sides 340 px, and
+the arc-length gaps are 24 px. Each capsule and its child geometry use the same
+1.72 m curve for rendering and ray projection. This is a horizontal radius:
+with the taskbar 0.74 m below the eye, centre viewing distance is about 1.87 m.
+App trays use 0.14 alpha (0.32 hovered), retain the existing 10 mm GPU hover
+lift and carry live 14x4 px running bars with a small blue halo.
 
 Client alpha is clipped twice: the complete surface is rounded in its Cairo
 snapshot and the Vulkan fragment shader applies the same 16 px SDF boundary.

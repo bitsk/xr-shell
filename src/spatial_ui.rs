@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 use super::*;
 use crate::spatial::{Frame, add, dot, scale, sub};
+use xr_spatial_kit::taskbar;
 #[derive(Clone)]
 enum Source {
     Node(u64, String),
@@ -199,7 +200,12 @@ impl Desktop {
             }
             parent = &n.parent_id;
         }
-        Some(frame.rect(rect, depth))
+        let mut child = frame.rect(rect, depth);
+        // Keep taskbar glyphs, trays and hit geometry on the same curved ribbon.
+        if Self::node_policy(p, node) == taskbar::POLICY {
+            child.curve = frame.curve;
+        }
+        Some(child)
     }
     /// Only acknowledged, visible, flat top-level focus can become a native layer.
     pub fn focus_quad_window(&self) -> Option<String> {
@@ -319,11 +325,18 @@ impl Desktop {
                 };
                 out.push(Draw {
                     id: format!("node:{}:{}", p.id, node.node_id),
-                    frame,
+                    frame: if node.style_id == "taskbar.running" {
+                        frame.rect(
+                            [-5., -4., frame.logical[0] + 10., frame.logical[1] + 8.],
+                            0.,
+                        )
+                    } else {
+                        frame
+                    },
                     source: Source::Node(p.id, node.node_id.clone()),
                     radius,
                     rim: if icon_button {
-                        0.
+                        0.75
                     } else if node.kind == "SurfaceReference" {
                         2.
                     } else if button || glass {
@@ -332,7 +345,7 @@ impl Desktop {
                         0.
                     },
                     border: if icon_button {
-                        0.
+                        0.16
                     } else if node.style_id == "keyboard.key" {
                         0.25
                     } else if node.kind == "SurfaceReference" {
@@ -344,7 +357,9 @@ impl Desktop {
                     } else {
                         0.
                     },
-                    material: if glass {
+                    material: if node.style_id == "taskbar.running" {
+                        6.
+                    } else if glass {
                         1.
                     } else if node.kind == "SurfaceReference" {
                         2.
@@ -430,6 +445,7 @@ impl Desktop {
             if [1., 2., 3., 5.].contains(&d.material) {
                 let w = d.frame.logical[0];
                 let h = d.frame.logical[1];
+                let spread = if d.material == 1. { 40. } else { 24. };
                 let elevation = match &d.source {
                     Source::Node(id, key) if [3., 5.].contains(&d.material) => {
                         0.008 + self.lifts.get(&(*id, key.clone())).copied().unwrap_or(0.)
@@ -440,19 +456,28 @@ impl Desktop {
                     id: format!("shadow:{}", d.id),
                     frame: Frame {
                         position: add(
-                            sub(d.frame.position, scale(d.frame.normal(), elevation + 0.001)),
-                            scale(d.frame.down, elevation * 0.6),
+                            sub(
+                                d.frame.position,
+                                scale(
+                                    d.frame.normal(),
+                                    elevation + if d.material == 1. { 0.012 } else { 0.003 },
+                                ),
+                            ),
+                            scale(
+                                d.frame.down,
+                                elevation * 0.6 + if d.material == 1. { 0.012 } else { 0. },
+                            ),
                         ),
                         size: [
-                            d.frame.size[0] * (w + 48.) / w,
-                            d.frame.size[1] * (h + 48.) / h,
+                            d.frame.size[0] * (w + spread * 2.) / w,
+                            d.frame.size[1] * (h + spread * 2.) / h,
                         ],
-                        logical: [w + 48., h + 48.],
+                        logical: [w + spread * 2., h + spread * 2.],
                         ..d.frame
                     },
                     source: Source::Shadow(Box::new(d.source.clone())),
                     radius: d.radius,
-                    rim: 0.,
+                    rim: spread,
                     border: 0.,
                     material: 4.,
                 });
@@ -799,7 +824,7 @@ impl Desktop {
     }
     pub fn layout(&self, offset: usize, limit: usize) -> Value {
         let draws = self.draws();
-        let items:Vec<_>=draws.iter().skip(offset).take(limit.min(32)).map(|d|json!({"id":d.id,"position_m":d.frame.position,"right":d.frame.right,"down":d.frame.down,"normal":d.frame.normal(),"size_m":d.frame.size,"logical_size":d.frame.logical,"curve_radius_m":d.frame.curve,"corner_radius_px":d.radius,"rim_width_px":d.rim,"rim_alpha":d.border,"material":d.material,"rim_alpha_top_left":if d.material==1. {0.50}else{d.border},"rim_alpha_bottom_right":if d.material==1. {0.16}else{d.border},"extrusion_depth_m":match d.material as u32 {1=>0.006,2=>0.003,3=>0.002,_=>0.},"shadow_spread_px":if d.material==4. {24}else{0}})).collect();
+        let items:Vec<_>=draws.iter().skip(offset).take(limit.min(32)).map(|d|json!({"id":d.id,"position_m":d.frame.position,"right":d.frame.right,"down":d.frame.down,"normal":d.frame.normal(),"size_m":d.frame.size,"logical_size":d.frame.logical,"curve_radius_m":d.frame.curve,"corner_radius_px":d.radius,"rim_width_px":d.rim,"rim_alpha":d.border,"material":d.material,"rim_alpha_top_left":if d.material==1. {0.65}else{d.border},"rim_alpha_bottom_right":if d.material==1. {0.18}else{d.border},"extrusion_depth_m":match d.material as u32 {1=>0.006,2=>0.003,3=>0.002,_=>0.},"shadow_spread_px":if d.material==4. {d.rim}else{0.}})).collect();
         json!({"total":draws.len(),"offset":offset,"items":items})
     }
     fn target(draw: &Draw) -> Option<Target> {

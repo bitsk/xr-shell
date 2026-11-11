@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
-//! One shared lazy-follow anchor with individually user-facing taskbar islands.
+//! One shared lazy-follow anchor with equal-radius curved taskbar islands.
 use crate::spatial::{Frame, add, sub};
 use serde::Serialize;
 use xr_spatial_kit::taskbar;
@@ -43,13 +43,13 @@ impl TaskbarFollow {
                 taskbar::CENTER_POSITION[2],
             ]),
         );
-        let mut facing = Frame::new(
-            frame.position,
-            frame.size,
-            frame.logical,
-            crate::spatial::user_facing(frame.position, eye),
-        );
-        facing.curve = frame.curve;
+        let mut rotation = crate::spatial::user_facing(frame.position, eye);
+        // All three centres share one horizontal radius and one reading pitch.
+        rotation[0] = (1.6 - taskbar::CENTER_POSITION[1])
+            .atan2(taskbar::RADIUS_M)
+            .to_degrees();
+        let mut facing = Frame::new(frame.position, frame.size, frame.logical, rotation);
+        facing.curve = taskbar::RADIUS_M;
         facing
     }
     pub fn mode(&self) -> &'static str {

@@ -183,7 +183,7 @@ fn islands_share_motion_capture_and_scene_refresh_without_moving_world_panels() 
         .with_rotation(taskbar::ROTATION)
         .with_spatial_policy(taskbar::POLICY),
     );
-    dock.push(Widget::card("left-bg", [0., 0., 440., 72.], "dock.background").parent("left"));
+    dock.push(Widget::card("left-bg", [0., 0., 340., 72.], "dock.background").parent("left"));
     let mut system = Scene::new([600., 700.], [0.6, 0.7], [1.18, 1.6, -1.74], "world_locked")
         .with_rotation([0., -18., 0.]);
     system.push(
@@ -196,7 +196,7 @@ fn islands_share_motion_capture_and_scene_refresh_without_moving_world_panels() 
         .with_rotation(taskbar::ROTATION)
         .with_spatial_policy(taskbar::POLICY),
     );
-    system.push(Widget::card("right-bg", [0., 0., 440., 72.], "dock.background").parent("right"));
+    system.push(Widget::card("right-bg", [0., 0., 340., 72.], "dock.background").parent("right"));
     system.push(
         Widget::button(
             "status",
@@ -239,14 +239,35 @@ fn islands_share_motion_capture_and_scene_refresh_without_moving_world_panels() 
             .any(|d| d.abs() > 0.2)
     );
     assert!(center.right[2].abs() > 0.5);
-    close(
-        sub(left.position, center.position),
-        scale(center.right, -0.9632),
-    );
-    close(
-        sub(right.position, center.position),
-        scale(center.right, 0.9632),
-    );
+    let horizontal_normal = [-center.right[2], 0., center.right[0]];
+    for (island, design) in [
+        (left, taskbar::LEFT_POSITION),
+        (right, taskbar::RIGHT_POSITION),
+    ] {
+        close(
+            sub(island.position, center.position),
+            add(
+                scale(center.right, design[0]),
+                scale(horizontal_normal, design[2] - taskbar::CENTER_POSITION[2]),
+            ),
+        );
+        assert!((design[0].hypot(design[2]) - taskbar::RADIUS_M).abs() < 0.00001);
+        assert_eq!(island.curve, taskbar::RADIUS_M);
+        assert!((island.normal()[1] - center.normal()[1]).abs() < 0.00001);
+        // Curved face pixels must round-trip through the same ray intersection.
+        for xy in [[8., 36.], [170., 36.], [332., 36.]] {
+            let point = island.point(xy, 0.);
+            let normal = island.normal_at(xy);
+            let (hit, _) = island
+                .project(add(point, scale(normal, 0.3)), scale(normal, -1.))
+                .unwrap();
+            assert!((hit[0] - xy[0]).abs() < 0.001 && (hit[1] - xy[1]).abs() < 0.001);
+        }
+    }
+    let arc_gap = taskbar::RADIUS_M * taskbar::RIGHT_POSITION[0].atan2(-taskbar::RIGHT_POSITION[2])
+        - taskbar::CENTER_SIZE[0] * 0.5
+        - taskbar::SIDE_SIZE[0] * 0.5;
+    assert!((arc_gap - taskbar::GAP_PX * taskbar::SCALE_M).abs() < 0.00001);
     assert!(dot(left.normal(), center.normal()) < 0.99);
     assert!(dot(right.normal(), center.normal()) < 0.99);
     close(frame(&d, 2, "control").position, world.position);
@@ -260,7 +281,7 @@ fn islands_share_motion_capture_and_scene_refresh_without_moving_world_panels() 
         )
         .unwrap();
     assert!((xy[0] - 26.).abs() < 0.001 && (xy[1] - 26.).abs() < 0.001);
-    assert!(dot(button.normal(), right.normal()) > 0.9999);
+    assert!(dot(button.normal(), right.normal_at([52., 36.])) > 0.9999);
     d.captures.insert(
         "regression".into(),
         Capture {
@@ -300,7 +321,13 @@ fn islands_share_motion_capture_and_scene_refresh_without_moving_world_panels() 
             frame(&d, 2, "right-bg").position,
             frame(&d, 1, "center").position,
         ),
-        scale(center.right, 0.9632),
+        add(
+            scale(center.right, taskbar::RIGHT_POSITION[0]),
+            scale(
+                horizontal_normal,
+                taskbar::RIGHT_POSITION[2] - taskbar::CENTER_POSITION[2],
+            ),
+        ),
     );
     let current = frame(&d, 1, "center");
     d.taskbar_follow.set_mode(false);

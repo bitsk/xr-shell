@@ -19,10 +19,19 @@ void main(){
  Item item=items[item_index];vec2 size=item.logical.xy;float material=item.centre.w;
  float radius=min(item.logical.z,min(size.x,size.y)*.5);
  if(material==4.){
-  float distance=rounded((local_uv-.5)*size,max(vec2(1),size*.5-vec2(24)),radius);
-  float alpha=.17*(1.-smoothstep(-4.,24.,distance));if(alpha<.001)discard;
-  if(opaque_pass==1)discard;
-  colour=vec4(linear_colour(vec3(35,60,96)/255.)*alpha,alpha);return;
+  float spread=max(item.logical.w,1.);
+  float distance=rounded((local_uv-.5)*size,max(vec2(1),size*.5-vec2(spread)),radius);
+  float alpha=.22*exp(-pow(max(distance,0.)/(spread*.48),2.))*(1.-smoothstep(spread*.7,spread,distance));
+  if(alpha<.001||opaque_pass==1)discard;
+  colour=vec4(linear_colour(vec3(.045,.10,.19))*alpha,alpha);return;
+ }
+ if(material==6.){
+  float distance=rounded((local_uv-.5)*size,max(vec2(1),size*.5-vec2(5.,4.)),2.);
+  float core=1.-smoothstep(-.6,.6,distance);
+  float glow=.28*exp(-pow(max(distance,0.)/2.5,2.));
+  float alpha=max(core,glow);
+  if(alpha<.001||opaque_pass==1)discard;
+  colour=vec4(linear_colour(vec3(.26,.72,1.))*alpha,alpha);return;
  }
  vec3 normal=normalize(world_normal),toward_eye=normalize(view.origin.xyz-world_position);
  vec3 light=normalize(vec3(-.5,1.,1.));
@@ -32,7 +41,7 @@ void main(){
  float spec=pow(max(dot(normal,normalize(light+toward_eye)),0.),64.);
  if(side_face==1){
   if(facing<=0.||opaque_pass==1)discard;
-  float alpha=material==3.?.52:.7;
+  float alpha=material==1.?.38:min(.52,item.tint.a);
   vec3 tint=linear_colour(mix(vec3(.65,.75,.88),vec3(.95,.98,1.),.2+.65*max(dot(normal,light),0.)));
   colour=vec4((tint+vec3(.08)*fresnel)*alpha,alpha);return;
  }
@@ -49,7 +58,7 @@ void main(){
   vec4 tint=item.tint;
   tint.rgb=mix(tint.rgb,vec3(.78,.88,1.),item.controls.x*.35);
   tint.rgb=mix(tint.rgb,vec3(.55,.74,.98),item.controls.y*.25);
-  tint.a=max(tint.a,item.controls.x*.22);
+  tint.a=mix(tint.a,max(tint.a,.32),item.controls.x);
   if(material==5.){
    float track=rounded(point,vec2(size.x*.5,11.),11.);
    float track_alpha=1.-smoothstep(-aa,aa,track);
@@ -60,7 +69,10 @@ void main(){
    float knob_alpha=1.-smoothstep(-aa,aa,knob);
    base=over(vec4(linear_colour(vec3(.98,.99,1.))*knob_alpha,knob_alpha),base);
   }else{
-   vec3 lit=linear_colour(tint.rgb)+vec3(.16)*spec+vec3(.08,.10,.13)*fresnel;
+   float sheen=material==1.?mix(.08,-.03,local_uv.y):0.;
+   float inner_glow=material==1.?.035*exp(-pow((local_uv.y-.24)/.38,2.)):0.;
+   vec3 lit=linear_colour(tint.rgb)*(1.+sheen)+vec3(.08,.12,.18)*inner_glow
+       +vec3(.16)*spec+vec3(.08,.10,.13)*fresnel;
    base=vec4(lit*tint.a,tint.a);
   }
  }
@@ -71,7 +83,15 @@ void main(){
   pixel=over(vec4(linear_colour(vec3(.216,.565,.98))*alpha,alpha),pixel);
  }
  float rim=(1.-smoothstep(item.logical.w-aa,item.logical.w+aa,abs(distance)))*item.extra.x;
- rim*=clamp(.45+fresnel+spec,0.,1.);
+ if(material==1.){
+  // Top/left key light and a second inset rim describe a rounded glass edge.
+  float top=1.-smoothstep(.0,1.,local_uv.y);
+  float lit_edge=max(top,(1.-local_uv.x)*.75);
+  float outer=1.-smoothstep(0.,1.2+aa,abs(distance));
+  float inner=1.-smoothstep(.4,1.1+aa,abs(distance+2.2));
+  rim=max(outer*mix(.18,.65,lit_edge),inner*mix(.04,.16,lit_edge));
+ }else{rim*=clamp(.45+fresnel+spec,0.,1.);}
+
  pixel=over(vec4(vec3(rim),rim),pixel);
  colour=pixel*mask;
  if(colour.a<.001)discard;
