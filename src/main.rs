@@ -701,7 +701,6 @@ fn frame_loop(
         }
         times[5] = timeline::now();
         let result = renderer.render_stereo(&indices, &views, capture.is_some());
-        summary.passthrough = renderer.passthrough_status();
         times[6] = timeline::now();
         let releases: Vec<_> = renderer
             .targets_mut()
@@ -805,6 +804,8 @@ fn frame_loop(
                 &[&background],
             )?;
         }
+        renderer.passthrough_submitted();
+        summary.passthrough = renderer.passthrough_status();
         times[8] = timeline::now();
         summary.timeline.push(timeline::Frame {
             number: summary.frames + 1,

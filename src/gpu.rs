@@ -293,7 +293,15 @@ impl Buffer {
         Ok(b)
     }
     pub fn write(&self, data: &[u8]) -> Result<()> {
-        ensure!(data.len() as u64 <= self.size, "staging buffer overflow");
+        self.write_at(0, data)
+    }
+    pub fn write_at(&self, offset: usize, data: &[u8]) -> Result<()> {
+        ensure!(
+            offset
+                .checked_add(data.len())
+                .is_some_and(|end| end as u64 <= self.size),
+            "staging buffer overflow"
+        );
         unsafe {
             let mapped = self.gpu.device.map_memory(
                 self.memory,
@@ -301,7 +309,11 @@ impl Buffer {
                 self.size,
                 vk::MemoryMapFlags::empty(),
             )?;
-            std::ptr::copy_nonoverlapping(data.as_ptr(), mapped as *mut u8, data.len());
+            std::ptr::copy_nonoverlapping(
+                data.as_ptr(),
+                (mapped as *mut u8).add(offset),
+                data.len(),
+            );
             self.gpu.device.unmap_memory(self.memory);
         }
         Ok(())

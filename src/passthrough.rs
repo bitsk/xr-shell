@@ -2,20 +2,20 @@
 //! Read QSP1 snapshots from the existing hardware owner. This module never
 //! opens V4L2, changes a sensor, or depends on the debug server or browser.
 use crate::gpu::{Buffer, Gpu};
-use crate::renderer::{colour_layers, colour_range, image_barrier};
+use crate::renderer::{colour_range, image_barrier};
 use anyhow::{Context, Result, ensure};
 use ash::vk;
 use serde::Deserialize;
 use std::{
     fs::{File, OpenOptions},
-    io::{Read, Seek, SeekFrom},
+    io::{Cursor, Read},
     os::fd::AsRawFd,
     os::unix::fs::{MetadataExt, OpenOptionsExt},
     path::{Path, PathBuf},
     rc::Rc,
     sync::{
         Arc, Mutex,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
     },
     thread,
     time::Duration,
@@ -58,14 +58,19 @@ struct Frame {
     generation: u64,
     sequence: u64,
     received: u64,
-    rgba: Vec<u8>,
+    stride: usize,
+    raw: Vec<u8>,
     sums: [f64; 3],
     count: u32,
 }
 struct Stereo {
-    received: [u64; 2],
-    rgba: Vec<u8>,
+    frames: [Arc<Frame>; 2],
     gains: [f32; 3],
+}
+#[derive(Default)]
+struct WorkerStats {
+    reads: [AtomicU64; 2],
+    cpu_ns: [AtomicU64; 2],
 }
 fn snapshot(
     directory: &Path,
@@ -75,7 +80,11 @@ fn snapshot(
     height: usize,
     black: u16,
 ) -> Option<Frame> {
-    let mut selected: Option<Frame> = None;
+    let started = now_ns();
+    let max_stride = (width * 2 * 5 / 4).div_ceil(256) * 256;
+    // Inspect only the small headers first. Keep a shared lock solely on the
+    // newest candidate; no full-image decoding is performed under that lock.
+    let mut selected: Option<(File, u64, u64, u64, usize, usize)> = None;
     for index in 0..3 {
         let mut f = match OpenOptions::new()
             .read(true)
@@ -85,96 +94,82 @@ fn snapshot(
             Ok(f) => f,
             Err(_) => continue,
         };
-        let meta = f.metadata().ok()?;
-        if !meta.is_file() || meta.uid() != 0 || meta.mode() & 0o022 != 0 {
+        let meta = match f.metadata() {
+            Ok(m) => m,
+            Err(_) => continue,
+        };
+        if !meta.is_file()
+            || meta.uid() != 0
+            || meta.mode() & 0o022 != 0
+            || unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_SH | libc::LOCK_NB) } != 0
+        {
             continue;
         }
-        if unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_SH | libc::LOCK_NB) } != 0 {
+        let mut header = [0u8; 64];
+        if f.read_exact(&mut header).is_err() {
             continue;
         }
-        let read = (|| {
-            let mut header = [0u8; 64];
-            f.read_exact(&mut header).ok()?;
-            let word = |offset| u32::from_le_bytes(header[offset..offset + 4].try_into().unwrap());
-            let wide = |offset| u64::from_le_bytes(header[offset..offset + 8].try_into().unwrap());
-            let (stride, bytes) = (word(16) as usize, word(28) as usize);
-            let (generation, sequence, received) = (wide(32), wide(40), wide(48));
-            // QSP1 header: generation, sequence, received are at 32, 40, 48;
-            // the final eight bytes are reserved, not a timestamp.
-            if word(0) != 0x31505351
-                || word(4) != 1
-                || word(8) as usize != width * 2
-                || word(12) as usize != height * 2
-                || word(20) != u32::from_le_bytes(*b"pRAA")
-                || word(24) != slot
-                || !(width * 2 * 5 / 4..=8192).contains(&stride)
-                || bytes != stride * height * 2
-                || meta.len() != 64 + bytes as u64
-                || received > now_ns()
-                || now_ns().saturating_sub(received) >= MAX_AGE_NS
-            {
-                return None;
-            }
-            if previous.is_some_and(|p| p.generation == generation && p.sequence >= sequence)
-                || selected.as_ref().is_some_and(|p| p.received >= received)
-            {
-                return None;
-            }
-            let mut raw = vec![0u8; bytes];
-            f.seek(SeekFrom::Start(64)).ok()?;
-            f.read_exact(&mut raw).ok()?;
-            let mut rgba = vec![0u8; width * height * 4];
-            let mut sums = [0.; 3];
-            let mut count = 0;
-            let sample = |x: usize, y: usize| -> u16 {
-                let group = y * stride + (x / 4) * 5;
-                u16::from(raw[group + x % 4]) * 4 + u16::from((raw[group + 4] >> (2 * (x % 4))) & 3)
-            };
-            for y in 0..height {
-                for x in 0..width {
-                    let values = [
-                        sample(x * 2, y * 2),
-                        (sample(x * 2 + 1, y * 2) + sample(x * 2, y * 2 + 1)) / 2,
-                        sample(x * 2 + 1, y * 2 + 1),
-                    ];
-                    let dest = (y * width + x) * 4;
-                    for channel in 0..3 {
-                        rgba[dest + channel] = ((u32::from(values[channel].saturating_sub(black))
-                            * 255)
-                            / u32::from(1023 - black))
-                        .min(255) as u8;
-                    }
-                    rgba[dest + 3] = 255;
-                    // Joint RGB mask excludes darkness and clipped highlights;
-                    // one shared estimate preserves stereo colour consistency.
-                    if x % 8 == 0
-                        && y % 8 == 0
-                        && rgba[dest..dest + 3].iter().all(|v| *v > 6 && *v < 225)
-                    {
-                        for channel in 0..3 {
-                            sums[channel] += f64::from(rgba[dest + channel]);
-                        }
-                        count += 1;
-                    }
+        let word = |at| u32::from_le_bytes(header[at..at + 4].try_into().unwrap());
+        let wide = |at| u64::from_le_bytes(header[at..at + 8].try_into().unwrap());
+        let (stride, bytes) = (word(16) as usize, word(28) as usize);
+        let (generation, sequence, received) = (wide(32), wide(40), wide(48));
+        if word(0) != 0x31505351
+            || word(4) != 1
+            || word(8) as usize != width * 2
+            || word(12) as usize != height * 2
+            || word(20) != u32::from_le_bytes(*b"pRAA")
+            || word(24) != slot
+            || !(width * 2 * 5 / 4..=max_stride).contains(&stride)
+            || bytes != stride * height * 2
+            || meta.len() != 64 + bytes as u64
+            || received > started
+            || started.saturating_sub(received) >= MAX_AGE_NS
+            || previous.is_some_and(|p| p.generation == generation && p.sequence >= sequence)
+            || selected.as_ref().is_some_and(|p| p.3 >= received)
+        {
+            continue;
+        }
+        selected = Some((f, generation, sequence, received, stride, bytes));
+    }
+    let (mut f, generation, sequence, received, stride, bytes) = selected?;
+    let mut raw = vec![0u8; bytes];
+    f.read_exact(&mut raw).ok()?;
+    drop(f); // Release the producer's snapshot before colour statistics.
+    let sample = |x: usize, y: usize| -> u16 {
+        let at = y * stride + (x / 4) * 5;
+        u16::from(raw[at + x % 4]) * 4 + u16::from((raw[at + 4] >> (2 * (x % 4))) & 3)
+    };
+    let mut sums = [0.; 3];
+    let mut count = 0;
+    // Sparse grey-world statistics only. The GPU unpacks every output pixel.
+    for y in (0..height).step_by(8) {
+        for x in (0..width).step_by(8) {
+            let values = [
+                sample(x * 2, y * 2),
+                (sample(x * 2 + 1, y * 2) + sample(x * 2, y * 2 + 1)) / 2,
+                sample(x * 2 + 1, y * 2 + 1),
+            ];
+            let rgb = values.map(|v| {
+                ((u32::from(v.saturating_sub(black)) * 255) / u32::from(1023 - black)).min(255)
+                    as u8
+            });
+            if rgb.iter().all(|v| *v > 6 && *v < 225) {
+                for c in 0..3 {
+                    sums[c] += f64::from(rgb[c]);
                 }
+                count += 1;
             }
-            Some(Frame {
-                generation,
-                sequence,
-                received,
-                rgba,
-                sums,
-                count,
-            })
-        })();
-        unsafe {
-            libc::flock(f.as_raw_fd(), libc::LOCK_UN);
-        }
-        if let Some(frame) = read {
-            selected = Some(frame);
         }
     }
-    selected
+    Some(Frame {
+        generation,
+        sequence,
+        received,
+        stride,
+        raw,
+        sums,
+        count,
+    })
 }
 
 pub struct Passthrough {
@@ -196,6 +191,21 @@ pub struct Passthrough {
     coefficients: Vec<f32>,
     gains: [f32; 3],
     white_balance: String,
+    plane_bytes: usize,
+    black: u32,
+    compute_layout: vk::PipelineLayout,
+    compute_pipeline: vk::Pipeline,
+    compute_set_layout: vk::DescriptorSetLayout,
+    compute_pool: vk::DescriptorPool,
+    compute_set: vk::DescriptorSet,
+    uploaded_ids: [(u64, u64); 2],
+    uploaded_distinct: [u64; 2],
+    submitted_ids: [(u64, u64); 2],
+    submitted_distinct: [u64; 2],
+    submitted_render_frames: u64,
+    strides: [u32; 2],
+    stats: Arc<WorkerStats>,
+    last_report_ns: u64,
 }
 impl Passthrough {
     pub fn from_environment(gpu: Rc<Gpu>, descriptor: vk::DescriptorSet) -> Result<Option<Self>> {
@@ -252,11 +262,14 @@ impl Passthrough {
             0.,
         ]);
         coefficients.extend([width as f32, height as f32, 0., 0.]);
+        let row_capacity = (width * 2 * 5 / 4).div_ceil(256) * 256;
+        let plane_bytes = row_capacity * height * 2;
         let staging = Buffer::host(
             gpu.clone(),
-            (width * 2 * height * 4) as u64,
-            vk::BufferUsageFlags::TRANSFER_SRC,
+            (plane_bytes * 2) as u64,
+            vk::BufferUsageFlags::STORAGE_BUFFER,
         )?;
+        staging.write(&vec![0; plane_bytes * 2])?;
         let calibration = Buffer::host(
             gpu.clone(),
             (coefficients.len() * 4) as u64,
@@ -273,11 +286,7 @@ impl Passthrough {
             sampler: vk::Sampler::null(),
             staging,
             _calibration: calibration,
-            latest: Arc::new(Mutex::new(Some(Stereo {
-                received: [0; 2],
-                rgba: vec![0u8; width * 2 * height * 4],
-                gains: config.colour_gain,
-            }))),
+            latest: Arc::new(Mutex::new(None)),
             stop: Arc::new(AtomicBool::new(false)),
             worker: None,
             received: [0; 2],
@@ -288,6 +297,21 @@ impl Passthrough {
             coefficients,
             gains: config.colour_gain,
             white_balance: config.white_balance.clone(),
+            plane_bytes,
+            black: u32::from(config.black_level_10bit),
+            compute_layout: vk::PipelineLayout::null(),
+            compute_pipeline: vk::Pipeline::null(),
+            compute_set_layout: vk::DescriptorSetLayout::null(),
+            compute_pool: vk::DescriptorPool::null(),
+            compute_set: vk::DescriptorSet::null(),
+            uploaded_ids: [(0, 0); 2],
+            uploaded_distinct: [0; 2],
+            submitted_ids: [(0, 0); 2],
+            submitted_distinct: [0; 2],
+            submitted_render_frames: 0,
+            strides: [(width * 2 * 5 / 4) as u32; 2],
+            stats: Arc::new(WorkerStats::default()),
+            last_report_ns: 0,
         };
         unsafe {
             let d = &p.gpu.device;
@@ -304,7 +328,7 @@ impl Passthrough {
                     .array_layers(1)
                     .samples(vk::SampleCountFlags::TYPE_1)
                     .tiling(vk::ImageTiling::OPTIMAL)
-                    .usage(vk::ImageUsageFlags::SAMPLED | vk::ImageUsageFlags::TRANSFER_DST),
+                    .usage(vk::ImageUsageFlags::SAMPLED | vk::ImageUsageFlags::STORAGE),
                 None,
             )?;
             let req = d.get_image_memory_requirements(p.image);
@@ -355,23 +379,30 @@ impl Passthrough {
                 &[],
             );
         }
+        p.create_decoder()?;
         let latest = p.latest.clone();
         let stop = p.stop.clone();
+        let stats = p.stats.clone();
         p.worker = Some(thread::spawn(move || {
-            let mut frames: [Option<Frame>; 2] = [None, None];
+            let mut frames: [Option<Arc<Frame>>; 2] = [None, None];
             let mut gains = config.colour_gain;
+            let mut next_balance = 0;
             while !stop.load(Ordering::Relaxed) {
                 let mut changed = false;
                 for eye in 0..2 {
+                    let started = now_ns();
                     if let Some(f) = snapshot(
                         &config.directory,
                         config.eyes[eye].slot,
-                        frames[eye].as_ref(),
+                        frames[eye].as_deref(),
                         width,
                         height,
                         config.black_level_10bit,
                     ) {
-                        frames[eye] = Some(f);
+                        stats.reads[eye].fetch_add(1, Ordering::Relaxed);
+                        stats.cpu_ns[eye]
+                            .fetch_add(now_ns().saturating_sub(started), Ordering::Relaxed);
+                        frames[eye] = Some(Arc::new(f));
                         changed = true;
                     }
                 }
@@ -381,7 +412,10 @@ impl Passthrough {
                             .is_some_and(|f| now_ns().saturating_sub(f.received) < MAX_AGE_NS)
                     })
                 {
-                    if config.white_balance == "gray-world" {
+                    let now = now_ns();
+                    // Keep adaptation time stable as source frame rate increases.
+                    if config.white_balance == "gray-world" && now >= next_balance {
+                        next_balance = now + 33_333_333;
                         let sums: [f64; 3] = std::array::from_fn(|c| {
                             frames.iter().map(|f| f.as_ref().unwrap().sums[c]).sum()
                         });
@@ -399,40 +433,133 @@ impl Passthrough {
                             }
                         }
                     }
-                    let mut rgba = vec![0u8; width * 2 * height * 4];
-                    for (eye, frame) in frames.iter().enumerate() {
-                        let frame = frame.as_ref().unwrap();
-                        for y in 0..height {
-                            let source = &frame.rgba[y * width * 4..(y + 1) * width * 4];
-                            let target = (y * width * 2 + eye * width) * 4;
-                            rgba[target..target + width * 4].copy_from_slice(source);
-                        }
-                    }
                     if let Ok(mut target) = latest.lock() {
                         *target = Some(Stereo {
-                            received: [
-                                frames[0].as_ref().unwrap().received,
-                                frames[1].as_ref().unwrap().received,
+                            frames: [
+                                frames[0].as_ref().unwrap().clone(),
+                                frames[1].as_ref().unwrap().clone(),
                             ],
-                            rgba,
                             gains,
                         });
                     }
                 }
-                thread::sleep(Duration::from_millis(8));
+                thread::sleep(Duration::from_millis(2));
             }
         }));
         eprintln!(
-            "XR_PASSTHROUGH=enabled SOURCE=QSP1 SIZE={}x{} STEREO=left4,right5 COLOUR=black-subtracted-linear GEOMETRY=OEM-camera-body-rotation",
+            "XR_PASSTHROUGH=enabled SOURCE=QSP1 SIZE={}x{} STEREO=left4,right5 DECODE=GPU-RAW10 COLOUR=black-subtracted-linear GEOMETRY=OEM-camera-body-rotation",
             width, height
         );
         Ok(Some(p))
     }
+    fn create_decoder(&mut self) -> Result<()> {
+        unsafe {
+            let d = &self.gpu.device;
+            self.compute_set_layout = d.create_descriptor_set_layout(
+                &vk::DescriptorSetLayoutCreateInfo::default().bindings(&[
+                    vk::DescriptorSetLayoutBinding::default()
+                        .binding(0)
+                        .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                        .descriptor_count(1)
+                        .stage_flags(vk::ShaderStageFlags::COMPUTE),
+                    vk::DescriptorSetLayoutBinding::default()
+                        .binding(1)
+                        .descriptor_type(vk::DescriptorType::STORAGE_IMAGE)
+                        .descriptor_count(1)
+                        .stage_flags(vk::ShaderStageFlags::COMPUTE),
+                ]),
+                None,
+            )?;
+            self.compute_pool = d.create_descriptor_pool(
+                &vk::DescriptorPoolCreateInfo::default()
+                    .max_sets(1)
+                    .pool_sizes(&[
+                        vk::DescriptorPoolSize {
+                            ty: vk::DescriptorType::STORAGE_BUFFER,
+                            descriptor_count: 1,
+                        },
+                        vk::DescriptorPoolSize {
+                            ty: vk::DescriptorType::STORAGE_IMAGE,
+                            descriptor_count: 1,
+                        },
+                    ]),
+                None,
+            )?;
+            self.compute_set = d.allocate_descriptor_sets(
+                &vk::DescriptorSetAllocateInfo::default()
+                    .descriptor_pool(self.compute_pool)
+                    .set_layouts(&[self.compute_set_layout]),
+            )?[0];
+            d.update_descriptor_sets(
+                &[
+                    vk::WriteDescriptorSet::default()
+                        .dst_set(self.compute_set)
+                        .dst_binding(0)
+                        .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                        .buffer_info(&[vk::DescriptorBufferInfo::default()
+                            .buffer(self.staging.handle)
+                            .range(self.staging.size)]),
+                    vk::WriteDescriptorSet::default()
+                        .dst_set(self.compute_set)
+                        .dst_binding(1)
+                        .descriptor_type(vk::DescriptorType::STORAGE_IMAGE)
+                        .image_info(&[vk::DescriptorImageInfo::default()
+                            .image_view(self.view)
+                            .image_layout(vk::ImageLayout::GENERAL)]),
+                ],
+                &[],
+            );
+            self.compute_layout = d.create_pipeline_layout(
+                &vk::PipelineLayoutCreateInfo::default()
+                    .set_layouts(&[self.compute_set_layout])
+                    .push_constant_ranges(&[vk::PushConstantRange {
+                        stage_flags: vk::ShaderStageFlags::COMPUTE,
+                        offset: 0,
+                        size: 28,
+                    }]),
+                None,
+            )?;
+            let code = ash::util::read_spv(&mut Cursor::new(include_bytes!(concat!(
+                env!("OUT_DIR"),
+                "/passthrough.comp.spv"
+            ))))?;
+            let shader =
+                d.create_shader_module(&vk::ShaderModuleCreateInfo::default().code(&code), None)?;
+            let result = d.create_compute_pipelines(
+                vk::PipelineCache::null(),
+                &[vk::ComputePipelineCreateInfo::default()
+                    .layout(self.compute_layout)
+                    .stage(
+                        vk::PipelineShaderStageCreateInfo::default()
+                            .stage(vk::ShaderStageFlags::COMPUTE)
+                            .module(shader)
+                            .name(c"main"),
+                    )],
+                None,
+            );
+            d.destroy_shader_module(shader, None);
+            match result {
+                Ok(p) => self.compute_pipeline = p[0],
+                Err((partial, error)) => {
+                    for pipeline in partial {
+                        d.destroy_pipeline(pipeline, None);
+                    }
+                    return Err(error.into());
+                }
+            }
+        }
+        Ok(())
+    }
     pub fn status(&self) -> serde_json::Value {
-        serde_json::json!({"source":"QSP1", "size_per_eye":[self.width,self.height], "slots_left_right":[4,5], "white_balance":self.white_balance, "colour_gain":self.gains,
-            "active":self.active(), "uploaded_frames":self.uploaded_frames,
-            "age_ms":self.received.map(|t| if t==0 {None} else {Some(now_ns().saturating_sub(t) as f64/1e6)}),
-            "pair_dq_delta_ms":self.received[0].abs_diff(self.received[1]) as f64/1e6,
+        let reads = self
+            .stats
+            .reads
+            .each_ref()
+            .map(|x| x.load(Ordering::Relaxed));
+        serde_json::json!({"source":"QSP1","decode":"gpu-raw10","reported_monotonic_ns":now_ns(),"size_per_eye":[self.width,self.height],"slots_left_right":[4,5],"white_balance":self.white_balance,"colour_gain":self.gains,
+            "active":self.active(),"uploaded_frames":self.uploaded_frames,"uploaded_distinct_source_frames":self.uploaded_distinct,"submitted_distinct_source_frames":self.submitted_distinct,"submitted_render_frames":self.submitted_render_frames,
+            "source_generation":self.uploaded_ids.map(|x|x.0),"source_sequence":self.uploaded_ids.map(|x|x.1),"raw_reads":reads,"average_raw_read_cpu_ms":std::array::from_fn::<_,2,_>(|i|if reads[i]==0 {0.}else{self.stats.cpu_ns[i].load(Ordering::Relaxed) as f64/reads[i] as f64/1e6}),
+            "received_monotonic_ns":self.received,"age_ms":self.received.map(|t|if t==0 {None}else{Some(now_ns().saturating_sub(t) as f64/1e6)}),"pair_dq_delta_ms":self.received[0].abs_diff(self.received[1]) as f64/1e6,
             "exposure_sync_verified":false,"physical_extrinsics_verified":false,"colour_calibrated":false})
     }
     pub fn active(&self) -> bool {
@@ -442,21 +569,56 @@ impl Passthrough {
                 .iter()
                 .all(|t| *t > 0 && now_ns().saturating_sub(*t) < MAX_AGE_NS)
     }
+    pub fn submitted(&mut self, active: bool) {
+        if active {
+            self.submitted_render_frames += 1;
+            for i in 0..2 {
+                if self.submitted_ids[i] != self.uploaded_ids[i] {
+                    self.submitted_distinct[i] += 1;
+                    self.submitted_ids[i] = self.uploaded_ids[i];
+                }
+            }
+        }
+        let now = now_ns();
+        if now.saturating_sub(self.last_report_ns) >= 1_000_000_000 {
+            self.last_report_ns = now;
+            let mut status = self.status();
+            status["render_active"] = active.into();
+            eprintln!("XR_PASSTHROUGH_STATS {}", status);
+        }
+    }
     pub fn prepare(&mut self, cmd: vk::CommandBuffer) -> Result<()> {
         let next = match self.latest.try_lock() {
             Ok(mut f) => f.take(),
             Err(_) => None,
         };
-        if let Some(frame) = next {
-            self.staging.write(&frame.rgba)?;
-            self.gains = frame.gains;
-            self.coefficients[40..43].copy_from_slice(&frame.gains);
+        let mut mask = if self.initialized { 0u32 } else { 3 };
+        if let Some(stereo) = next {
+            for (i, frame) in stereo.frames.iter().enumerate() {
+                let id = (frame.generation, frame.sequence);
+                if id != self.uploaded_ids[i] {
+                    ensure!(
+                        frame.raw.len() <= self.plane_bytes,
+                        "RAW plane exceeds allocated capacity"
+                    );
+                    self.staging.write_at(i * self.plane_bytes, &frame.raw)?;
+                    self.strides[i] = frame.stride as u32;
+                    self.received[i] = frame.received;
+                    self.uploaded_ids[i] = id;
+                    self.uploaded_distinct[i] += 1;
+                    mask |= 1 << i;
+                }
+            }
+            self.gains = stereo.gains;
+            self.coefficients[40..43].copy_from_slice(&stereo.gains);
             self._calibration.write(unsafe {
                 std::slice::from_raw_parts(
                     self.coefficients.as_ptr() as *const u8,
                     self.coefficients.len() * 4,
                 )
             })?;
+        }
+        if mask != 0 {
             unsafe {
                 let d = &self.gpu.device;
                 let (old, source, stage) = if self.initialized {
@@ -475,48 +637,65 @@ impl Passthrough {
                 d.cmd_pipeline_barrier(
                     cmd,
                     stage,
-                    vk::PipelineStageFlags::TRANSFER,
+                    vk::PipelineStageFlags::COMPUTE_SHADER,
                     vk::DependencyFlags::empty(),
                     &[],
                     &[],
                     &[image_barrier(
                         self.image,
                         old,
-                        vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                        vk::ImageLayout::GENERAL,
                         source,
-                        vk::AccessFlags::TRANSFER_WRITE,
+                        vk::AccessFlags::SHADER_WRITE,
                     )],
                 );
-                d.cmd_copy_buffer_to_image(
+                d.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::COMPUTE, self.compute_pipeline);
+                d.cmd_bind_descriptor_sets(
                     cmd,
-                    self.staging.handle,
-                    self.image,
-                    vk::ImageLayout::TRANSFER_DST_OPTIMAL,
-                    &[vk::BufferImageCopy::default()
-                        .image_subresource(colour_layers())
-                        .image_extent(vk::Extent3D {
-                            width: (self.width * 2) as u32,
-                            height: self.height as u32,
-                            depth: 1,
-                        })],
+                    vk::PipelineBindPoint::COMPUTE,
+                    self.compute_layout,
+                    0,
+                    &[self.compute_set],
+                    &[],
+                );
+                let params = [
+                    self.width as u32,
+                    self.height as u32,
+                    self.plane_bytes as u32,
+                    self.strides[0],
+                    self.strides[1],
+                    self.black,
+                    mask,
+                ];
+                d.cmd_push_constants(
+                    cmd,
+                    self.compute_layout,
+                    vk::ShaderStageFlags::COMPUTE,
+                    0,
+                    std::slice::from_raw_parts(params.as_ptr() as *const u8, 28),
+                );
+                d.cmd_dispatch(
+                    cmd,
+                    (self.width as u32 * 2).div_ceil(8),
+                    (self.height as u32).div_ceil(8),
+                    1,
                 );
                 d.cmd_pipeline_barrier(
                     cmd,
-                    vk::PipelineStageFlags::TRANSFER,
+                    vk::PipelineStageFlags::COMPUTE_SHADER,
                     vk::PipelineStageFlags::FRAGMENT_SHADER,
                     vk::DependencyFlags::empty(),
                     &[],
                     &[],
                     &[image_barrier(
                         self.image,
-                        vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                        vk::ImageLayout::GENERAL,
                         vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
-                        vk::AccessFlags::TRANSFER_WRITE,
+                        vk::AccessFlags::SHADER_WRITE,
                         vk::AccessFlags::SHADER_READ,
                     )],
                 );
             }
-            self.received = frame.received;
             self.initialized = true;
             if self.received.iter().all(|t| *t > 0) {
                 self.uploaded_frames += 1;
@@ -525,6 +704,7 @@ impl Passthrough {
         Ok(())
     }
 }
+
 impl Drop for Passthrough {
     fn drop(&mut self) {
         self.stop.store(true, Ordering::Relaxed);
@@ -533,6 +713,10 @@ impl Drop for Passthrough {
         }
         unsafe {
             let d = &self.gpu.device;
+            d.destroy_pipeline(self.compute_pipeline, None);
+            d.destroy_pipeline_layout(self.compute_layout, None);
+            d.destroy_descriptor_pool(self.compute_pool, None);
+            d.destroy_descriptor_set_layout(self.compute_set_layout, None);
             d.destroy_sampler(self.sampler, None);
             d.destroy_image_view(self.view, None);
             d.destroy_image(self.image, None);

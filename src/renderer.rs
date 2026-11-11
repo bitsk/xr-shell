@@ -1064,6 +1064,11 @@ impl Renderer {
             status
         })
     }
+    pub fn passthrough_submitted(&mut self) {
+        if let Some(p) = &mut self.passthrough {
+            p.submitted(self.passthrough_active);
+        }
+    }
     pub fn render_stereo(
         &mut self,
         indices: &[u32],

@@ -412,3 +412,9 @@ or execution time. Samples remain bounded and are written only on capture/exit.
 投影采用无穷远旋转模型，配置保留相机中心的真实米制平移供审计，但没有
 虚构深度来应用平移。快照时间是DQ，不是曝光时间；运动重投影、曝光同步、
 色彩准确度和佩戴几何仍需单独验收。默认环境保持原样，包安装不启用透视。
+
+彩透吞吐路径现在只读取最新QSP1原始帧，复制后立即释放共享锁；CPU仅稀疏
+采样白平衡统计，RAW10全图解包与Bayer单元生成由Vulkan计算着色器执行。
+双眼原始帧通过共享引用传递，仅上传发生变化的眼睛。每秒的
+`XR_PASSTHROUGH_STATS` 区分读取、GPU上传、不同源帧的OpenXR提交计数；
+OpenXR提交不是物理扫描呈现证明。摄像头/曝光同步与运动重投影仍需另行验收。
