@@ -683,7 +683,7 @@ impl Input {
             } else {
                 None
             };
-            if let Some((amplitude, milliseconds)) = pulse {
+            if let Some((amplitude, milliseconds)) = pulse.filter(|_| std::env::var("XR_SHELL_INPUT_MODE").as_deref() != Ok("hands")) {
                 let vibration = xr::HapticVibration::new()
                     .amplitude(amplitude)
                     .frequency(xr::FREQUENCY_UNSPECIFIED)

@@ -662,7 +662,11 @@ fn frame_loop(
             input_times[2] = timeline::now();
             renderer.update_panel_poses(&d.panel_poses(), head_position)?;
             input_times[3] = timeline::now();
-            renderer.controller_visuals = d.controller_visuals;
+            // Optical hands use measured grip/aim and the existing 6DoF routes.
+            // Do not draw a physical controller body at an optical palm pose.
+            renderer.controller_visuals = if env::var("XR_SHELL_INPUT_MODE").as_deref() == Ok("hands") {
+                d.controller_visuals & 2
+            } else { d.controller_visuals };
             if let Some(i) = input.as_ref() {
                 renderer.update_ray_feedback(std::array::from_fn(|hand| {
                     let (origin, direction) = i.controllers()[hand].aim_ray()?;
