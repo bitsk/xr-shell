@@ -4,6 +4,8 @@ mod controller_model;
 mod desktop;
 mod environment;
 mod gpu;
+mod hand_model;
+mod hand_tracking;
 mod home;
 mod input;
 mod passthrough;
@@ -46,6 +48,7 @@ struct Options {
     socket: Option<PathBuf>,
     ui_anchor: ui_anchor::Mode,
     focus_quad: bool,
+    hand_reference_capture: Option<PathBuf>,
 }
 impl Options {
     fn parse() -> Result<Option<Self>> {
@@ -59,6 +62,7 @@ impl Options {
             debug_input: false,
             socket: None,
             ui_anchor: ui_anchor::Mode::Stage,
+            hand_reference_capture: None,
             focus_quad: env::var("XR_FOCUS_QUAD").is_ok_and(|v| v == "auto"),
         };
         let mut args = env::args().skip(1);
@@ -77,6 +81,13 @@ impl Options {
                     o.capture_dir = Some(
                         args.next()
                             .context("--capture-dir requires a directory")?
+                            .into(),
+                    )
+                }
+                "--hand-reference-capture" => {
+                    o.hand_reference_capture = Some(
+                        args.next()
+                            .context("--hand-reference-capture requires a recorded file")?
                             .into(),
                     )
                 }
@@ -124,6 +135,11 @@ impl Options {
         ensure!(
             o.scale.is_finite() && (0.1..=1.0).contains(&o.scale),
             "view scale must be in 0.1..1"
+        );
+        ensure!(
+            o.hand_reference_capture.is_none()
+                || (!o.components && o.capture_dir.is_some() && (1..=30).contains(&o.seconds)),
+            "recorded hand capture requires no components, a capture directory and 1..30 seconds"
         );
         Ok(Some(o))
     }
@@ -314,6 +330,7 @@ fn run(options: &Options, summary: &mut Summary) -> Result<()> {
     );
     let mut extensions = xr::ExtensionSet::default();
     extensions.khr_vulkan_enable2 = true;
+    extensions.ext_hand_tracking = available.ext_hand_tracking;
     extensions.khr_convert_timespec_time = available.khr_convert_timespec_time;
     let instance = entry.create_instance(
         &xr::ApplicationInfo {
@@ -474,6 +491,18 @@ fn frame_loop(
     input: &mut Option<input::Input>,
 ) -> Result<()> {
     let mut home = home::Home::new();
+    let mut hands = hand_tracking::Tracking::new(instance, session);
+    let reference = options
+        .hand_reference_capture
+        .as_ref()
+        .map(|p| hand_tracking::Reference::load(p))
+        .transpose()?;
+    renderer.hand_reference_capture = reference.is_some();
+    if reference.is_some() {
+        eprintln!(
+            "XR_HAND_REFERENCE source=recorded capture_only=true action_routes=none projection_layers=0"
+        );
+    }
     let mut centered_space = None;
     let mut events = xr::EventDataBuffer::new();
     let mut running = false;
@@ -553,6 +582,7 @@ fn frame_loop(
         summary.waited_frames += 1;
         // Clear visibility even while the runtime suspends scene rendering.
         renderer.update_controllers(&[input::HandState::default(); 2]);
+        renderer.clear_hands();
         renderer.update_ray_feedback([None; 2]);
         let recenter_requested =
             home.poll(state.should_render && desktop.as_ref().is_some_and(|d| d.focused));
@@ -648,10 +678,20 @@ fn frame_loop(
                 d.invalidate_horizon_head();
             }
         }
+        renderer.update_hands(hands.sample(space, state.predicted_display_time))?;
         let mut input_times = [timeline::now(); 5];
         if let (Some(i), Some(d)) = (input.as_mut(), desktop.as_mut()) {
             i.update(session, space, state.predicted_display_time, d)?;
             renderer.update_controllers(i.controllers());
+        }
+        if let Some(reference) = reference.as_ref() {
+            let mut centre = views[0].pose;
+            centre.position = xr::Vector3f {
+                x: head_position[0],
+                y: head_position[1],
+                z: head_position[2],
+            };
+            renderer.update_hands(reference.at(centre))?;
         }
         input_times[1] = timeline::now();
         if let Some(d) = desktop.as_mut() {
@@ -664,9 +704,12 @@ fn frame_loop(
             input_times[3] = timeline::now();
             // Optical hands use measured grip/aim and the existing 6DoF routes.
             // Do not draw a physical controller body at an optical palm pose.
-            renderer.controller_visuals = if env::var("XR_SHELL_INPUT_MODE").as_deref() == Ok("hands") {
-                d.controller_visuals & 2
-            } else { d.controller_visuals };
+            renderer.controller_visuals =
+                if env::var("XR_SHELL_INPUT_MODE").as_deref() == Ok("hands") {
+                    d.controller_visuals & 2
+                } else {
+                    d.controller_visuals
+                };
             if let Some(i) = input.as_ref() {
                 renderer.update_ray_feedback(std::array::from_fn(|hand| {
                     let (origin, direction) = i.controllers()[hand].aim_ray()?;
@@ -749,7 +792,13 @@ fn frame_loop(
         let background = xr::CompositionLayerProjection::new()
             .space(space)
             .views(&layers);
-        if let Some(focus) = &renderer.focus_quad {
+        if reference.is_some() {
+            stream.end(
+                state.predicted_display_time,
+                xr::EnvironmentBlendMode::OPAQUE,
+                &[],
+            )?;
+        } else if let Some(focus) = &renderer.focus_quad {
             let target = renderer.quad.as_ref().unwrap();
             let quad = xr::CompositionLayerQuad::new()
                 .space(space)
@@ -825,7 +874,13 @@ fn frame_loop(
             predicted_display_xr_ns: state.predicted_display_time.as_nanos(),
             runtime_now_xr_ns,
             runtime_now_mono_bracket_ns: clock_bracket,
-            layers: if renderer.focus_quad.is_some() { 3 } else { 1 },
+            layers: if reference.is_some() {
+                0
+            } else if renderer.focus_quad.is_some() {
+                3
+            } else {
+                1
+            },
             capture: capture.is_some(),
             input_mono_ns: input_times,
             head_pose: {

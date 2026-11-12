@@ -258,6 +258,7 @@ impl Renderer {
             .controller_states
             .iter()
             .any(|s| s.grip.is_some() || s.aim.is_some())
+            || self.hand_joints.iter().any(Option::is_some)
         {
             return Err("controller-depth-requires-projection".into());
         }

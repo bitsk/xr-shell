@@ -135,6 +135,9 @@ pub struct Renderer {
     opaque_pipeline: vk::Pipeline,
     controllers: [Option<crate::controller_model::Model>; 2],
     controller_states: [crate::input::HandState; 2],
+    pub hand_reference_capture: bool,
+    hand_models: [Option<crate::controller_model::Model>; 2],
+    hand_joints: [Option<xr::HandJointLocations>; 2],
     ray_feedback: [Option<crate::spatial::RayFeedback>; 2],
     draw_count: u32,
     uv_map: std::collections::BTreeMap<String, [f32; 4]>,
@@ -201,6 +204,9 @@ impl Renderer {
             opaque_pipeline: vk::Pipeline::null(),
             controllers: [None, None],
             controller_states: [crate::input::HandState::default(); 2],
+            hand_reference_capture: false,
+            hand_models: [None, None],
+            hand_joints: [None, None],
             ray_feedback: [None; 2],
             draw_count: 0,
             uv_map: std::collections::BTreeMap::new(),
@@ -262,6 +268,12 @@ impl Renderer {
             Err(error) => eprintln!("XR_PASSTHROUGH=disabled ERROR={error:#}"),
         }
         r.controllers = crate::controller_model::load_models(r.gpu.clone(), r.pass);
+        if std::env::var("XR_SHELL_INPUT_MODE").as_deref() == Ok("hands") {
+            for hand in 0..2 {
+                r.hand_models[hand] =
+                    Some(crate::controller_model::Model::hand(r.gpu.clone(), r.pass)?);
+            }
+        }
         eprintln!("XR_INIT_STAGE=renderer-resources STATUS=complete");
         for (index, v) in views.iter().enumerate() {
             let extent = vk::Extent2D {
@@ -685,6 +697,21 @@ impl Renderer {
         }
     }
 
+    pub fn clear_hands(&mut self) {
+        self.hand_joints = [None, None];
+    }
+    pub fn update_hands(&mut self, joints: [Option<xr::HandJointLocations>; 2]) -> Result<()> {
+        self.hand_joints = joints;
+        for hand in 0..2 {
+            if let Some(model) = self.hand_models[hand].as_mut() {
+                model.update_hand(self.hand_joints[hand].as_ref())?;
+            }
+        }
+        Ok(())
+    }
+    pub fn hand_status(&self) -> serde_json::Value {
+        serde_json::json!({"extension":"XR_EXT_hand_tracking","source":if self.hand_reference_capture{"recorded-capture-only"}else{"live-openxr"},"joint_count":26,"model":"rounded articulated palm and fingers","hands":(0..2).map(|h|serde_json::json!({"hand":if h==0{"left"}else{"right"},"active":self.hand_joints[h].is_some(),"model_loaded":self.hand_models[h].is_some(),"model_vertices":self.hand_models[h].as_ref().map_or(0,|m|m.vertex_count()),"joints":self.hand_joints[h].as_ref().map(|js|js.iter().map(|j|serde_json::json!({"flags":j.location_flags.into_raw(),"position":[j.pose.position.x,j.pose.position.y,j.pose.position.z],"orientation":[j.pose.orientation.x,j.pose.orientation.y,j.pose.orientation.z,j.pose.orientation.w],"radius":j.radius})).collect::<Vec<_>>())})).collect::<Vec<_>>()})
+    }
     pub fn update_controllers(&mut self, states: &[crate::input::HandState; 2]) {
         self.controller_states = *states;
     }
@@ -697,6 +724,7 @@ impl Renderer {
         serde_json::json!({
             "source": "OpenXR action grip/aim spaces at predicted display time",
             "draw_mask":self.controller_visuals,
+            "hand_tracking":self.hand_status(),
             "model_to_grip_calibrated": false,
             "model_binding_source": "Resource controller-anchors.json; model-only rotation, tracked grip and aim unchanged",
             "hands": self.controllers.iter().zip(&self.controller_states).enumerate().map(|(hand,(model,state))| {
@@ -924,6 +952,15 @@ impl Renderer {
                         self.ray_feedback[hand].as_ref(),
                         false,
                     );
+                }
+            }
+            if matches!(pass, DrawPass::All) {
+                for hand in 0..2 {
+                    if self.hand_joints[hand].is_some() {
+                        if let Some(model) = self.hand_models[hand].as_ref() {
+                            model.draw_hand(self.cmd, view, &self.controller_states[hand]);
+                        }
+                    }
                 }
             }
             // Controller drawing uses a separate descriptor and push-constant layout.
@@ -1195,6 +1232,7 @@ impl Drop for Renderer {
             self.foreground.clear();
             self.quad = None;
             self.eyes.clear();
+            self.hand_models = [None, None];
             self.controllers = [None, None];
             let d = &self.gpu.device;
             d.destroy_pipeline(self.spatial_pipeline, None);

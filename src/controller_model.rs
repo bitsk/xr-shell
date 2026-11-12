@@ -148,11 +148,36 @@ impl Model {
                 .collect(),
             _ => anyhow::bail!("controller texture must be RGB or RGBA"),
         };
+        Self::from_data(
+            gpu,
+            pass,
+            mesh.vertices,
+            &pixels,
+            info.width,
+            info.height,
+            directory.display().to_string(),
+            source_rotation,
+            source_binding_present,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn from_data(
+        gpu: Rc<Gpu>,
+        pass: vk::RenderPass,
+        vertices: Vec<[f32; 8]>,
+        pixels: &[u8],
+        width: u32,
+        height: u32,
+        directory: String,
+        source_rotation: xr::Quaternionf,
+        source_binding_present: bool,
+    ) -> Result<Self> {
         let mut m = Self {
             gpu,
             vertices: None,
             beam: None,
-            count: mesh.vertices.len() as u32,
+            count: vertices.len() as u32,
             image: vk::Image::null(),
             memory: vk::DeviceMemory::null(),
             view: vk::ImageView::null(),
@@ -166,16 +191,16 @@ impl Model {
             upload_pool: vk::CommandPool::null(),
             upload_fence: vk::Fence::null(),
             modules: Vec::new(),
-            directory: directory.display().to_string(),
+            directory,
             source_rotation,
             source_binding_present,
         };
         let buffer = Buffer::host(
             m.gpu.clone(),
-            (mesh.vertices.len() * 32) as u64,
+            (vertices.len() * 32) as u64,
             vk::BufferUsageFlags::VERTEX_BUFFER,
         )?;
-        buffer.write(bytes(&mesh.vertices))?;
+        buffer.write(bytes(&vertices))?;
         m.vertices = Some(buffer);
         // Two crossing thin surfaces keep the beam visible from either eye.
         let mut beam: Vec<[f32; 8]> = Vec::new();
@@ -223,13 +248,62 @@ impl Model {
         )?;
         buffer.write(bytes(&beam))?;
         m.beam = Some(buffer);
-        m.upload(&pixels, info.width, info.height)?;
+        m.upload(&pixels, width, height)?;
         m.pipeline(pass)?;
         eprintln!(
             "XR_CONTROLLER_MODEL directory={} vertices={} texture={}x{}",
-            m.directory, m.count, info.width, info.height
+            m.directory, m.count, width, height
         );
         Ok(m)
+    }
+
+    pub fn hand(gpu: Rc<Gpu>, pass: vk::RenderPass) -> Result<Self> {
+        let mut model = Self::from_data(
+            gpu,
+            pass,
+            vec![[0.; 8]; 8192],
+            &[174, 206, 222, 255],
+            1,
+            1,
+            "procedural anatomical hand".into(),
+            xr::Quaternionf {
+                x: 0.,
+                y: 0.,
+                z: 0.,
+                w: 1.,
+            },
+            true,
+        )?;
+        model.count = 0;
+        Ok(model)
+    }
+    pub fn update_hand(&mut self, joints: Option<&xr::HandJointLocations>) -> Result<()> {
+        self.count = 0;
+        if let Some(joints) = joints {
+            let vertices = crate::hand_model::vertices(joints);
+            ensure!(
+                vertices.len() <= 8192,
+                "hand surface exceeds allocated vertex capacity"
+            );
+            if !vertices.is_empty() {
+                self.vertices.as_ref().unwrap().write(bytes(&vertices))?;
+                self.count = vertices.len() as u32;
+            }
+        }
+        Ok(())
+    }
+    pub fn vertex_count(&self) -> u32 {
+        self.count
+    }
+    pub unsafe fn draw_hand(&self, cmd: vk::CommandBuffer, view: &xr::View, state: &HandState) {
+        if self.count == 0 {
+            return;
+        }
+        let state = HandState {
+            grip: Some(xr::Posef::IDENTITY),
+            ..*state
+        };
+        unsafe { self.draw(cmd, view, &state, None, false) };
     }
 
     fn upload(&mut self, pixels: &[u8], width: u32, height: u32) -> Result<()> {
