@@ -1,3 +1,9 @@
+xr-shell (0.2.30) unstable; urgency=medium
+
+  * Reflect live input selection and toggle passthrough without competing capture.
+
+ -- bits <bigbits@hackx.cc>  Thu, 12 Nov 2026 16:42:54 +0800
+
 xr-shell (0.2.29) unstable; urgency=medium
 
   * Consume OpenXR hand joints and render articulated hands for spatial input.

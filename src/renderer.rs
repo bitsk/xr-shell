@@ -1094,6 +1094,11 @@ impl Renderer {
 
     /// Both eyes share one recording/submission. The single completion wait
     /// protects XR release and optional readback; no CPU wait splits the eyes.
+    pub fn set_passthrough_visible(&mut self, visible: bool) {
+        if let Some(p) = self.passthrough.as_mut() {
+            p.set_visible(visible);
+        }
+    }
     pub fn passthrough_status(&self) -> Option<serde_json::Value> {
         self.passthrough.as_ref().map(|p| {
             let mut status = p.status();

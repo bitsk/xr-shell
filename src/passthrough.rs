@@ -319,6 +319,7 @@ pub struct Passthrough {
     _calibration: Buffer,
     latest: Arc<Mutex<Option<Stereo>>>,
     stop: Arc<AtomicBool>,
+    visible: Arc<AtomicBool>,
     worker: Option<thread::JoinHandle<()>>,
     received: [u64; 2],
     initialized: bool,
@@ -440,6 +441,7 @@ impl Passthrough {
             _calibration: calibration,
             latest: Arc::new(Mutex::new(None)),
             stop: Arc::new(AtomicBool::new(false)),
+            visible: Arc::new(AtomicBool::new(true)),
             worker: None,
             received: [0; 2],
             initialized: false,
@@ -541,11 +543,16 @@ impl Passthrough {
         let latest = p.latest.clone();
         let stop = p.stop.clone();
         let stats = p.stats.clone();
+        let visible = p.visible.clone();
         p.worker = Some(thread::spawn(move || {
             let mut frames: [Option<Arc<Frame>>; 2] = [None, None];
             let mut gains = config.colour_gain;
             let mut next_balance = 0;
             while !stop.load(Ordering::Relaxed) {
+                if !visible.load(Ordering::Relaxed) {
+                    thread::sleep(std::time::Duration::from_millis(30));
+                    continue;
+                }
                 let mut changed = false;
                 for eye in 0..2 {
                     let started = now_ns();
@@ -724,8 +731,12 @@ impl Passthrough {
             "fisheye_projection":"oem-radial-lut-1024","fisheye_lut_intervals":RADIAL_LUT_INTERVALS,
             "exposure_sync_verified":false,"physical_extrinsics_verified":false,"colour_calibrated":false})
     }
+    pub fn set_visible(&self, visible: bool) {
+        self.visible.store(visible, Ordering::Relaxed);
+    }
     pub fn active(&self) -> bool {
-        self.initialized
+        self.visible.load(Ordering::Relaxed)
+            && self.initialized
             && self
                 .received
                 .iter()
@@ -809,6 +820,9 @@ impl Passthrough {
     }
 
     pub fn prepare(&mut self, cmd: vk::CommandBuffer) -> Result<()> {
+        if !self.visible.load(Ordering::Relaxed) && self.initialized {
+            return Ok(());
+        }
         let next = match self.latest.try_lock() {
             Ok(mut f) => f.take(),
             Err(_) => None,

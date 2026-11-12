@@ -446,6 +446,13 @@ impl Input {
         self.gates[hand].cancel();
     }
 
+    pub fn cancel_for_source_change(&mut self, desktop: &mut Desktop) {
+        for hand in 0..2 {
+            self.cancel_hand(hand, desktop, "input source changed");
+        }
+        self.last_hover = [None, None];
+    }
+
     pub fn cancel_for_recenter(&mut self, desktop: &mut Desktop) {
         for hand in 0..2 {
             self.cancel_hand(hand, desktop, "desktop recentered");
@@ -683,7 +690,9 @@ impl Input {
             } else {
                 None
             };
-            if let Some((amplitude, milliseconds)) = pulse.filter(|_| std::env::var("XR_SHELL_INPUT_MODE").as_deref() != Ok("hands")) {
+            if let Some((amplitude, milliseconds)) =
+                pulse.filter(|_| std::env::var("XR_SHELL_INPUT_MODE").as_deref() != Ok("hands"))
+            {
                 let vibration = xr::HapticVibration::new()
                     .amplitude(amplitude)
                     .frequency(xr::FREQUENCY_UNSPECIFIED)

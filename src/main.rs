@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 mod art;
 mod controller_model;
+mod controls;
 mod desktop;
 mod environment;
 mod gpu;
@@ -491,6 +492,7 @@ fn frame_loop(
     input: &mut Option<input::Input>,
 ) -> Result<()> {
     let mut home = home::Home::new();
+    let mut controls = controls::Controls::new();
     let mut hands = hand_tracking::Tracking::new(instance, session);
     let reference = options
         .hand_reference_capture
@@ -678,7 +680,19 @@ fn frame_loop(
                 d.invalidate_horizon_head();
             }
         }
-        renderer.update_hands(hands.sample(space, state.predicted_display_time))?;
+        controls.poll();
+        renderer.set_passthrough_visible(controls.passthrough());
+        if controls.take_source_change() {
+            if let (Some(i), Some(d)) = (input.as_mut(), desktop.as_mut()) {
+                i.cancel_for_source_change(d);
+            }
+        }
+        let hand_joints = hands.sample(space, state.predicted_display_time);
+        renderer.update_hands(if controls.source() == "hands" {
+            hand_joints
+        } else {
+            [None, None]
+        })?;
         let mut input_times = [timeline::now(); 5];
         if let (Some(i), Some(d)) = (input.as_mut(), desktop.as_mut()) {
             i.update(session, space, state.predicted_display_time, d)?;
@@ -704,12 +718,11 @@ fn frame_loop(
             input_times[3] = timeline::now();
             // Optical hands use measured grip/aim and the existing 6DoF routes.
             // Do not draw a physical controller body at an optical palm pose.
-            renderer.controller_visuals =
-                if env::var("XR_SHELL_INPUT_MODE").as_deref() == Ok("hands") {
-                    d.controller_visuals & 2
-                } else {
-                    d.controller_visuals
-                };
+            renderer.controller_visuals = match controls.source() {
+                "hands" => d.controller_visuals & 2,
+                "controllers" => d.controller_visuals,
+                _ => 0,
+            };
             if let Some(i) = input.as_ref() {
                 renderer.update_ray_feedback(std::array::from_fn(|hand| {
                     let (origin, direction) = i.controllers()[hand].aim_ray()?;
@@ -867,6 +880,7 @@ fn frame_loop(
         }
         renderer.passthrough_submitted();
         summary.passthrough = renderer.passthrough_status();
+        controls.report(summary.passthrough.clone());
         times[8] = timeline::now();
         summary.timeline.push(timeline::Frame {
             number: summary.frames + 1,
