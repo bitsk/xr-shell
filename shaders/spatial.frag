@@ -51,9 +51,6 @@ void main(){
  float mask=1.-smoothstep(-aa,aa,distance);if(mask<.001)discard;
  vec2 atlas_uv=item.uvrect.xy+clamp(local_uv,0.,1.)*item.uvrect.zw;
  vec4 glyph=texture(atlas,atlas_uv);
- // Cairo's bytes are premultiplied in sRGB. Undo that representation
- // before linear-light premultiplied compositing (the sampler decodes sRGB).
- glyph.rgb=glyph.a>.0001?linear_colour(clamp(display_colour(glyph.rgb)/glyph.a,0.,1.))*glyph.a:vec3(0);
  vec4 base=vec4(0);
  if(material==1.||material==3.||material==5.){
   vec4 tint=item.tint;
@@ -76,19 +73,32 @@ void main(){
    base=vec4(lit*tint.a,tint.a);
   }
  }
- vec4 pixel=over(glyph,base);
- if(item.controls.w>.5){
-  float grip=rounded(point,vec2(size.x*.30,2.5),2.5);
-  float alpha=1.-smoothstep(-aa,aa,grip);
-  pixel=over(vec4(linear_colour(vec3(.216,.565,.98))*alpha,alpha),pixel);
- }
  float rim=(1.-smoothstep(item.logical.w-aa,item.logical.w+aa,abs(distance)))*item.extra.x;
  if(material==1.){
   float lit_edge=max(1.-local_uv.y,(1.-local_uv.x)*.6);
   float outer=1.-smoothstep(0.,.55+aa,abs(distance));
   rim=outer*mix(.08,.28,lit_edge);
  }else{rim*=clamp(.45+fresnel+spec,0.,1.);}
-
+ // Both depth passes visit the same panel. Reject the other pass's pixels
+ // before the expensive sRGB unpremultiplication. Keep the final exact
+ // classification below; a small margin avoids changing threshold edges.
+ float pass_alpha=glyph.a+base.a*(1.-glyph.a);
+ if(item.controls.w>.5){
+  float grip=rounded(point,vec2(size.x*.30,2.5),2.5);
+  float alpha=1.-smoothstep(-aa,aa,grip);
+  pass_alpha=alpha+pass_alpha*(1.-alpha);
+ }
+ pass_alpha=(rim+pass_alpha*(1.-rim))*mask;
+ if(opaque_pass==1 ? pass_alpha<.9949 : pass_alpha>.9951)discard;
+ // Cairo's bytes are premultiplied in sRGB. Undo that representation
+ // before linear-light premultiplied compositing (the sampler decodes sRGB).
+ glyph.rgb=glyph.a>.0001?linear_colour(clamp(display_colour(glyph.rgb)/glyph.a,0.,1.))*glyph.a:vec3(0);
+ vec4 pixel=over(glyph,base);
+ if(item.controls.w>.5){
+  float grip=rounded(point,vec2(size.x*.30,2.5),2.5);
+  float alpha=1.-smoothstep(-aa,aa,grip);
+  pixel=over(vec4(linear_colour(vec3(.216,.565,.98))*alpha,alpha),pixel);
+ }
  pixel=over(vec4(vec3(rim),rim),pixel);
  colour=pixel*mask;
  if(colour.a<.001)discard;

@@ -1,3 +1,9 @@
+xr-shell (0.2.34) unstable; urgency=medium
+
+  * Reject pixels belonging to the other depth pass before sRGB conversion.
+
+ -- bits <bigbits@hackx.cc>  Fri, 13 Nov 2026 17:09:14 +0800
+
 xr-shell (0.2.33) unstable; urgency=medium
 
   * Keep stage statistics, not every retained frame, in the exit summary.
