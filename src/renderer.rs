@@ -114,6 +114,16 @@ struct AtlasUpload {
     gutters: Vec<vk::ImageBlit>,
     clear: bool,
 }
+/// Diagnostic cost attribution only: `XR_SHELL_DRAW_SKIP=background,panels`
+/// omits those draws so GPU time can be compared between launches.
+fn draw_skip() -> (bool, bool) {
+    static SKIP: std::sync::OnceLock<(bool, bool)> = std::sync::OnceLock::new();
+    *SKIP.get_or_init(|| {
+        let value = std::env::var("XR_SHELL_DRAW_SKIP").unwrap_or_default();
+        let has = |name| value.split(',').any(|item| item == name);
+        (has("background"), has("panels"))
+    })
+}
 pub struct Renderer {
     gpu: Rc<Gpu>,
     pub timing: crate::gpu_timing::Timer,
@@ -889,7 +899,8 @@ impl Renderer {
                     ]),
                 vk::SubpassContents::INLINE,
             );
-            if matches!(pass, DrawPass::Foreground | DrawPass::Quad) {
+            let (skip_background, skip_panels) = draw_skip();
+            if matches!(pass, DrawPass::Foreground | DrawPass::Quad) || skip_background {
                 // The shared pass uses DONT_CARE for the opaque panorama.
                 // Alpha layers must explicitly clear reused swapchain images;
                 // unwritten pixels otherwise retain undefined/previous content.
@@ -958,7 +969,7 @@ impl Renderer {
                 0,
                 bytes,
             );
-            if matches!(pass, DrawPass::All | DrawPass::Background) {
+            if matches!(pass, DrawPass::All | DrawPass::Background) && !skip_background {
                 d.cmd_draw(self.cmd, 3, 1, 0, 0);
             }
             record("background_and_setup");
@@ -1008,7 +1019,7 @@ impl Renderer {
                 0,
                 bytes,
             );
-            if self.ui_anchor_ready && self.draw_count > 0 {
+            if self.ui_anchor_ready && self.draw_count > 0 && !skip_panels {
                 // Opaque window/glyph cores establish per-pixel depth before
                 // sorted translucent glass. Intersecting opaque panels no longer
                 // depend on their centre-distance order.

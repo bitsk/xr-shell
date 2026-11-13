@@ -1,3 +1,10 @@
+xr-shell (0.2.32) unstable; urgency=medium
+
+  * Parse the built-in style tokens once instead of for every draw of every frame.
+  * Add a diagnostic XR_SHELL_DRAW_SKIP launch switch for GPU cost attribution.
+
+ -- bits <bigbits@hackx.cc>  Fri, 13 Nov 2026 15:41:41 +0800
+
 xr-shell (0.2.31) unstable; urgency=medium
 
   * Add bounded per-frame input, model, CPU and optional GPU timestamp observations.

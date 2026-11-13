@@ -19,6 +19,12 @@ use std::{
 };
 use xr_shell_protocols::{CAPABILITIES, Node, Packet, SeqPacket};
 use xr_spatial_kit::Theme;
+/// The built-in UKUI tokens are immutable. `Theme::default()` parses its JSON on
+/// every call, so validation and per-frame draw preparation share one instance.
+pub(crate) fn ukui_theme() -> &'static Theme {
+    static THEME: std::sync::OnceLock<Theme> = std::sync::OnceLock::new();
+    THEME.get_or_init(Theme::default)
+}
 
 #[derive(Clone)]
 struct Root {
@@ -785,7 +791,7 @@ impl Desktop {
                                 "invalid primitive fields"
                             );
                             ensure!(
-                                Theme::default().styles.contains_key(&node.style_id)
+                                ukui_theme().styles.contains_key(&node.style_id)
                                     || node.style_id == "ukui.default"
                                     || (node.kind == "Group" && node.style_id.is_empty()),
                                 "unregistered style id"

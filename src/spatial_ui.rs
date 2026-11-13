@@ -518,7 +518,7 @@ impl Desktop {
         }
         self.dirty = false;
         let started = std::time::Instant::now();
-        let theme = Theme::default();
+        let theme = ukui_theme();
         let mut panels = Vec::new();
         let draws = self.draws();
         let live: BTreeSet<_> = draws.iter().map(|d| d.id.clone()).collect();
@@ -582,7 +582,7 @@ impl Desktop {
                             &canvas,
                             n,
                             [0., 0., width as f32, height as f32],
-                            &theme,
+                            theme,
                             false,
                             false,
                             true,
@@ -651,6 +651,7 @@ impl Desktop {
         Ok(Some(panels))
     }
     pub fn panel_poses(&self) -> Vec<Geometry> {
+        let theme = ukui_theme();
         self.draws()
             .into_iter()
             .map(|d| {
@@ -687,7 +688,6 @@ impl Desktop {
                 if matches!(d.source, Source::Shadow(_)) && matches!(original, Source::Window(_)) {
                     layer -= 0.01;
                 }
-                let theme = Theme::default();
                 let (tint, controls) = match original {
                     Source::Node(id,key) => {
                         let n = &self.peers[id].nodes[key];
