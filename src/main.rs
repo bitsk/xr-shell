@@ -511,6 +511,7 @@ fn frame_loop(
     let mut running = false;
     let mut started = None::<Instant>;
     loop {
+        let loop_start = timeline::now();
         while let Some(event) = instance.poll_event(&mut events)? {
             match event {
                 xr::Event::SessionStateChanged(e) => {
@@ -559,6 +560,7 @@ fn frame_loop(
             std::thread::sleep(Duration::from_millis(20));
             continue;
         }
+        let events_done = timeline::now();
         if summary.waited_frames % 30 == 0 {
             let request = options.summary_dir().join("timeline-request");
             if request.is_file() {
@@ -908,6 +910,7 @@ fn frame_loop(
                 &[&background],
             )?;
         }
+        let end_frame_done = timeline::now();
         renderer.passthrough_submitted();
         summary.passthrough = renderer.passthrough_status();
         controls.report(summary.passthrough.clone());
@@ -915,6 +918,10 @@ fn frame_loop(
         summary.timeline.push(timeline::Frame {
             number: summary.frames + 1,
             mono_ns: times,
+            loop_mono_ns: [loop_start, events_done, times[0]],
+            end_frame_mono_ns: [times[7], end_frame_done, times[8]],
+            post_frame_mono_ns: [times[8]; 2],
+            post_frame_complete: false,
             wait_number: summary.waited_frames,
             thread_cpu_ns: [cpu_start, timeline::thread_cpu()],
             cpu_core: [core_start, unsafe { libc::sched_getcpu() }],
@@ -1001,6 +1008,10 @@ fn frame_loop(
                 summary.frames,
                 state.predicted_display_time.as_nanos()
             );
+        }
+        if let Some(frame) = summary.timeline.frames.back_mut() {
+            frame.post_frame_mono_ns[1] = timeline::now();
+            frame.post_frame_complete = true;
         }
     }
 }

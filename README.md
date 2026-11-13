@@ -461,3 +461,14 @@ CPU可见且HOST_COHERENT的缓冲在创建时映射，销毁前取消映射，�
 ## 会话交互开关
 
 控制中心通过会话管理器选择手柄、手输入或自动切换。Shell 观察实际输入来源，更换来源时取消已有抓取并等待按键释放，按当前来源绘制手模型或手柄模型。透视关闭时停止读取和显示彩透快照，采集生命周期仍由唯一相机生产者管理。状态文件的读取及呈现状态发布在独立工作线程执行。
+
+## Frame performance observations
+
+The bounded timeline includes CPU frame/input/draw stages, thread CPU time,
+pose flags, model/atlas counters and skipped render reasons. Create an empty
+`timeline-request` in the existing summary directory for a JSON-only snapshot;
+this does not request a screen capture. Export work remains visible before the
+next frame. Set `XR_SHELL_GPU_TIMING=1` only in a diagnostic launch to collect
+optional GPU timestamp intervals after the existing completion fence.
+See [the profiling guide](https://github.com/bitsk/openkylin-xr-docs/blob/main/wiki/frame-profiling.md)
+for clock boundaries, system correlation and acceptance limits.
