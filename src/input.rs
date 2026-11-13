@@ -13,6 +13,8 @@ pub struct HandState {
     pub controls_active: bool,
     pub channel_active: [bool; 4],
     pub grip: Option<xr::Posef>,
+    pub grip_flags: u64,
+    pub aim_flags: u64,
     pub aim: Option<xr::Posef>,
     pub select: bool,
     pub trigger: f32,
@@ -60,6 +62,8 @@ impl HandState {
 }
 
 pub struct Input {
+    pub sync_span: Option<[i64; 2]>,
+    pub read_spans: [Option<[i64; 2]>; 2],
     set: xr::ActionSet,
     aim: xr::Action<xr::Posef>,
     grip: xr::Action<xr::Posef>,
@@ -294,6 +298,8 @@ impl Input {
             grip.create_space(session, hands[1], xr::Posef::IDENTITY)?,
         ];
         Ok(Self {
+            sync_span: None,
+            read_spans: [None; 2],
             set,
             aim,
             grip,
@@ -339,22 +345,23 @@ impl Input {
         session: &xr::Session<xr::Vulkan>,
         base: &xr::Space,
         time: xr::Time,
-    ) -> Result<Option<xr::Posef>> {
+    ) -> Result<(Option<xr::Posef>, u64)> {
         if !action.is_active(session, hand)? {
-            return Ok(None);
+            return Ok((None, 0));
         }
         let location = space.locate(base, time)?;
         let pose = location.pose;
         let q = pose.orientation;
         let p = pose.position;
         let norm = q.x * q.x + q.y * q.y + q.z * q.z + q.w * q.w;
-        Ok((location.location_flags.contains(
+        let valid = (location.location_flags.contains(
             xr::SpaceLocationFlags::ORIENTATION_VALID | xr::SpaceLocationFlags::POSITION_VALID,
         ) && [p.x, p.y, p.z, q.x, q.y, q.z, q.w]
             .iter()
             .all(|v| v.is_finite())
             && (0.9..=1.1).contains(&norm))
-        .then_some(pose))
+        .then_some(pose);
+        Ok((valid, location.location_flags.into_raw()))
     }
 
     fn read_hand(
@@ -382,6 +389,16 @@ impl Input {
                 0.
             }
         };
+        let (grip, grip_flags) = Self::pose(
+            &self.grip,
+            &self.grip_spaces[hand],
+            path,
+            session,
+            base,
+            time,
+        )?;
+        let (aim, aim_flags) =
+            Self::pose(&self.aim, &self.spaces[hand], path, session, base, time)?;
         Ok(HandState {
             channel_active: [
                 select.is_active || trigger.is_active || trigger_click.is_active,
@@ -399,15 +416,10 @@ impl Input {
                 || thumb_click.is_active
                 || trigger_click.is_active
                 || squeeze_click.is_active,
-            grip: Self::pose(
-                &self.grip,
-                &self.grip_spaces[hand],
-                path,
-                session,
-                base,
-                time,
-            )?,
-            aim: Self::pose(&self.aim, &self.spaces[hand], path, session, base, time)?,
+            grip,
+            aim,
+            grip_flags,
+            aim_flags,
             select: select.is_active && select.current_state,
             trigger: if trigger_click.is_active && trigger_click.current_state {
                 1.
@@ -467,6 +479,8 @@ impl Input {
         time: xr::Time,
         desktop: &mut Desktop,
     ) -> Result<()> {
+        self.sync_span = None;
+        self.read_spans = [None; 2];
         self.controllers = [HandState::default(); 2];
         self.routes = ["none"; 2];
         self.route_ok = [false; 2];
@@ -558,7 +572,10 @@ impl Input {
             self.last_hover = [None, None];
             return Ok(());
         }
-        if let Err(error) = session.sync_actions(&[(&self.set).into()]) {
+        let sync_start = crate::timeline::now();
+        let sync_result = session.sync_actions(&[(&self.set).into()]);
+        self.sync_span = Some([sync_start, crate::timeline::now()]);
+        if let Err(error) = sync_result {
             for hand in 0..2 {
                 self.cancel_hand(hand, desktop, "controller action sync failed");
             }
@@ -570,7 +587,10 @@ impl Input {
         // Read BOTH subaction paths even during a capture. Ignored presses from
         // the other hand must not be replayed when the current owner releases.
         for hand in 0..2 {
-            let state = match self.read_hand(hand, session, base, time) {
+            let read_start = crate::timeline::now();
+            let result = self.read_hand(hand, session, base, time);
+            self.read_spans[hand] = Some([read_start, crate::timeline::now()]);
+            let state = match result {
                 Ok(state) => state,
                 Err(error) => {
                     self.cancel_hand(hand, desktop, "controller state unavailable");

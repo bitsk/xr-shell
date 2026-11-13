@@ -5,6 +5,7 @@ mod controls;
 mod desktop;
 mod environment;
 mod gpu;
+mod gpu_timing;
 mod hand_model;
 mod hand_tracking;
 mod home;
@@ -558,8 +559,20 @@ fn frame_loop(
             std::thread::sleep(Duration::from_millis(20));
             continue;
         }
+        if summary.waited_frames % 30 == 0 {
+            let request = options.summary_dir().join("timeline-request");
+            if request.is_file() {
+                fs::remove_file(request)?;
+                atomic_json(
+                    &options.summary_dir().join("timeline.json"),
+                    &json!({"summary":summary.timeline.summary(),"samples":summary.timeline.frames}),
+                )?;
+            }
+        }
         let mut times = [0i64; 9];
         times[0] = timeline::now();
+        let cpu_start = timeline::thread_cpu();
+        let core_start = unsafe { libc::sched_getcpu() };
         if let Some(d) = desktop {
             d.tick()?;
             // Collect peer updates now, then prepare pixels once after input.
@@ -594,6 +607,12 @@ fn frame_loop(
                 xr::EnvironmentBlendMode::OPAQUE,
                 &[],
             )?;
+            summary.timeline.skip(
+                summary.waited_frames,
+                [times[0], times[2], timeline::now()],
+                "runtime_should_not_render",
+                None,
+            );
             continue;
         }
         if recenter_requested {
@@ -661,6 +680,12 @@ fn frame_loop(
                 xr::EnvironmentBlendMode::OPAQUE,
                 &[],
             )?;
+            summary.timeline.skip(
+                summary.waited_frames,
+                [times[0], times[2], timeline::now()],
+                "head_orientation_invalid",
+                Some(flags.into_raw()),
+            );
             continue;
         }
         ensure!(views.len() == 2, "runtime changed stereo view count");
@@ -687,7 +712,12 @@ fn frame_loop(
                 i.cancel_for_source_change(d);
             }
         }
+        let head_controls_done = timeline::now();
         let hand_joints = hands.sample(space, state.predicted_display_time);
+        let hand_joint_count = hand_joints
+            .each_ref()
+            .map(|j| j.as_ref().map_or(0, |v| v.len()));
+        let hands_located = timeline::now();
         renderer.update_hands(if controls.source() == "hands" {
             hand_joints
         } else {
@@ -885,6 +915,24 @@ fn frame_loop(
         summary.timeline.push(timeline::Frame {
             number: summary.frames + 1,
             mono_ns: times,
+            wait_number: summary.waited_frames,
+            thread_cpu_ns: [cpu_start, timeline::thread_cpu()],
+            cpu_core: [core_start, unsafe { libc::sched_getcpu() }],
+            action_sync_span: input.as_ref().and_then(|i| i.sync_span),
+            controller_read_spans: input.as_ref().map_or([None; 2], |i| i.read_spans),
+            controller_flags: std::array::from_fn(|h| {
+                input.as_ref().map_or([0; 2], |i| {
+                    [i.controllers()[h].grip_flags, i.controllers()[h].aim_flags]
+                })
+            }),
+            hand_joint_count,
+            predicted_display_period_ns: state.predicted_display_period.as_nanos(),
+            pre_input_mono_ns: [times[3], head_controls_done, hands_located, input_times[0]],
+            render_mono_ns: renderer.render_mono_ns,
+            gpu: renderer.timing.sample.clone(),
+            draw_spans: renderer.draw_spans.borrow().clone(),
+            model_vertices: renderer.model_vertices(),
+            panel_instances: renderer.panel_instances(),
             predicted_display_xr_ns: state.predicted_display_time.as_nanos(),
             runtime_now_xr_ns,
             runtime_now_mono_bracket_ns: clock_bracket,

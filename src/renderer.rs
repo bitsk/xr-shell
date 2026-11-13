@@ -116,6 +116,9 @@ struct AtlasUpload {
 }
 pub struct Renderer {
     gpu: Rc<Gpu>,
+    pub timing: crate::gpu_timing::Timer,
+    pub render_mono_ns: [i64; 11],
+    pub draw_spans: std::cell::RefCell<Vec<crate::timeline::DrawSpan>>,
     pub eyes: Vec<Eye>,
     pub format: vk::Format,
     pub foreground: Vec<Eye>,
@@ -185,6 +188,9 @@ impl Renderer {
             .find(|f| formats.contains(&(f.as_raw() as _)))
             .ok_or_else(|| anyhow::anyhow!("no supported sRGB OpenXR swapchain format"))?;
         let mut r = Self {
+            timing: crate::gpu_timing::Timer::new(gpu.clone()),
+            render_mono_ns: [0; 11],
+            draw_spans: std::cell::RefCell::new(Vec::with_capacity(25)),
             gpu,
             eyes: Vec::new(),
             format,
@@ -320,19 +326,21 @@ impl Renderer {
             Ok(())
         }
     }
-    fn submit(&self) -> Result<()> {
+    fn submit(&self) -> Result<[i64; 3]> {
         unsafe {
             self.gpu.device.end_command_buffer(self.cmd)?;
+            let ended = crate::timeline::now();
             self.gpu.device.queue_submit(
                 self.gpu.queue,
                 &[vk::SubmitInfo::default().command_buffers(&[self.cmd])],
                 self.fence,
             )?;
+            let submitted = crate::timeline::now();
             // Complete the stereo batch before releasing the acquired XR images.
             self.gpu
                 .device
                 .wait_for_fences(&[self.fence], true, u64::MAX)?;
-            Ok(())
+            Ok([ended, submitted, crate::timeline::now()])
         }
     }
 
@@ -826,6 +834,24 @@ impl Renderer {
             image_index < target.images.len(),
             "XR swapchain index out of bounds"
         );
+        let mut mark = crate::timeline::now();
+        let mut record = |stage| {
+            let end = crate::timeline::now();
+            self.draw_spans
+                .borrow_mut()
+                .push(crate::timeline::DrawSpan {
+                    eye: eye_index,
+                    pass: match pass {
+                        DrawPass::All => "all",
+                        DrawPass::Background => "background",
+                        DrawPass::Foreground => "foreground",
+                        DrawPass::Quad => "quad",
+                    },
+                    stage,
+                    mono_ns: [mark, end],
+                });
+            mark = end;
+        };
         let image = &target.images[image_index];
         let readback = if capture {
             Some(Buffer::host(
@@ -935,6 +961,7 @@ impl Renderer {
             if matches!(pass, DrawPass::All | DrawPass::Background) {
                 d.cmd_draw(self.cmd, 3, 1, 0, 0);
             }
+            record("background_and_setup");
             for (hand, (model, state)) in self
                 .controllers
                 .iter()
@@ -954,6 +981,7 @@ impl Renderer {
                     );
                 }
             }
+            record("controller_models");
             if matches!(pass, DrawPass::All) {
                 for hand in 0..2 {
                     if self.hand_joints[hand].is_some() {
@@ -963,6 +991,7 @@ impl Renderer {
                     }
                 }
             }
+            record("hand_models");
             // Controller drawing uses a separate descriptor and push-constant layout.
             d.cmd_bind_descriptor_sets(
                 self.cmd,
@@ -1007,6 +1036,7 @@ impl Renderer {
                     }
                 }
             }
+            record("spatial_panels");
             for (hand, (model, state)) in self
                 .controllers
                 .iter()
@@ -1026,6 +1056,7 @@ impl Renderer {
                     );
                 }
             }
+            record("controller_rays");
             d.cmd_end_render_pass(self.cmd);
             if let Some(buffer) = &readback {
                 d.cmd_pipeline_barrier(
@@ -1089,6 +1120,7 @@ impl Renderer {
                 );
             }
         }
+        record("end_pass_and_capture_copy");
         Ok(readback)
     }
 
@@ -1155,7 +1187,11 @@ impl Renderer {
         session: &xr::Session<xr::Vulkan>,
         space: &xr::Space,
     ) -> Result<Vec<Option<Vec<u8>>>> {
+        self.draw_spans.borrow_mut().clear();
+        self.render_mono_ns[0] = crate::timeline::now();
         self.begin()?;
+        self.render_mono_ns[1] = crate::timeline::now();
+        self.timing.begin(self.cmd);
         if let Some(passthrough) = &mut self.passthrough {
             passthrough.prepare(self.cmd)?;
         }
@@ -1167,10 +1203,13 @@ impl Renderer {
             passthrough.update_projection(views)?;
         }
         self.passthrough_active = self.passthrough.as_ref().is_some_and(|p| p.active());
+        self.render_mono_ns[2] = crate::timeline::now();
         self.record_atlas_upload();
+        self.timing.mark(self.cmd, 1);
+        self.render_mono_ns[3] = crate::timeline::now();
         let mut readbacks: Vec<_> = (0..2)
             .map(|eye| {
-                self.record_eye(
+                let result = self.record_eye(
                     &self.eyes[eye],
                     if self.focus_quad.is_some() {
                         DrawPass::Background
@@ -1182,7 +1221,10 @@ impl Renderer {
                     &views[eye],
                     capture,
                     None,
-                )
+                );
+                self.timing.mark(self.cmd, eye as u32 + 2);
+                self.render_mono_ns[eye + 4] = crate::timeline::now();
+                result
             })
             .collect::<Result<_>>()?;
         if let Some(focus) = &self.focus_quad {
@@ -1207,11 +1249,15 @@ impl Renderer {
                 None,
             )?);
         }
-        self.submit()?;
+        self.timing.mark(self.cmd, 4);
+        self.render_mono_ns[6] = crate::timeline::now();
+        let submit = self.submit()?;
+        self.render_mono_ns[7..10].copy_from_slice(&submit);
+        self.timing.resolve();
         if self.atlas_upload.take().is_some() {
             self.atlas.as_mut().unwrap().initialized = true;
         }
-        readbacks
+        let pixels = readbacks
             .into_iter()
             .map(|buffer| {
                 buffer
@@ -1226,7 +1272,9 @@ impl Renderer {
                     })
                     .transpose()
             })
-            .collect()
+            .collect();
+        self.render_mono_ns[10] = crate::timeline::now();
+        pixels
     }
 }
 
@@ -1619,6 +1667,20 @@ impl Renderer {
         )?);
         self.update_panels(&[])
     }
+    pub fn model_vertices(&self) -> [[u32; 2]; 2] {
+        [
+            self.controllers
+                .each_ref()
+                .map(|m| m.as_ref().map_or(0, |v| v.vertex_count())),
+            self.hand_models
+                .each_ref()
+                .map(|m| m.as_ref().map_or(0, |v| v.vertex_count())),
+        ]
+    }
+    pub fn panel_instances(&self) -> u32 {
+        self.draw_count
+    }
+
     pub fn pending_atlas_stats(&self) -> (usize, u64, bool) {
         self.atlas_upload.as_ref().map_or((0, 0, false), |u| {
             (
