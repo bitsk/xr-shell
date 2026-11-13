@@ -138,7 +138,7 @@ impl Timeline {
             "gpu_scope":"optional device timestamp intervals; pipeline overlap and query overhead possible; not CPU-clock aligned",
             "input_stage_boundaries":["actions_and_routing","animate_and_raster","geometry_upload","ray_feedback"],
             "stage_boundaries":labels,"stages":stages,
-            "scope":"application CPU wall time, not compositor timing, GPU execution time, scanout or physical MTP"})
+            "scope":"CPU stages are wall time; optional GPU intervals are separate, not compositor timing, scanout or physical MTP"})
     }
 }
 
