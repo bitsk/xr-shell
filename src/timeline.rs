@@ -142,6 +142,10 @@ impl Timeline {
     }
 }
 
+pub fn serialize_summary<S: serde::Serializer>(t: &Timeline, s: S) -> Result<S::Ok, S::Error> {
+    t.summary().serialize(s)
+}
+
 pub fn pose(p: openxr::Posef) -> [f32; 7] {
     [
         p.position.x,

@@ -270,6 +270,9 @@ struct Summary {
     outcome: String,
     error: Option<String>,
     desktop: Value,
+    // The exit summary keeps stage statistics only. Full frames are written on
+    // request; the session wrapper copies this file twice more.
+    #[serde(serialize_with = "timeline::serialize_summary")]
     timeline: timeline::Timeline,
     focus_quad: Value,
     native_quad_frames: u64,
