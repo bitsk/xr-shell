@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
-//! Device artwork is installed separately; all poses come from OpenXR actions.
+//! Optional device artwork falls back to a neutral grip; poses are OpenXR actions.
 use crate::{
     gpu::{Buffer, Gpu},
     input::HandState,
@@ -255,6 +255,59 @@ impl Model {
             m.directory, m.count, width, height
         );
         Ok(m)
+    }
+
+    /// Keep both grip feedback and aim rays available without vendor artwork.
+    /// The neutral shape uses grip space; the ray still uses the separate aim pose.
+    fn generic_controller(gpu: Rc<Gpu>, pass: vk::RenderPass) -> Result<Self> {
+        let mut vertices = Vec::new();
+        for (center, radius) in [
+            ([0., 0., 0.025], [0.022, 0.025, 0.065]),
+            ([0., 0.012, -0.025], [0.032, 0.018, 0.032]),
+        ] {
+            for lat in 0..8 {
+                for lon in 0..16 {
+                    let point = |a: usize, b: usize| {
+                        let t = std::f32::consts::PI * a as f32 / 8.;
+                        let f = std::f32::consts::TAU * b as f32 / 16.;
+                        let n = [t.sin() * f.cos(), t.cos(), t.sin() * f.sin()];
+                        let normal = std::array::from_fn::<_, 3, _>(|i| n[i] / radius[i]);
+                        let length = normal.iter().map(|v| v * v).sum::<f32>().sqrt();
+                        [
+                            center[0] + radius[0] * n[0],
+                            center[1] + radius[1] * n[1],
+                            center[2] + radius[2] * n[2],
+                            normal[0] / length,
+                            normal[1] / length,
+                            normal[2] / length,
+                            0.5,
+                            0.5,
+                        ]
+                    };
+                    let a = point(lat, lon);
+                    let b = point(lat + 1, lon);
+                    let c = point(lat + 1, lon + 1);
+                    let d = point(lat, lon + 1);
+                    vertices.extend([a, b, c, a, c, d]);
+                }
+            }
+        }
+        Self::from_data(
+            gpu,
+            pass,
+            vertices,
+            &[190, 204, 216, 255],
+            1,
+            1,
+            "builtin:generic-controller".into(),
+            xr::Quaternionf {
+                x: 0.,
+                y: 0.,
+                z: 0.,
+                w: 1.,
+            },
+            false,
+        )
     }
 
     pub fn hand(gpu: Rc<Gpu>, pass: vk::RenderPass) -> Result<Self> {
@@ -751,7 +804,13 @@ pub fn load_models(gpu: Rc<Gpu>, pass: vk::RenderPass) -> [Option<Model>; 2] {
             Ok(model) => Some(model),
             Err(error) => {
                 eprintln!("XR_CONTROLLER_MODEL_UNAVAILABLE hand={hand} error={error:#}");
-                None
+                match Model::generic_controller(gpu.clone(), pass) {
+                    Ok(model) => Some(model),
+                    Err(error) => {
+                        eprintln!("XR_CONTROLLER_FALLBACK_FAILED hand={hand} error={error:#}");
+                        None
+                    }
+                }
             }
         }
     })

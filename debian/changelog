@@ -1,3 +1,9 @@
+xr-shell (0.2.35) unstable; urgency=medium
+
+  * Draw a built-in neutral controller and aim ray when device artwork is absent.
+
+ -- bits <bigbits@hackx.cc>  Mon, 16 Nov 2026 15:54:28 +0800
+
 xr-shell (0.2.34) unstable; urgency=medium
 
   * Reject pixels belonging to the other depth pass before sRGB conversion.
