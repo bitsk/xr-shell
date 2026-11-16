@@ -1,3 +1,9 @@
+xr-shell (0.3.1) unstable; urgency=medium
+
+  * Load installed themes without content digest gates or diagnostic hashes.
+
+ -- bits <bigbits@hackx.cc>  Mon, 16 Nov 2026 23:08:36 +0800
+
 xr-shell (0.3.0) unstable; urgency=medium
 
   * Separate Vultra from device camera and controller taps; consume OpenXR hand and environment capabilities.

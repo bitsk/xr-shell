@@ -1,7 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 use anyhow::{Context, Result, ensure};
 use serde::Deserialize;
-use sha2::{Digest, Sha256};
 use std::{
     fs,
     io::{BufReader, Cursor},
@@ -20,7 +19,6 @@ struct Manifest {
 #[derive(Deserialize)]
 struct Texture {
     file: String,
-    sha256: String,
     width: u32,
     height: u32,
     colour_space: String,
@@ -45,7 +43,6 @@ struct Space {
 
 pub struct Environment {
     pub id: String,
-    pub sha256: String,
     pub width: u32,
     pub height: u32,
     pub rgba: Vec<u8>,
@@ -91,8 +88,6 @@ impl Environment {
             "texture must be relative to the manifest"
         );
         let bytes = fs::read(path.parent().context("manifest parent")?.join(&t.file))?;
-        let hash = format!("{:x}", Sha256::digest(&bytes));
-        ensure!(hash == t.sha256, "panorama SHA-256 mismatch");
         ensure!(
             t.width > 0
                 && t.width <= 16384
@@ -121,7 +116,6 @@ impl Environment {
         };
         Ok(Self {
             id: m.id,
-            sha256: hash,
             width: t.width,
             height: t.height,
             rgba,

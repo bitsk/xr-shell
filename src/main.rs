@@ -257,7 +257,6 @@ struct Summary {
     passthrough: Option<serde_json::Value>,
     runtime_alpha_supported: bool,
     runtime_recenter_count: u64,
-    asset_sha256: Option<String>,
     validation_enabled: bool,
     validation_errors: u64,
     validation_warnings: u64,
@@ -321,12 +320,8 @@ fn entry() -> Result<()> {
 
 fn run(options: &Options, summary: &mut Summary) -> Result<()> {
     let environment = Environment::load(&options.environment)?;
-    println!(
-        "XR_ENVIRONMENT={} SHA256={}",
-        environment.id, environment.sha256
-    );
+    println!("XR_ENVIRONMENT={}", environment.id);
     summary.environment = Some(environment.id.clone());
-    summary.asset_sha256 = Some(environment.sha256.clone());
     let quit = Arc::new(AtomicBool::new(false));
     let signal_quit = quit.clone();
     ctrlc::set_handler(move || {
