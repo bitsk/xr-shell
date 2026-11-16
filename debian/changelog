@@ -1,3 +1,9 @@
+xr-shell (0.3.0) unstable; urgency=medium
+
+  * Separate Vultra from device camera and controller taps; consume OpenXR hand and environment capabilities.
+
+ -- bits <bigbits@hackx.cc>  Mon, 16 Nov 2026 16:54:22 +0800
+
 xr-shell (0.2.35) unstable; urgency=medium
 
   * Draw a built-in neutral controller and aim ray when device artwork is absent.

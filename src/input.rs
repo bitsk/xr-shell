@@ -80,6 +80,10 @@ pub struct Input {
     spaces: [xr::Space; 2],
     grip_spaces: [xr::Space; 2],
     hands: [xr::Path; 2],
+    profiles: [xr::Path; 2],
+    profile_is_hand: [bool; 2],
+    optical_hands: [bool; 2],
+    optical_override: Option<bool>,
     pressed: [bool; 2],
     gates: [ButtonGate; 2],
     haptic: xr::Action<xr::Haptic>,
@@ -97,6 +101,9 @@ pub struct Input {
     scroll_ok: [bool; 2],
 }
 impl Input {
+    pub fn optical_hands(&self) -> [bool; 2] {
+        self.optical_hands
+    }
     pub fn new(instance: &xr::Instance, session: &xr::Session<xr::Vulkan>) -> Result<Self> {
         eprintln!("XR_INIT_STAGE=input-hand-paths STATUS=begin");
         let hands = [
@@ -277,6 +284,24 @@ impl Input {
                 eprintln!("XR_INIT_STAGE=input-profile STATUS=complete PROFILE={profile}");
             }
         }
+        if instance.exts().ext_hand_interaction.is_some() {
+            let mut bindings = Vec::new();
+            for hand in ["left", "right"] {
+                let path = |suffix: &str| {
+                    instance.string_to_path(&format!("/user/hand/{hand}/input/{suffix}"))
+                };
+                bindings.push(xr::Binding::new(&aim, path("aim/pose")?));
+                bindings.push(xr::Binding::new(&grip, path("grip/pose")?));
+                bindings.push(xr::Binding::new(&trigger, path("aim_activate_ext/value")?));
+                bindings.push(xr::Binding::new(&squeeze, path("grasp_ext/value")?));
+            }
+            instance
+                .suggest_interaction_profile_bindings(
+                    instance.string_to_path("/interaction_profiles/ext/hand_interaction_ext")?,
+                    &bindings,
+                )
+                .context("bind runtime hand interaction actions")?;
+        }
         eprintln!("XR_INIT_STAGE=input-attach-action-sets STATUS=begin");
         session
             .attach_action_sets(&[&set])
@@ -316,6 +341,10 @@ impl Input {
             spaces,
             grip_spaces,
             hands,
+            profiles: [xr::Path::NULL; 2],
+            profile_is_hand: [false; 2],
+            optical_hands: [false; 2],
+            optical_override: None,
             pressed: [false; 2],
             gates: std::array::from_fn(|_| ButtonGate::default()),
             haptic,
@@ -478,7 +507,13 @@ impl Input {
         base: &xr::Space,
         time: xr::Time,
         desktop: &mut Desktop,
+        source: &str,
     ) -> Result<()> {
+        self.optical_override = match source {
+            "hands" => Some(true),
+            "controllers" => Some(false),
+            _ => None,
+        };
         self.sync_span = None;
         self.read_spans = [None; 2];
         self.controllers = [HandState::default(); 2];
@@ -587,6 +622,25 @@ impl Input {
         // Read BOTH subaction paths even during a capture. Ignored presses from
         // the other hand must not be replayed when the current owner releases.
         for hand in 0..2 {
+            let profile = session.current_interaction_profile(self.hands[hand])?;
+            let previous_optical = self.optical_hands[hand];
+            if profile != self.profiles[hand] {
+                let path = session
+                    .instance()
+                    .path_to_string(profile)
+                    .unwrap_or_default();
+                self.profile_is_hand[hand] = matches!(
+                    path.as_str(),
+                    "/interaction_profiles/ext/hand_interaction_ext"
+                        | "/interaction_profiles/microsoft/hand_interaction"
+                );
+            }
+            self.optical_hands[hand] = self.optical_override.unwrap_or(self.profile_is_hand[hand]);
+            if profile != self.profiles[hand] || previous_optical != self.optical_hands[hand] {
+                self.cancel_hand(hand, desktop, "runtime interaction profile changed");
+                self.last_hover[hand] = None;
+                self.profiles[hand] = profile;
+            }
             let read_start = crate::timeline::now();
             let result = self.read_hand(hand, session, base, time);
             self.read_spans[hand] = Some([read_start, crate::timeline::now()]);
@@ -710,9 +764,7 @@ impl Input {
             } else {
                 None
             };
-            if let Some((amplitude, milliseconds)) =
-                pulse.filter(|_| std::env::var("XR_SHELL_INPUT_MODE").as_deref() != Ok("hands"))
-            {
+            if let Some((amplitude, milliseconds)) = pulse.filter(|_| !self.optical_hands[hand]) {
                 let vibration = xr::HapticVibration::new()
                     .amplitude(amplitude)
                     .frequency(xr::FREQUENCY_UNSPECIFIED)

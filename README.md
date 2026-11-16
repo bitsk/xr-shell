@@ -1,6 +1,8 @@
-# xr-shell
+# Vultra · 高性能空间合成器
 
-Rust OpenXR panorama Shell for UKUI XR. The first implementation loads a
+Vultra 是 **openKylin XR 空间智能版本**中 **HyperSpace XR 空间桌面**的合成核心。采用 Rust 模块化开发，基于 OpenXR 与 Vulkan 实现双眼渲染与三维空间界面合成。任务栏、空间控件、窗口服务与系统控制以独立组件协作。晴空（Qingkong）是一款可选空间主题。`xr-shell` 是当前仓库、包与可执行文件的技术标识。
+
+Rust OpenXR/Vulkan spatial compositor for HyperSpace. The first implementation loads a
 versioned environment, renders each PRIMARY_STEREO view into its own runtime
 swapchain, and submits one projection layer containing both views. It uses
 `openxr` and `ash` directly; environment artwork is supplied by the independent
@@ -275,7 +277,8 @@ follow-ups; this implementation retains immediate trigger drag behavior.
 ## Original controller models
 
 Separate device assets provide `left`/`right` `mesh.json` and `texture.png`
-under `/usr/share/xr/devices/a081/controllers` (or `XR_CONTROLLER_MODEL_DIR`).
+under an explicit `XR_CONTROLLER_MODEL_DIR`. Without device artwork, Vultra
+uses built-in neutral controller meshes and aim rays.
 Shell renders these models at the runtime grip action and routes rays through
 the independent aim action. A device package may provide its native
 `model_binding.rotation_xyzw` in `controller-anchors.json`; this rotates only
@@ -304,21 +307,11 @@ distance. DebugInput `ray_probe` performs a read-only hit query when debug input
 is enabled. This changes presentation only; device aim/grip parameters remain
 owned by the runtime.
 
-## Controller Home recenter
+## Runtime recenter
 
-On A081, hold Home on either controller for one second to bring the desktop
-center and horizontal heading to the current headset position and gaze. Floor
-height and head pitch remain unchanged. Each hold fires once; release Home
-before the next hold. A short press does not recenter. Focus loss, stale input,
-producer restart or disconnection cancels the hold and requires a fresh release.
-
-The Shell subscribes read-only to the existing `A081_CONTROLLER_POSE_SOCKET`
-wire-v2 stream owned by qiyu-controller-tracking because SteamVR reserves the
-system button. It reads fresh valid controls independently of controller pose.
-Recenter requires valid headset position and orientation, creates a Shell-local
-reference space, clears pointer captures and resets the taskbar anchor while
-retaining its fixed/follow mode. Sensor state and other applications' runtime
-origins are unaffected. Missing controller sockets disable this shortcut.
+System/Home buttons belong to the OpenXR runtime. Vultra consumes
+`ReferenceSpaceChangePending` at its effective frame time, cancels pointer
+captures and reanchors the desktop. It does not read device controller packets.
 
 Xwayland application windows receive the same external grab, menu, close,
 minimize, curve and resize controls as native Wayland toplevels. The window
@@ -402,55 +395,28 @@ preparation path and `atlas_update` as `[regions, source_bytes, full_replacement
 pending upload before submission, not GPU traffic
 or execution time. Samples remain bounded and are written only on capture/exit.
 
-## 原生双目透视候选
+## Runtime-owned passthrough
 
-显式设置 `XR_PASSTHROUGH_CONFIG` 指向本机私有配置时，桌面从设备服务 QSP1
-共享快照消费左 slot4、右 slot5 的图像，不打开 V4L2、不经过调试后端。
-四路追踪、窗口和双手 6DoF 保持原路径。版本2配置支持原厂1728×1728裁剪
-（解码864×864/眼）及1928×1088裁剪。解包全部RAW10位、扣除显式黑电平后，
-采用双眼共用、排除暗部/饱和像素的缓慢灰世界白平衡估计；这不是原厂ISP或
-色卡标定。150ms 无新鲜双眼图像时回到原环境，遥测同时记录新鲜度与提交时
-锁存的渲染选择。
+`XR_ENVIRONMENT_MODE=opaque` selects the theme background (default).
+`XR_ENVIRONMENT_MODE=passthrough` requires the runtime to enumerate
+`ALPHA_BLEND`; unavailable support is an error, not an opaque fallback.
+Vultra clears its background to transparent and submits alpha-enabled OpenXR
+layers. Camera capture, calibration, lens correction, exposure timing and
+motion compensation belong to XROS/runtime or the streaming headset.
+No QSP1 reader, RAW10 decoder, camera calibration or device pose tap ships here.
 
-配置由设备服务的 `tools/export-passthrough-calibration.py` 从本机原厂校准和
-传感器寄存器模式生成。坐标链为 `R_camera_reference * R_body_reference^T * C^T`，
-`C` 为既有QVR机身到XR的坐标变换；相机使用CV的右、下、前轴。
-相机中心由 `-R^T t` 求出，再变换到机身坐标，按XR横坐标排序左右眼。
-原厂1728×1728模式无需内参裁剪平移；1928×1088模式仍显式修正裁剪。
-实际双目匹配可核对相对旋转/平移方向，不能代替机身到眼睛原点的佩戴标定。
-
-投影采用无穷远旋转模型，配置保留相机中心的真实米制平移供审计，但没有
-虚构深度来应用平移。快照时间是DQ，不是曝光时间；运动重投影、曝光同步、
-色彩准确度和佩戴几何仍需单独验收。默认环境保持原样，包安装不启用透视。
-
-彩透吞吐路径现在只读取最新QSP1原始帧，复制后立即释放共享锁；CPU仅稀疏
-采样白平衡统计，RAW10全图解包与Bayer单元生成由Vulkan计算着色器执行。
-双眼原始帧通过共享引用传递，仅上传发生变化的眼睛。每秒的
-`XR_PASSTHROUGH_STATS` 区分读取、GPU上传、不同源帧的OpenXR提交计数；
-OpenXR提交不是物理扫描呈现证明。摄像头/曝光同步与运动重投影仍需另行验收。
-
-可选的 `"motion_compensation": "dequeue-rotation"` 使用每眼自己的QSP1取帧
-时间，在本进程观测到的OpenXR姿态历史中插值，将当前视线旋转到取帧时的
-眼坐标，再应用原厂相机外参。它仅补偿取帧后的旋转延迟，不把DQ当作曝光，
-不添加虚构深度或平移，也不修改追踪生产者。无有效姿态括号、超过40ms采样
-间断或Home重置参考空间时，使用原投影，待历史重新覆盖源帧后恢复补偿。
-默认关闭；遥测分别记录每眼补偿是否应用、角度和累计渲染帧数。
-
-鱼眼径向多项式按每眼原厂系数预计算1025个样本。片段着色器以有界的
-`r/(r+z)` 线性插值，避免在每个显示像素重复计算atan及高阶多项式；原厂
-内参、动态旋转、裁剪和颜色路径保持一致。表只在初始化上传，逐帧仅更新
-原有小段标定/旋转数据。
-
-CPU可见且HOST_COHERENT的缓冲在创建时映射，销毁前取消映射，读写仍受
-既有提交完成栅栏保护。RAW上传和逐帧UI更新不再反复创建内存映射和触发
-同一批页面的缺页处理。
+The current native MIX runtime reports OPAQUE only. Its previous Shell-owned
+camera path is removed; native passthrough requires runtime implementation
+before it can be enabled again. WiVRn can advertise ALPHA_BLEND when its client
+supports passthrough. Capability enumeration and a build do not establish
+physical passthrough quality or latency acceptance.
 
 ## 光学双手
 
 手输入会话通过 `XR_EXT_hand_tracking` 获取左右手各 26 个关节，使用真实位置、
 方向、有效性及运行时半径绘制可弯曲的掌面与手指表面；无效手隐藏。
 捏合沿已有 trigger 点击/拖动，抓握沿 squeeze 执行 6DoF 抓取及双手缩放。
-模型与输入共同使用当前 OpenXR 参考空间，Home 重置不再额外旋转手部美术。
+模型与输入共同使用当前 OpenXR 参考空间，由运行时管理参考空间重置。
 有手部模型时保持同一投影层深度关系，避免焦点 quad 截断手指。
 
 `--hand-reference-capture FILE` 是只读保存几何的 GPU 截图入口：必须不启用 components、
@@ -460,7 +426,15 @@ CPU可见且HOST_COHERENT的缓冲在创建时映射，销毁前取消映射，�
 
 ## 会话交互开关
 
-控制中心通过会话管理器选择手柄、手输入或自动切换。Shell 观察实际输入来源，更换来源时取消已有抓取并等待按键释放，按当前来源绘制手模型或手柄模型。透视关闭时停止读取和显示彩透快照，采集生命周期仍由唯一相机生产者管理。状态文件的读取及呈现状态发布在独立工作线程执行。
+默认按每只手的 OpenXR interaction profile 选择手柄或光学手部显示；关节来自
+`XR_EXT_hand_tracking`，手部瞄准、激活与抓握动作来自
+[`XR_EXT_hand_interaction`](https://registry.khronos.org/OpenXR/specs/1.1/html/xrspec.html#XR_EXT_hand_interaction)。
+来源改变取消已有抓取并要求按键释放；光学手部不发送震动。
+不通过关节存在与否猜测物理手柄是否活跃，也不在 Shell 再做设备跟踪预测。
+
+XROS 可显式提供 `XR_SESSION_CONTROLS_FILE`、`XR_INPUT_STATUS_FILE` 和
+`XR_SCENE_CONTROLS_STATUS_FILE` 接入系统管理策略。未配置时不创建文件轮询线程；
+配置后状态缺失或过期不当作可用输入。系统偏好不代表运行时已实现该能力。
 
 ## Frame performance observations
 

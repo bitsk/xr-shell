@@ -136,6 +136,7 @@ pub struct Renderer {
     pub focus_quad: Option<FocusQuad>,
     pub quad_reason: String,
     pub controller_visuals: u8,
+    pub optical_hands: [bool; 2],
     geometry: Vec<crate::desktop::spatial_ui::Geometry>,
     partition: Vec<i8>,
     quad_disabled: bool,
@@ -168,8 +169,8 @@ pub struct Renderer {
     fence: vk::Fence,
     shaders: Vec<vk::ShaderModule>,
     yaw: f32,
-    passthrough: Option<crate::passthrough::Passthrough>,
-    passthrough_fallback: Option<Buffer>,
+    pub runtime_alpha_supported: bool,
+    passthrough_requested: bool,
     passthrough_active: bool,
     atlas: Option<Atlas>,
     atlas_upload: Option<AtlasUpload>,
@@ -209,6 +210,7 @@ impl Renderer {
             focus_quad: None,
             quad_reason: "no-focus".into(),
             controller_visuals: 3,
+            optical_hands: [false; 2],
             geometry: Vec::new(),
             partition: Vec::new(),
             quad_disabled: false,
@@ -240,8 +242,8 @@ impl Renderer {
             fence: vk::Fence::null(),
             shaders: Vec::new(),
             yaw: environment.yaw,
-            passthrough: None,
-            passthrough_fallback: None,
+            runtime_alpha_supported: false,
+            passthrough_requested: false,
             passthrough_active: false,
             atlas: None,
             atlas_upload: None,
@@ -279,17 +281,7 @@ impl Renderer {
         r.pipeline().context("create panorama Vulkan pipeline")?;
         r.create_spatial_pipeline()
             .context("create spatial Vulkan pipeline")?;
-        match crate::passthrough::Passthrough::from_environment(r.gpu.clone(), r.descriptor) {
-            Ok(passthrough) => r.passthrough = passthrough,
-            Err(error) => eprintln!("XR_PASSTHROUGH=disabled ERROR={error:#}"),
-        }
         r.controllers = crate::controller_model::load_models(r.gpu.clone(), r.pass);
-        if std::env::var("XR_SHELL_INPUT_MODE").as_deref() == Ok("hands") {
-            for hand in 0..2 {
-                r.hand_models[hand] =
-                    Some(crate::controller_model::Model::hand(r.gpu.clone(), r.pass)?);
-            }
-        }
         eprintln!("XR_INIT_STAGE=renderer-resources STATUS=complete");
         for (index, v) in views.iter().enumerate() {
             let extent = vk::Extent2D {
@@ -500,16 +492,6 @@ impl Renderer {
                         .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
                         .descriptor_count(1)
                         .stage_flags(vk::ShaderStageFlags::FRAGMENT | vk::ShaderStageFlags::VERTEX),
-                    vk::DescriptorSetLayoutBinding::default()
-                        .binding(3)
-                        .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
-                        .descriptor_count(1)
-                        .stage_flags(vk::ShaderStageFlags::FRAGMENT),
-                    vk::DescriptorSetLayoutBinding::default()
-                        .binding(4)
-                        .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
-                        .descriptor_count(1)
-                        .stage_flags(vk::ShaderStageFlags::FRAGMENT),
                 ]),
                 None,
             )?;
@@ -519,11 +501,11 @@ impl Renderer {
                     .pool_sizes(&[
                         vk::DescriptorPoolSize {
                             ty: vk::DescriptorType::COMBINED_IMAGE_SAMPLER,
-                            descriptor_count: 3,
+                            descriptor_count: 2,
                         },
                         vk::DescriptorPoolSize {
                             ty: vk::DescriptorType::STORAGE_BUFFER,
-                            descriptor_count: 2,
+                            descriptor_count: 1,
                         },
                     ]),
                 None,
@@ -545,30 +527,6 @@ impl Renderer {
                     .image_info(&images)],
                 &[],
             );
-            let fallback = Buffer::host(
-                self.gpu.clone(),
-                48 * 4,
-                vk::BufferUsageFlags::STORAGE_BUFFER,
-            )?;
-            fallback.write(&[0u8; 48 * 4])?;
-            d.update_descriptor_sets(
-                &[
-                    vk::WriteDescriptorSet::default()
-                        .dst_set(self.descriptor)
-                        .dst_binding(3)
-                        .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
-                        .image_info(&images),
-                    vk::WriteDescriptorSet::default()
-                        .dst_set(self.descriptor)
-                        .dst_binding(4)
-                        .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
-                        .buffer_info(&[vk::DescriptorBufferInfo::default()
-                            .buffer(fallback.handle)
-                            .range(fallback.size)]),
-                ],
-                &[],
-            );
-            self.passthrough_fallback = Some(fallback);
         }
         Ok(())
     }
@@ -721,6 +679,12 @@ impl Renderer {
     pub fn update_hands(&mut self, joints: [Option<xr::HandJointLocations>; 2]) -> Result<()> {
         self.hand_joints = joints;
         for hand in 0..2 {
+            if self.hand_joints[hand].is_some() && self.hand_models[hand].is_none() {
+                self.hand_models[hand] = Some(crate::controller_model::Model::hand(
+                    self.gpu.clone(),
+                    self.pass,
+                )?);
+            }
             if let Some(model) = self.hand_models[hand].as_mut() {
                 model.update_hand(self.hand_joints[hand].as_ref())?;
             }
@@ -747,7 +711,7 @@ impl Renderer {
             "model_binding_source": "Resource controller-anchors.json; model-only rotation, tracked grip and aim unchanged",
             "hands": self.controllers.iter().zip(&self.controller_states).enumerate().map(|(hand,(model,state))| {
                 let pose = |p: xr::Posef| serde_json::json!({"position_m":[p.position.x,p.position.y,p.position.z],"orientation_xyzw":[p.orientation.x,p.orientation.y,p.orientation.z,p.orientation.w]});
-                serde_json::json!({"hand":if hand==0 {"left"} else {"right"}, "loaded":model.is_some(), "directory":model.as_ref().map(|m|&m.directory), "visible":self.controller_visuals & 1 != 0 && model.is_some() && state.grip.is_some(), "rays_visible":self.controller_visuals & 2 != 0 && model.is_some() && state.aim.is_some(), "grip":state.grip.map(pose), "aim":state.aim.map(pose), "ray_feedback":self.ray_feedback[hand], "ray_length_m":self.ray_feedback[hand].map_or(crate::spatial::IDLE_RAY_LENGTH_M, |h|h.distance_m), "source_binding_present":model.as_ref().is_some_and(|m|m.source_binding_present), "source_rotation_xyzw":model.as_ref().map(|m|{let q=m.source_rotation;[q.x,q.y,q.z,q.w]}), "model_pose":model.as_ref().and_then(|m|state.grip.map(|p|pose(m.model_pose(p)))), "select":state.select,"secondary":state.secondary,"thumb_click":state.thumb_click,"trigger":state.trigger,"squeeze":state.squeeze,"menu":state.menu,"stick":state.stick})
+                serde_json::json!({"hand":if hand==0 {"left"} else {"right"}, "loaded":model.is_some(), "directory":model.as_ref().map(|m|&m.directory), "visible":self.controller_visuals & 1 != 0 && !self.optical_hands[hand] && model.is_some() && state.grip.is_some(), "rays_visible":self.controller_visuals & 2 != 0 && model.is_some() && state.aim.is_some(), "grip":state.grip.map(pose), "aim":state.aim.map(pose), "ray_feedback":self.ray_feedback[hand], "ray_length_m":self.ray_feedback[hand].map_or(crate::spatial::IDLE_RAY_LENGTH_M, |h|h.distance_m), "source_binding_present":model.as_ref().is_some_and(|m|m.source_binding_present), "source_rotation_xyzw":model.as_ref().map(|m|{let q=m.source_rotation;[q.x,q.y,q.z,q.w]}), "model_pose":model.as_ref().and_then(|m|state.grip.map(|p|pose(m.model_pose(p)))), "select":state.select,"secondary":state.secondary,"thumb_click":state.thumb_click,"trigger":state.trigger,"squeeze":state.squeeze,"menu":state.menu,"stick":state.stick})
             }).collect::<Vec<_>>()
         })
     }
@@ -900,6 +864,7 @@ impl Renderer {
                 vk::SubpassContents::INLINE,
             );
             let (skip_background, skip_panels) = draw_skip();
+            let skip_background = skip_background || self.passthrough_active;
             if matches!(pass, DrawPass::Foreground | DrawPass::Quad) || skip_background {
                 // The shared pass uses DONT_CARE for the opaque panorama.
                 // Alpha layers must explicitly clear reused swapchain images;
@@ -979,10 +944,11 @@ impl Renderer {
                 .zip(&self.controller_states)
                 .enumerate()
             {
-                if let Some(model) = model
-                    .as_ref()
-                    .filter(|_| matches!(pass, DrawPass::All) && self.controller_visuals & 1 != 0)
-                {
+                if let Some(model) = model.as_ref().filter(|_| {
+                    matches!(pass, DrawPass::All)
+                        && self.controller_visuals & 1 != 0
+                        && !self.optical_hands[hand]
+                }) {
                     model.draw(
                         self.cmd,
                         view,
@@ -1137,83 +1103,32 @@ impl Renderer {
 
     /// Both eyes share one recording/submission. The single completion wait
     /// protects XR release and optional readback; no CPU wait splits the eyes.
-    pub fn set_passthrough_visible(&mut self, visible: bool) {
-        if let Some(p) = self.passthrough.as_mut() {
-            p.set_visible(visible);
-        }
+    pub fn set_passthrough_visible(&mut self, requested: bool) {
+        self.passthrough_requested = requested;
+        self.passthrough_active = requested && self.runtime_alpha_supported;
+    }
+    pub fn runtime_alpha_active(&self) -> bool {
+        self.passthrough_active
     }
     pub fn passthrough_status(&self) -> Option<serde_json::Value> {
-        self.passthrough.as_ref().map(|p| {
-            let mut status = p.status();
-            status["render_active"] = self.passthrough_active.into();
-            status
-        })
-    }
-    pub fn passthrough_submitted(&mut self) {
-        if let Some(p) = &mut self.passthrough {
-            p.submitted(self.passthrough_active);
-        }
-    }
-    pub fn sample_passthrough_pose(
-        &mut self,
-        instance: &xr::Instance,
-        session: &xr::Session<xr::Vulkan>,
-        space: &xr::Space,
-    ) {
-        let Some(p) = self.passthrough.as_mut().filter(|p| p.motion_enabled()) else {
-            return;
-        };
-        // Sample "now", not predictedDisplayTime: associating a predicted pose
-        // with a current monotonic stamp would shift the entire pose history.
-        let before = crate::timeline::now() as u64;
-        let time = if instance.exts().khr_convert_timespec_time.is_some() {
-            instance.now().ok()
-        } else {
-            None
-        };
-        let after = crate::timeline::now() as u64;
-        if after.saturating_sub(before) > 1_000_000 {
-            p.reset_pose_history();
-            return;
-        }
-        if let Some((flags, views)) =
-            time.and_then(|t| session.locate_views(crate::VIEW_TYPE, t, space).ok())
-        {
-            p.observe_views(flags, &views, before + (after - before) / 2);
-        } else {
-            p.reset_pose_history();
-        }
-    }
-    pub fn reset_passthrough_pose_history(&mut self) {
-        if let Some(p) = &mut self.passthrough {
-            p.reset_pose_history();
-        }
+        Some(serde_json::json!({
+            "provider": "openxr-runtime", "supported": self.runtime_alpha_supported,
+            "requested": self.passthrough_requested, "render_active": self.passthrough_active,
+            "environment_blend_mode": if self.passthrough_active { "ALPHA_BLEND" } else { "OPAQUE" },
+            "camera_pixels_available_to_application": false
+        }))
     }
     pub fn render_stereo(
         &mut self,
         indices: &[u32],
         views: &[xr::View],
         capture: bool,
-        instance: &xr::Instance,
-        session: &xr::Session<xr::Vulkan>,
-        space: &xr::Space,
     ) -> Result<Vec<Option<Vec<u8>>>> {
         self.draw_spans.borrow_mut().clear();
         self.render_mono_ns[0] = crate::timeline::now();
         self.begin()?;
         self.render_mono_ns[1] = crate::timeline::now();
         self.timing.begin(self.cmd);
-        if let Some(passthrough) = &mut self.passthrough {
-            passthrough.prepare(self.cmd)?;
-        }
-        // Latch the source first, then append a pose newer than that frame.
-        // Querying before RAW selection can leave a just-arrived frame without
-        // the upper interpolation bracket and make compensation intermittent.
-        self.sample_passthrough_pose(instance, session, space);
-        if let Some(passthrough) = &mut self.passthrough {
-            passthrough.update_projection(views)?;
-        }
-        self.passthrough_active = self.passthrough.as_ref().is_some_and(|p| p.active());
         self.render_mono_ns[2] = crate::timeline::now();
         self.record_atlas_upload();
         self.timing.mark(self.cmd, 1);

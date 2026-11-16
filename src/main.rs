@@ -8,9 +8,7 @@ mod gpu;
 mod gpu_timing;
 mod hand_model;
 mod hand_tracking;
-mod home;
 mod input;
-mod passthrough;
 mod raster;
 mod recenter;
 mod renderer;
@@ -50,6 +48,7 @@ struct Options {
     socket: Option<PathBuf>,
     ui_anchor: ui_anchor::Mode,
     focus_quad: bool,
+    passthrough: bool,
     hand_reference_capture: Option<PathBuf>,
 }
 impl Options {
@@ -57,6 +56,11 @@ impl Options {
         let mut o = Self {
             environment: "/usr/share/xr/environments/qingkong/environment.json".into(),
             seconds: 0,
+            passthrough: match env::var("XR_ENVIRONMENT_MODE").as_deref() {
+                Ok("passthrough") => true,
+                Err(env::VarError::NotPresent) | Ok("opaque") => false,
+                _ => bail!("XR_ENVIRONMENT_MODE must be opaque or passthrough"),
+            },
             capture_dir: None,
             validation: false,
             scale: 1.0,
@@ -251,6 +255,8 @@ struct Summary {
     gpu: Option<String>,
     environment: Option<String>,
     passthrough: Option<serde_json::Value>,
+    runtime_alpha_supported: bool,
+    runtime_recenter_count: u64,
     asset_sha256: Option<String>,
     validation_enabled: bool,
     validation_errors: u64,
@@ -263,7 +269,6 @@ struct Summary {
     session_states: Vec<String>,
     elapsed_seconds: f64,
     reference_space: Option<String>,
-    home_recenter_count: u64,
     initialization_stage: Option<&'static str>,
     ui_anchor: ui_anchor::UiAnchor,
     cleanup: Cleanup,
@@ -336,12 +341,13 @@ fn run(options: &Options, summary: &mut Summary) -> Result<()> {
     let mut extensions = xr::ExtensionSet::default();
     extensions.khr_vulkan_enable2 = true;
     extensions.ext_hand_tracking = available.ext_hand_tracking;
+    extensions.ext_hand_interaction = available.ext_hand_interaction;
     extensions.khr_convert_timespec_time = available.khr_convert_timespec_time;
     let instance = entry.create_instance(
         &xr::ApplicationInfo {
-            application_name: "UKUI XR Shell",
+            application_name: "HyperSpace",
             application_version: 1,
-            engine_name: "xr-shell",
+            engine_name: "Vultra",
             engine_version: 1,
             api_version: xr::Version::new(1, 0, 0),
         },
@@ -356,6 +362,16 @@ fn run(options: &Options, summary: &mut Summary) -> Result<()> {
     ));
     println!("XR_RUNTIME={}", summary.runtime.as_ref().unwrap());
     let system = instance.system(xr::FormFactor::HEAD_MOUNTED_DISPLAY)?;
+    let modes = instance.enumerate_environment_blend_modes(system, VIEW_TYPE)?;
+    summary.runtime_alpha_supported = modes.contains(&xr::EnvironmentBlendMode::ALPHA_BLEND);
+    ensure!(
+        modes.contains(&if options.passthrough {
+            xr::EnvironmentBlendMode::ALPHA_BLEND
+        } else {
+            xr::EnvironmentBlendMode::OPAQUE
+        }),
+        "runtime does not support the requested environment mode"
+    );
     let graphics = instance.system_properties(system)?.graphics_properties;
     summary.layer_limits = [
         graphics.max_layer_count,
@@ -377,11 +393,6 @@ fn run(options: &Options, summary: &mut Summary) -> Result<()> {
             view.max_swapchain_sample_count
         );
     }
-    let blends = instance.enumerate_environment_blend_modes(system, VIEW_TYPE)?;
-    ensure!(
-        blends.contains(&xr::EnvironmentBlendMode::OPAQUE),
-        "opaque panorama mode unavailable"
-    );
     let gpu = Gpu::new(&instance, system, options.validation)?;
     summary.gpu = Some(gpu.name.clone());
     let validation_stats = gpu.instance.validation.clone();
@@ -495,8 +506,8 @@ fn frame_loop(
     desktop: &mut Option<desktop::Desktop>,
     input: &mut Option<input::Input>,
 ) -> Result<()> {
-    let mut home = home::Home::new();
     let mut controls = controls::Controls::new();
+    renderer.runtime_alpha_supported = summary.runtime_alpha_supported;
     let mut hands = hand_tracking::Tracking::new(instance, session);
     let reference = options
         .hand_reference_capture
@@ -509,7 +520,7 @@ fn frame_loop(
             "XR_HAND_REFERENCE source=recorded capture_only=true action_routes=none projection_layers=0"
         );
     }
-    let mut centered_space = None;
+    let mut pending_recenter = None;
     let mut events = xr::EventDataBuffer::new();
     let mut running = false;
     let mut started = None::<Instant>;
@@ -517,11 +528,18 @@ fn frame_loop(
         let loop_start = timeline::now();
         while let Some(event) = instance.poll_event(&mut events)? {
             match event {
+                xr::Event::ReferenceSpaceChangePending(e) => {
+                    let selected = if summary.reference_space.as_deref() == Some("STAGE") {
+                        xr::ReferenceSpaceType::STAGE
+                    } else {
+                        xr::ReferenceSpaceType::LOCAL
+                    };
+                    if e.reference_space_type() == selected {
+                        pending_recenter = Some(e.change_time().as_nanos());
+                    }
+                }
                 xr::Event::SessionStateChanged(e) => {
                     let state = e.state();
-                    if state != xr::SessionState::FOCUSED {
-                        home.cancel();
-                    }
                     println!("XR_SESSION_STATE={state:?}");
                     summary.session_states.push(format!("{state:?}"));
                     if let Some(d) = desktop {
@@ -590,8 +608,29 @@ fn frame_loop(
             }
         }
         times[1] = timeline::now();
+        controls.poll();
+        renderer.set_passthrough_visible(controls.passthrough(options.passthrough));
+        let blend_mode = if renderer.runtime_alpha_active() {
+            xr::EnvironmentBlendMode::ALPHA_BLEND
+        } else {
+            xr::EnvironmentBlendMode::OPAQUE
+        };
         let state = waiter.wait()?;
         stream.begin()?;
+        if pending_recenter.is_some_and(|time| state.predicted_display_time.as_nanos() >= time) {
+            pending_recenter = None;
+            summary.runtime_recenter_count += 1;
+            summary.ui_anchor = ui_anchor::UiAnchor::new(options.ui_anchor);
+            renderer.set_ui_anchor(summary.ui_anchor.offset());
+            if let Some(d) = desktop.as_mut() {
+                d.recenter_taskbar();
+                d.set_ui_anchor(summary.ui_anchor.offset());
+                if let Some(i) = input.as_mut() {
+                    i.cancel_for_recenter(d);
+                }
+            }
+        }
+
         times[2] = timeline::now();
         let runtime_now_xr_ns = if instance.exts().khr_convert_timespec_time.is_some() {
             instance.now().ok().map(|t| t.as_nanos())
@@ -604,14 +643,8 @@ fn frame_loop(
         renderer.update_controllers(&[input::HandState::default(); 2]);
         renderer.clear_hands();
         renderer.update_ray_feedback([None; 2]);
-        let recenter_requested =
-            home.poll(state.should_render && desktop.as_ref().is_some_and(|d| d.focused));
         if !state.should_render {
-            stream.end(
-                state.predicted_display_time,
-                xr::EnvironmentBlendMode::OPAQUE,
-                &[],
-            )?;
+            stream.end(state.predicted_display_time, blend_mode, &[])?;
             summary.timeline.skip(
                 summary.waited_frames,
                 [times[0], times[2], timeline::now()],
@@ -620,44 +653,6 @@ fn frame_loop(
             );
             continue;
         }
-        if recenter_requested {
-            let (flags, views) =
-                session.locate_views(VIEW_TYPE, state.predicted_display_time, space)?;
-            if let Some(pose) = recenter::pose(flags, &views) {
-                let kind = if summary.reference_space.as_deref() == Some("STAGE") {
-                    xr::ReferenceSpaceType::STAGE
-                } else {
-                    xr::ReferenceSpaceType::LOCAL
-                };
-                match session.create_reference_space(kind, pose) {
-                    Ok(new_space) => {
-                        centered_space = Some(new_space);
-                        renderer.reset_passthrough_pose_history();
-                        summary.home_recenter_count += 1;
-                        summary.ui_anchor = ui_anchor::UiAnchor::new(options.ui_anchor);
-                        renderer.set_ui_anchor(summary.ui_anchor.offset());
-                        if let Some(d) = desktop.as_mut() {
-                            d.recenter_taskbar();
-                            d.set_ui_anchor(summary.ui_anchor.offset());
-                            if let Some(i) = input.as_mut() {
-                                i.cancel_for_recenter(d);
-                            }
-                        }
-                        eprintln!(
-                            "XR_HOME_RECENTER=applied X={} Z={} YAW_QUAT_Y={} YAW_QUAT_W={}",
-                            pose.position.x,
-                            pose.position.z,
-                            pose.orientation.y,
-                            pose.orientation.w
-                        );
-                    }
-                    Err(error) => eprintln!("XR_HOME_RECENTER=failed {error:?}"),
-                }
-            } else {
-                eprintln!("XR_HOME_RECENTER=rejected REASON=invalid_head_pose");
-            }
-        }
-        let space = centered_space.as_ref().unwrap_or(space);
         let (flags, views) =
             session.locate_views(VIEW_TYPE, state.predicted_display_time, space)?;
         summary
@@ -680,11 +675,7 @@ fn frame_loop(
             if let Some(d) = desktop.as_mut() {
                 d.invalidate_horizon_head();
             }
-            stream.end(
-                state.predicted_display_time,
-                xr::EnvironmentBlendMode::OPAQUE,
-                &[],
-            )?;
+            stream.end(state.predicted_display_time, blend_mode, &[])?;
             summary.timeline.skip(
                 summary.waited_frames,
                 [times[0], times[2], timeline::now()],
@@ -710,8 +701,6 @@ fn frame_loop(
                 d.invalidate_horizon_head();
             }
         }
-        controls.poll();
-        renderer.set_passthrough_visible(controls.passthrough());
         if controls.take_source_change() {
             if let (Some(i), Some(d)) = (input.as_mut(), desktop.as_mut()) {
                 i.cancel_for_source_change(d);
@@ -723,16 +712,27 @@ fn frame_loop(
             .each_ref()
             .map(|j| j.as_ref().map_or(0, |v| v.len()));
         let hands_located = timeline::now();
-        renderer.update_hands(if controls.source() == "hands" {
-            hand_joints
-        } else {
-            [None, None]
-        })?;
         let mut input_times = [timeline::now(); 5];
+        let mut optical_hands = [false; 2];
         if let (Some(i), Some(d)) = (input.as_mut(), desktop.as_mut()) {
-            i.update(session, space, state.predicted_display_time, d)?;
-            renderer.update_controllers(i.controllers());
+            if controls.source() == "none" {
+                i.cancel_for_source_change(d);
+            } else {
+                i.update(
+                    session,
+                    space,
+                    state.predicted_display_time,
+                    d,
+                    controls.source(),
+                )?;
+                renderer.update_controllers(i.controllers());
+                optical_hands = i.optical_hands();
+            }
         }
+        renderer.optical_hands = optical_hands;
+        renderer.update_hands(std::array::from_fn(|hand| {
+            optical_hands[hand].then(|| hand_joints[hand]).flatten()
+        }))?;
         if let Some(reference) = reference.as_ref() {
             let mut centre = views[0].pose;
             centre.position = xr::Vector3f {
@@ -754,8 +754,7 @@ fn frame_loop(
             // Optical hands use measured grip/aim and the existing 6DoF routes.
             // Do not draw a physical controller body at an optical palm pose.
             renderer.controller_visuals = match controls.source() {
-                "hands" => d.controller_visuals & 2,
-                "controllers" => d.controller_visuals,
+                "hands" | "controllers" | "runtime" => d.controller_visuals,
                 _ => 0,
             };
             if let Some(i) = input.as_ref() {
@@ -796,14 +795,7 @@ fn frame_loop(
             target.swapchain.wait_image(xr::Duration::INFINITE)?;
         }
         times[5] = timeline::now();
-        let result = renderer.render_stereo(
-            &indices,
-            &views,
-            capture.is_some(),
-            instance,
-            session,
-            space,
-        );
+        let result = renderer.render_stereo(&indices, &views, capture.is_some());
         times[6] = timeline::now();
         let releases: Vec<_> = renderer
             .targets_mut()
@@ -839,13 +831,14 @@ fn frame_loop(
             .collect();
         let background = xr::CompositionLayerProjection::new()
             .space(space)
+            .layer_flags(if renderer.runtime_alpha_active() {
+                xr::CompositionLayerFlags::BLEND_TEXTURE_SOURCE_ALPHA
+            } else {
+                xr::CompositionLayerFlags::EMPTY
+            })
             .views(&layers);
         if reference.is_some() {
-            stream.end(
-                state.predicted_display_time,
-                xr::EnvironmentBlendMode::OPAQUE,
-                &[],
-            )?;
+            stream.end(state.predicted_display_time, blend_mode, &[])?;
         } else if let Some(focus) = &renderer.focus_quad {
             let target = renderer.quad.as_ref().unwrap();
             let quad = xr::CompositionLayerQuad::new()
@@ -902,19 +895,14 @@ fn frame_loop(
                 .views(&front_views);
             stream.end(
                 state.predicted_display_time,
-                xr::EnvironmentBlendMode::OPAQUE,
+                blend_mode,
                 &[&background, &quad, &foreground],
             )?;
             summary.native_quad_frames += 1;
         } else {
-            stream.end(
-                state.predicted_display_time,
-                xr::EnvironmentBlendMode::OPAQUE,
-                &[&background],
-            )?;
+            stream.end(state.predicted_display_time, blend_mode, &[&background])?;
         }
         let end_frame_done = timeline::now();
-        renderer.passthrough_submitted();
         summary.passthrough = renderer.passthrough_status();
         controls.report(summary.passthrough.clone());
         times[8] = timeline::now();

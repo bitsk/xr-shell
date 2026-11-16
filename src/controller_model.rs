@@ -794,23 +794,21 @@ impl Drop for Model {
 }
 
 pub fn load_models(gpu: Rc<Gpu>, pass: vk::RenderPass) -> [Option<Model>; 2] {
-    let directory = std::env::var_os("XR_CONTROLLER_MODEL_DIR")
-        .map(std::path::PathBuf::from)
-        .unwrap_or_else(|| "/usr/share/xr/devices/a081/controllers".into());
+    let directory = std::env::var_os("XR_CONTROLLER_MODEL_DIR").map(std::path::PathBuf::from);
     ["left", "right"].map(|hand| {
-        match Model::load(gpu.clone(), pass, &directory.join(hand))
-            .with_context(|| format!("load {hand} controller model"))
-        {
+        if let Some(directory) = directory.as_ref() {
+            match Model::load(gpu.clone(), pass, &directory.join(hand)) {
+                Ok(model) => return Some(model),
+                Err(error) => {
+                    eprintln!("XR_CONTROLLER_MODEL_UNAVAILABLE hand={hand} error={error:#}")
+                }
+            }
+        }
+        match Model::generic_controller(gpu.clone(), pass) {
             Ok(model) => Some(model),
             Err(error) => {
-                eprintln!("XR_CONTROLLER_MODEL_UNAVAILABLE hand={hand} error={error:#}");
-                match Model::generic_controller(gpu.clone(), pass) {
-                    Ok(model) => Some(model),
-                    Err(error) => {
-                        eprintln!("XR_CONTROLLER_FALLBACK_FAILED hand={hand} error={error:#}");
-                        None
-                    }
-                }
+                eprintln!("XR_CONTROLLER_FALLBACK_FAILED hand={hand} error={error:#}");
+                None
             }
         }
     })

@@ -23,6 +23,7 @@ pub struct Controls {
     worker: Option<thread::JoinHandle<()>>,
     root: Option<Value>,
     input: Option<Value>,
+    managed: bool,
     generation: Option<u64>,
     changed: bool,
     last_write: Instant,
@@ -36,40 +37,44 @@ impl Controls {
         let root_path = std::env::var_os("XR_SESSION_CONTROLS_FILE").map(PathBuf::from);
         let input_path = std::env::var_os("XR_INPUT_STATUS_FILE").map(PathBuf::from);
         let report_path = std::env::var_os("XR_SCENE_CONTROLS_STATUS_FILE").map(PathBuf::from);
-        let worker = thread::spawn(move || {
-            while !done.load(Ordering::Relaxed) {
-                let root = root_path.as_ref().and_then(|p| Self::read(p, true));
-                let input = input_path
-                    .as_ref()
-                    .and_then(|p| Self::read(p, false))
-                    .filter(|v| {
-                        v["observed_monotonic_ns"].as_u64().is_some_and(|n| {
-                            let now = crate::timeline::now() as u64;
-                            now >= n && now - n < 1_000_000_000
-                        })
-                    });
-                let report = if let Ok(mut state) = work.lock() {
-                    state.root = root;
-                    state.input = input;
-                    state.report.take()
-                } else {
-                    None
-                };
-                if let (Some(p), Some(v)) = (report_path.as_ref(), report) {
-                    let tmp = p.with_extension("tmp");
-                    if let Ok(data) = serde_json::to_vec(&v) {
-                        if fs::write(&tmp, data).is_ok() {
-                            let _ = fs::rename(tmp, p);
+        let managed = root_path.is_some() || input_path.is_some();
+        let worker = (managed || report_path.is_some()).then(|| {
+            thread::spawn(move || {
+                while !done.load(Ordering::Relaxed) {
+                    let root = root_path.as_ref().and_then(|p| Self::read(p, true));
+                    let input = input_path
+                        .as_ref()
+                        .and_then(|p| Self::read(p, false))
+                        .filter(|v| {
+                            v["observed_monotonic_ns"].as_u64().is_some_and(|n| {
+                                let now = crate::timeline::now() as u64;
+                                now >= n && now - n < 1_000_000_000
+                            })
+                        });
+                    let report = if let Ok(mut state) = work.lock() {
+                        state.root = root;
+                        state.input = input;
+                        state.report.take()
+                    } else {
+                        None
+                    };
+                    if let (Some(p), Some(v)) = (report_path.as_ref(), report) {
+                        let tmp = p.with_extension("tmp");
+                        if let Ok(data) = serde_json::to_vec(&v) {
+                            if fs::write(&tmp, data).is_ok() {
+                                let _ = fs::rename(tmp, p);
+                            }
                         }
                     }
+                    thread::sleep(Duration::from_millis(50));
                 }
-                thread::sleep(Duration::from_millis(50));
-            }
+            })
         });
         Self {
             shared,
             stop,
-            worker: Some(worker),
+            worker,
+            managed,
             root: None,
             input: None,
             generation: None,
@@ -108,18 +113,20 @@ impl Controls {
         if let Some(v) = self.input.as_ref() {
             return v["active_source"].as_str().unwrap_or("none");
         }
-        if self.root.as_ref().is_some_and(|v|v["capabilities"]["hand_tracking"]==false){
+        if self
+            .root
+            .as_ref()
+            .is_some_and(|v| v["capabilities"]["hand_tracking"] == false)
+        {
             "controllers"
-        } else if self.root.is_some() {
+        } else if self.managed {
             "none"
-        } else if std::env::var("XR_SHELL_INPUT_MODE").as_deref() == Ok("hands") {
-            "hands"
         } else {
-            "controllers"
+            "runtime"
         }
     }
-    pub fn passthrough(&self) -> bool {
-        self.root.as_ref().map_or(true, |v| {
+    pub fn passthrough(&self, default: bool) -> bool {
+        self.root.as_ref().map_or(default, |v| {
             v["session_active"] == true && v["preferences"]["passthrough_enabled"] == true
         })
     }
@@ -128,7 +135,7 @@ impl Controls {
             return;
         }
         self.last_write = Instant::now();
-        let v = json!({"schema":1,"observed_monotonic_ns":crate::timeline::now(),"input_source":self.source(),"passthrough_requested":self.passthrough(),"passthrough":passthrough});
+        let v = json!({"schema":1,"observed_monotonic_ns":crate::timeline::now(),"input_source":self.source(),"passthrough_requested":passthrough.as_ref().and_then(|v|v["requested"].as_bool()).unwrap_or(false),"passthrough":passthrough});
         if let Ok(mut s) = self.shared.try_lock() {
             s.report = Some(v);
         }

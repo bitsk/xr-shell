@@ -9,8 +9,8 @@ Rules-Requires-Root: no
 Package: xr-shell
 Architecture: any
 Depends: ${shlibs:Depends}, ${misc:Depends}, libvulkan1
-Recommends: xr-device-a081-controller-models, xr-environment-qingkong, xr-spatial-style-ukui (>= 0.2.4)
-Description: Rust OpenXR panorama shell for UKUI XR
+Recommends: xr-environment-qingkong, xr-spatial-style-ukui (>= 0.2.4)
+Description: Vultra spatial compositor for the HyperSpace XR desktop
  Renders a versioned panoramic environment through an OpenXR Vulkan stereo
  session. A separately configured OpenXR loader and runtime are required;
  development profiles may provide an isolated loader. Installation does not
@@ -19,6 +19,6 @@ Description: Rust OpenXR panorama shell for UKUI XR
 Package: librust-xr-shell-protocols-dev
 Architecture: all
 Depends: ${misc:Depends}
-Description: source SDK for local UKUI XR component IPC
+Description: source SDK for local HyperSpace component IPC
  Versioned Rust client, bounded seqpacket metadata, immutable snapshot FD
  helpers and normative primitive types. The Shell owns this interface.

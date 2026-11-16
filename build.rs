@@ -5,7 +5,6 @@ fn main() {
     println!("cargo:rerun-if-env-changed=GLSLANG_VALIDATOR");
     let compiler = env::var_os("GLSLANG_VALIDATOR").unwrap_or_else(|| "glslangValidator".into());
     for name in [
-        "passthrough.comp",
         "panorama.vert",
         "panorama.frag",
         "spatial.vert",
