@@ -127,7 +127,8 @@ fn draw_skip() -> (bool, bool) {
 pub struct Renderer {
     gpu: Rc<Gpu>,
     pub timing: crate::gpu_timing::Timer,
-    pub render_mono_ns: [i64; 11],
+    pub render_mono_ns: [i64; 9],
+    pub retire_mono_ns: [i64; 3],
     pub draw_spans: std::cell::RefCell<Vec<crate::timeline::DrawSpan>>,
     pub eyes: Vec<Eye>,
     pub format: vk::Format,
@@ -167,6 +168,9 @@ pub struct Renderer {
     pool: vk::CommandPool,
     cmd: vk::CommandBuffer,
     fence: vk::Fence,
+    // Retained across XR release/end-frame, including their error paths. These
+    // buffers must not be read or destroyed while the stereo batch is pending.
+    pending_readbacks: Option<Vec<Option<Buffer>>>,
     shaders: Vec<vk::ShaderModule>,
     yaw: f32,
     pub runtime_alpha_supported: bool,
@@ -200,7 +204,8 @@ impl Renderer {
             .ok_or_else(|| anyhow::anyhow!("no supported sRGB OpenXR swapchain format"))?;
         let mut r = Self {
             timing: crate::gpu_timing::Timer::new(gpu.clone()),
-            render_mono_ns: [0; 11],
+            render_mono_ns: [0; 9],
+            retire_mono_ns: [0; 3],
             draw_spans: std::cell::RefCell::new(Vec::with_capacity(25)),
             gpu,
             eyes: Vec::new(),
@@ -240,6 +245,7 @@ impl Renderer {
             pool: vk::CommandPool::null(),
             cmd: vk::CommandBuffer::null(),
             fence: vk::Fence::null(),
+            pending_readbacks: None,
             shaders: Vec::new(),
             yaw: environment.yaw,
             runtime_alpha_supported: false,
@@ -328,7 +334,7 @@ impl Renderer {
             Ok(())
         }
     }
-    fn submit(&self) -> Result<[i64; 3]> {
+    fn enqueue(&self) -> Result<[i64; 2]> {
         unsafe {
             self.gpu.device.end_command_buffer(self.cmd)?;
             let ended = crate::timeline::now();
@@ -337,13 +343,18 @@ impl Renderer {
                 &[vk::SubmitInfo::default().command_buffers(&[self.cmd])],
                 self.fence,
             )?;
-            let submitted = crate::timeline::now();
-            // Complete the stereo batch before releasing the acquired XR images.
+            Ok([ended, crate::timeline::now()])
+        }
+    }
+    // Initialization uploads have local staging lifetimes and stay synchronous.
+    fn submit(&self) -> Result<()> {
+        self.enqueue()?;
+        unsafe {
             self.gpu
                 .device
                 .wait_for_fences(&[self.fence], true, u64::MAX)?;
-            Ok([ended, submitted, crate::timeline::now()])
         }
+        Ok(())
     }
 
     fn upload(&mut self, environment: &Environment) -> Result<()> {
@@ -1101,8 +1112,6 @@ impl Renderer {
         Ok(readback)
     }
 
-    /// Both eyes share one recording/submission. The single completion wait
-    /// protects XR release and optional readback; no CPU wait splits the eyes.
     pub fn set_passthrough_visible(&mut self, requested: bool) {
         self.passthrough_requested = requested;
         self.passthrough_active = requested && self.runtime_alpha_supported;
@@ -1118,13 +1127,22 @@ impl Renderer {
             "camera_pixels_available_to_application": false
         }))
     }
-    pub fn render_stereo(
+    /// Queue both eyes together. Vulkan enable2 permits XR release/end-frame
+    /// while work on the bound VkQueue is pending. The caller must retire this
+    /// batch after XR submission and before any next-frame resource updates.
+    pub fn enqueue_stereo(
         &mut self,
         indices: &[u32],
         views: &[xr::View],
         capture: bool,
-    ) -> Result<Vec<Option<Vec<u8>>>> {
+    ) -> Result<()> {
+        ensure!(
+            self.pending_readbacks.is_none(),
+            "previous stereo batch has not been retired"
+        );
         self.draw_spans.borrow_mut().clear();
+        self.retire_mono_ns = [0; 3];
+        self.render_mono_ns = [0; 9];
         self.render_mono_ns[0] = crate::timeline::now();
         self.begin()?;
         self.render_mono_ns[1] = crate::timeline::now();
@@ -1177,12 +1195,32 @@ impl Renderer {
         }
         self.timing.mark(self.cmd, 4);
         self.render_mono_ns[6] = crate::timeline::now();
-        let submit = self.submit()?;
-        self.render_mono_ns[7..10].copy_from_slice(&submit);
+        // Transfer ownership before enqueue: even a submission error leaves
+        // buffers alive until Renderer::drop has waited for device idle.
+        self.pending_readbacks = Some(readbacks);
+        let submit = self.enqueue()?;
+        self.render_mono_ns[7..9].copy_from_slice(&submit);
+        Ok(())
+    }
+    /// Complete the single in-flight batch after xrEndFrame. Only after this
+    /// wait may queries/readbacks be read, staging freed, or frame data reused.
+    pub fn retire_stereo(&mut self) -> Result<Vec<Option<Vec<u8>>>> {
+        ensure!(
+            self.pending_readbacks.is_some(),
+            "no stereo batch to retire"
+        );
+        self.retire_mono_ns[0] = crate::timeline::now();
+        unsafe {
+            self.gpu
+                .device
+                .wait_for_fences(&[self.fence], true, u64::MAX)?;
+        }
+        self.retire_mono_ns[1] = crate::timeline::now();
         self.timing.resolve();
         if self.atlas_upload.take().is_some() {
             self.atlas.as_mut().unwrap().initialized = true;
         }
+        let readbacks = self.pending_readbacks.take().unwrap();
         let pixels = readbacks
             .into_iter()
             .map(|buffer| {
@@ -1199,7 +1237,7 @@ impl Renderer {
                     .transpose()
             })
             .collect();
-        self.render_mono_ns[10] = crate::timeline::now();
+        self.retire_mono_ns[2] = crate::timeline::now();
         pixels
     }
 }
@@ -1208,6 +1246,7 @@ impl Drop for Renderer {
     fn drop(&mut self) {
         unsafe {
             let _ = self.gpu.device.device_wait_idle();
+            self.pending_readbacks = None;
             self.foreground.clear();
             self.quad = None;
             self.eyes.clear();

@@ -114,13 +114,18 @@ images and skip submission. This gives the runtime a later opportunity to use
 new tracking observations, but does not establish that it actually refreshed its
 internal sample or that the compositor's final reprojection used the same time.
 
-Timeline schema 3 records `input_view_locate_mono_ns` and
+Timeline schema 4 records `input_view_locate_mono_ns` and
 `render_view_locate_mono_ns` call intervals, separate input/render head poses and
 flags, and `render_runtime_now_xr_ns` with its monotonic clock bracket. Compare
 the paired runtime time with `predicted_display_xr_ns` to measure the remaining
 application prediction horizon. These fields do not measure sensor sample age,
 final compositor warp time or physical motion-to-photon latency. The existing
 record/submit stage includes the second locate call; its own interval is separate.
+`render_mono_ns` has nine boundaries ending at queue submission;
+`retire_mono_ns` separately brackets the post-`xrEndFrame` completion wait and
+query/readback/staging retirement. `end_frame_mono_ns[0..1]` still brackets the
+XR call itself. The enclosing final frame stage includes retirement; its total
+must not be interpreted as time inside `xrEndFrame`.
 
 On normal completion, `summary.json` records runtime, GPU, asset hash, frames,
 per-eye submission counts, state transitions, validation counts and cleanup
@@ -148,10 +153,17 @@ captured eye poses are unchanged. `ui_anchor` in summary and capture metadata
 records the source eye poses, flags, time and fixed offset. This mode does not
 continuously recenter the desktop or synthesize a tracked eye height.
 
-S1 deliberately waits for each eye's GPU work before releasing its XR image.
-This is a clear correctness baseline, not a claim of an optimized multi-frame
-pipeline or zero-copy display transport. Observation through a browser may
-have separate CPU-copy and video-encoding costs.
+Both eyes share one Vulkan submission on the queue bound to the XR session.
+After enqueueing, Shell releases its images and calls `xrEndFrame` before
+waiting for that submission's fence, as permitted by
+[the Vulkan enable2 swapchain contract](https://registry.khronos.org/OpenXR/specs/1.1-khr/html/xrspec.html#XR_KHR_vulkan_enable2).
+The completion wait still precedes all query/readback access, staging release,
+and next-frame resource updates. Submission, release and end-frame errors retain
+pending buffers in Renderer until idle cleanup. Only one Shell batch is in
+flight; initialization uploads remain synchronous. This changes CPU submission
+order, not GPU execution cost, and does not establish the runtime's final warp
+deadline or physical latency. Browser observation has separate copying and
+video-encoding costs.
 
 ## Component desktop candidate
 
@@ -384,7 +396,7 @@ The bounded timeline retains the latest 4096 rendered frames. Capture requests
 write `timeline.json`; normal frames do not write telemetry to disk. Final
 `summary.json` also contains the samples. CLOCK_MONOTONIC stage boundaries cover
 application work, wait/begin, locate, input/atlas preparation, acquire/wait,
-record/submit/completion wait, release and end. An XrTime/monotonic clock pair is
+record/submit, release, end and resource retirement. An XrTime/monotonic clock pair is
 recorded only when KHR_convert_timespec_time is available. CPU wait duration is
 not GPU execution time, end-frame return is not scanout, and these observations
 do not establish physical motion-to-photon latency.

@@ -1,3 +1,11 @@
+xr-shell (0.3.3) unstable; urgency=medium
+
+  * Submit XR layers before the single stereo batch CPU completion wait.
+  * Retain pending resources through XR submission and error cleanup.
+  * Separate queue submission and post-end-frame retirement telemetry.
+
+ -- bits <bigbits@hackx.cc>  Tue, 17 Nov 2026 02:44:35 +0800
+
 xr-shell (0.3.2) unstable; urgency=medium
 
   * Locate render views after scene preparation and swapchain waits.

@@ -39,7 +39,8 @@ pub struct Frame {
     pub hand_joint_count: [usize; 2],
     pub predicted_display_period_ns: i64,
     pub pre_input_mono_ns: [i64; 4],
-    pub render_mono_ns: [i64; 11],
+    pub render_mono_ns: [i64; 9],
+    pub retire_mono_ns: [i64; 3],
     pub gpu: crate::gpu_timing::Sample,
     pub draw_spans: Vec<DrawSpan>,
     pub model_vertices: [[u32; 2]; 2],
@@ -116,9 +117,9 @@ impl Timeline {
             "locate_views",
             "input_and_atlas_prepare",
             "swapchain_acquire_wait",
-            "record_submit_completion_wait",
+            "late_locate_record_queue_submit",
             "swapchain_release",
-            "xrEndFrame",
+            "xrEndFrame_and_resource_retire",
         ];
         let mut stages = serde_json::Map::new();
         // Capture frames include readback, and allocation frames remain visible.
@@ -137,10 +138,12 @@ impl Timeline {
         }
         json!({"observed":self.observed,"retained":self.frames.len(),"clock":"CLOCK_MONOTONIC",
             "xr_clock":"runtime XrTime; paired now only with XR_KHR_convert_timespec_time",
-            "schema":3,"boot_id":self.boot_id,"shell_version":env!("CARGO_PKG_VERSION"),"skipped":self.skipped,"retained_limit":4096,"process_id":std::process::id(),
+            "schema":4,"boot_id":self.boot_id,"shell_version":env!("CARGO_PKG_VERSION"),"skipped":self.skipped,"retained_limit":4096,"process_id":std::process::id(),
             "view_location_scope":"input and render locations share predicted_display_xr_ns; head_pose/head_flags are rendered views; call spans do not expose the runtime's underlying sensor sample time or final compositor warp",
             "pre_input_stage_boundaries":["head_controls","locate_hand_joints","hand_mesh_update"],
-            "render_stage_boundaries":["reuse_fence_and_begin","passthrough_prepare_pose","record_atlas_upload","record_left_eye","record_right_eye","record_extra_layers","end_command_buffer","queue_submit","completion_fence_wait","query_readback_and_retire"],
+            "render_stage_boundaries":["reuse_fence_and_begin","gpu_query_begin","record_atlas_upload","record_left_eye","record_right_eye","record_extra_layers","end_command_buffer","queue_submit"],
+            "retire_stage_boundaries":["post_end_frame_fence_wait","query_readback_and_retire"],
+            "retire_scope":"single in-flight shell batch; render_mono_ns ends at queue submission; retire_mono_ns separately measures the post-xrEndFrame CPU wait and cleanup",
             "gpu_stage_boundaries":["uploads","left_eye","right_eye","extra_layers"],
             "gpu_scope":"optional device timestamp intervals; pipeline overlap and query overhead possible; not CPU-clock aligned",
             "input_stage_boundaries":["actions_and_routing","animate_and_raster","geometry_upload","ray_feedback"],

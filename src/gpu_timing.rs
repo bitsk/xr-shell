@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
-//! Optional timestamp queries. Read only after the renderer's existing fence;
+//! Optional timestamp queries. Read during post-xrEndFrame retirement, after
+//! the renderer's submission fence;
 //! never add a profiling wait or interpret device ticks as CLOCK_MONOTONIC.
 use crate::gpu::Gpu;
 use ash::vk;

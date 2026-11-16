@@ -862,14 +862,14 @@ fn frame_loop(
             .render_view_state
             .observe(flags, &views, state.predicted_display_time);
         summary.focus_quad = renderer.quad_status();
-        let result = renderer.render_stereo(&indices, &views, capture.is_some());
+        let result = renderer.enqueue_stereo(&indices, &views, capture.is_some());
         times[6] = timeline::now();
         let releases: Vec<_> = renderer
             .targets_mut()
             .into_iter()
             .map(|eye| eye.swapchain.release_image())
             .collect();
-        let pixels = result?;
+        result?;
         for release in releases {
             release?;
         }
@@ -970,6 +970,12 @@ fn frame_loop(
             stream.end(state.predicted_display_time, blend_mode, &[&background])?;
         }
         let end_frame_done = timeline::now();
+        // Runtime submission does not require a CPU completion wait for work
+        // queued on the bound Vulkan queue. Retire now, before another loop can
+        // overwrite uniforms/atlas/hand buffers or reuse the command/query pool.
+        // Errors above leave pending buffers owned by Renderer until its idle
+        // cleanup in run(), rather than dropping them while the GPU uses them.
+        let pixels = renderer.retire_stereo()?;
         summary.passthrough = renderer.passthrough_status();
         controls.report(summary.passthrough.clone());
         times[8] = timeline::now();
@@ -994,6 +1000,7 @@ fn frame_loop(
             predicted_display_period_ns: state.predicted_display_period.as_nanos(),
             pre_input_mono_ns: [times[3], head_controls_done, hands_located, input_times[0]],
             render_mono_ns: renderer.render_mono_ns,
+            retire_mono_ns: renderer.retire_mono_ns,
             gpu: renderer.timing.sample.clone(),
             draw_spans: renderer.draw_spans.borrow().clone(),
             model_vertices: renderer.model_vertices(),
