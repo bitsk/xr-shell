@@ -124,6 +124,32 @@ impl Renderer {
             self.quad_reason = "active".into();
         }
     }
+    // Targets and the world-space partition are already selected and acquired.
+    // Refresh only the eye-dependent crop; never allocate or change the target
+    // list after acquisition. Crossing the focus plane invalidates that frame's
+    // background/quad/foreground ordering, so the caller must skip submission.
+    pub fn refresh_focus_quad_views(&mut self, views: &[xr::View]) -> bool {
+        use crate::spatial::{dot, sub};
+        let Some(focus) = &self.focus_quad else {
+            return true;
+        };
+        for view in views {
+            let p = view.pose.position;
+            if dot(
+                sub([p.x, p.y, p.z], focus.frame.position),
+                focus.frame.normal(),
+            ) <= 0.05
+            {
+                return false;
+            }
+        }
+        self.foreground_regions = views
+            .iter()
+            .enumerate()
+            .map(|(i, v)| self.foreground_region(v, self.eyes[i].extent))
+            .collect();
+        true
+    }
     // Crop the foreground projection's submitted sub-image and FOV together.
     // Geometry, pixel density, eye pose and depth ordering remain unchanged.
     // Flat panels (including their extrusion) are bounded before perspective

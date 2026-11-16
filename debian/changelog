@@ -1,3 +1,11 @@
+xr-shell (0.3.2) unstable; urgency=medium
+
+  * Locate render views after scene preparation and swapchain waits.
+  * Keep projection metadata and focus crops aligned with the rendered views.
+  * Record separate input and render pose timing observations.
+
+ -- bits <bigbits@hackx.cc>  Tue, 17 Nov 2026 02:32:06 +0800
+
 xr-shell (0.3.1) unstable; urgency=medium
 
   * Load installed themes without content digest gates or diagnostic hashes.

@@ -104,6 +104,22 @@ poses or UI anchors nor change rendering/input validity gates. A tracked flag
 is separate from a valid flag, and frame submission is separate from physical
 tracking and wearer acceptance.
 
+Head views are located before input handling and again after scene preparation
+and swapchain waits, immediately before rendering. Both calls use the runtime's
+unchanged `predictedDisplayTime`; rendered views also supply projection-layer
+poses, FOVs and focus-quad crop bounds. Invalid late views release all acquired
+images and skip submission. This gives the runtime a later opportunity to use
+new tracking observations, but does not establish that it actually refreshed its
+internal sample or that the compositor's final reprojection used the same time.
+
+Timeline schema 3 records `input_view_locate_mono_ns` and
+`render_view_locate_mono_ns` call intervals, separate input/render head poses and
+flags, and `render_runtime_now_xr_ns` with its monotonic clock bracket. Compare
+the paired runtime time with `predicted_display_xr_ns` to measure the remaining
+application prediction horizon. These fields do not measure sensor sample age,
+final compositor warp time or physical motion-to-photon latency. The existing
+record/submit stage includes the second locate call; its own interval is separate.
+
 On normal completion, `summary.json` records runtime, GPU, asset hash, frames,
 per-eye submission counts, state transitions, validation counts and cleanup
 status. It is placed in the capture directory when supplied, otherwise in

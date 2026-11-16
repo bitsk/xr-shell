@@ -648,8 +648,10 @@ fn frame_loop(
             );
             continue;
         }
+        let input_locate_start = timeline::now();
         let (flags, views) =
             session.locate_views(VIEW_TYPE, state.predicted_display_time, space)?;
+        let input_view_locate_mono_ns = [input_locate_start, timeline::now()];
         summary
             .view_state
             .observe(flags, &views, state.predicted_display_time);
@@ -686,6 +688,16 @@ fn frame_loop(
             (views[0].pose.position.y + views[1].pose.position.y) / 2.,
             (views[0].pose.position.z + views[1].pose.position.z) / 2.,
         ];
+        let input_head_pose = {
+            let mut p = views[0].pose;
+            p.position = xr::Vector3f {
+                x: head_position[0],
+                y: head_position[1],
+                z: head_position[2],
+            };
+            timeline::pose(p)
+        };
+        let input_head_flags = flags.into_raw();
         let dt = state.predicted_display_period.as_nanos() as f32 / 1e9;
         if let Some(d) = desktop.as_mut() {
             if let Some(centre) = recenter::center_eye(flags, &views) {
@@ -790,6 +802,65 @@ fn frame_loop(
             target.swapchain.wait_image(xr::Duration::INFINITE)?;
         }
         times[5] = timeline::now();
+        // Keep input and scene preparation on their earlier observation, then
+        // ask the runtime again after CPU work and swapchain waits. The target
+        // remains xrWaitFrame's display time: shortening it here would render
+        // for the wrong scanout, and adding local extrapolation would duplicate
+        // runtime prediction. Render and projection metadata use this same pair.
+        let render_clock_start = timeline::now();
+        let render_runtime_now_xr_ns = if instance.exts().khr_convert_timespec_time.is_some() {
+            instance.now().ok().map(|t| t.as_nanos())
+        } else {
+            None
+        };
+        let render_runtime_now_mono_bracket_ns = [render_clock_start, timeline::now()];
+        let render_locate_start = timeline::now();
+        let render_views = session.locate_views(VIEW_TYPE, state.predicted_display_time, space);
+        let render_view_locate_mono_ns = [render_locate_start, timeline::now()];
+        let render_views_valid = render_views.as_ref().is_ok_and(|(flags, views)| {
+            flags.contains(xr::ViewStateFlags::ORIENTATION_VALID) && views.len() == 2
+        });
+        let focus_views_valid = render_views_valid
+            && renderer.refresh_focus_quad_views(&render_views.as_ref().unwrap().1);
+        if !focus_views_valid {
+            // Acquisition preceded late location. Release every acquired target
+            // before skipping or propagating a runtime error.
+            let releases: Vec<_> = renderer
+                .targets_mut()
+                .into_iter()
+                .map(|eye| eye.swapchain.release_image())
+                .collect();
+            for release in releases {
+                release?;
+            }
+            let (flags, views) = render_views?;
+            summary
+                .view_state
+                .observe(flags, &views, state.predicted_display_time);
+            ensure!(views.len() == 2, "runtime changed stereo view count");
+            if !render_views_valid {
+                if let Some(d) = desktop.as_mut() {
+                    d.invalidate_horizon_head();
+                }
+            }
+            stream.end(state.predicted_display_time, blend_mode, &[])?;
+            summary.timeline.skip(
+                summary.waited_frames,
+                [times[0], times[2], timeline::now()],
+                if render_views_valid {
+                    "late_head_behind_focus_quad"
+                } else {
+                    "late_head_orientation_invalid"
+                },
+                Some(flags.into_raw()),
+            );
+            continue;
+        }
+        let (flags, views) = render_views?;
+        summary
+            .view_state
+            .observe(flags, &views, state.predicted_display_time);
+        summary.focus_quad = renderer.quad_status();
         let result = renderer.render_stereo(&indices, &views, capture.is_some());
         times[6] = timeline::now();
         let releases: Vec<_> = renderer
@@ -929,6 +1000,12 @@ fn frame_loop(
             predicted_display_xr_ns: state.predicted_display_time.as_nanos(),
             runtime_now_xr_ns,
             runtime_now_mono_bracket_ns: clock_bracket,
+            input_view_locate_mono_ns,
+            render_view_locate_mono_ns,
+            render_runtime_now_xr_ns,
+            render_runtime_now_mono_bracket_ns,
+            input_head_pose,
+            input_head_flags,
             layers: if reference.is_some() {
                 0
             } else if renderer.focus_quad.is_some() {
@@ -941,9 +1018,9 @@ fn frame_loop(
             head_pose: {
                 let mut p = views[0].pose;
                 p.position = xr::Vector3f {
-                    x: head_position[0],
-                    y: head_position[1],
-                    z: head_position[2],
+                    x: (views[0].pose.position.x + views[1].pose.position.x) * 0.5,
+                    y: (views[0].pose.position.y + views[1].pose.position.y) * 0.5,
+                    z: (views[0].pose.position.z + views[1].pose.position.z) * 0.5,
                 };
                 timeline::pose(p)
             },
