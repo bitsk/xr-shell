@@ -8,7 +8,7 @@ Rules-Requires-Root: no
 
 Package: xr-shell
 Architecture: any
-Depends: ${shlibs:Depends}, ${misc:Depends}, libvulkan1
+Depends: ${shlibs:Depends}, ${misc:Depends}, libvulkan1, libopenxr-loader1
 Recommends: xr-environment-qingkong, xr-spatial-style-ukui (>= 0.2.4)
 Description: Vultra spatial compositor for the HyperSpace XR desktop
  Renders a versioned panoramic environment through an OpenXR Vulkan stereo
