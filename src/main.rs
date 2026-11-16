@@ -264,6 +264,7 @@ struct Summary {
     waited_frames: u64,
     eye_submissions: [u64; 2],
     view_state: ViewStateObservations,
+    render_view_state: ViewStateObservations,
     captures: Vec<String>,
     session_states: Vec<String>,
     elapsed_seconds: f64,
@@ -835,7 +836,7 @@ fn frame_loop(
             }
             let (flags, views) = render_views?;
             summary
-                .view_state
+                .render_view_state
                 .observe(flags, &views, state.predicted_display_time);
             ensure!(views.len() == 2, "runtime changed stereo view count");
             if !render_views_valid {
@@ -858,7 +859,7 @@ fn frame_loop(
         }
         let (flags, views) = render_views?;
         summary
-            .view_state
+            .render_view_state
             .observe(flags, &views, state.predicted_display_time);
         summary.focus_quad = renderer.quad_status();
         let result = renderer.render_stereo(&indices, &views, capture.is_some());

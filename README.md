@@ -95,9 +95,11 @@ capture intervals must be excluded from steady-state performance measurements.
 
 `view_state_flags` preserves the actual `locate_views` raw bits plus separate
 orientation/position valid and tracked booleans. `summary.json` also contains
-`view_state`: valid/invalid and tracked/untracked counts cover every successful
-view location, including orientation-invalid frames skipped by the existing
-renderer. First/last mean eye positions and their predicted display times are
+`view_state`: valid/invalid and tracked/untracked counts cover the early input
+view location, including orientation-invalid frames skipped by the renderer.
+The separate `render_view_state` covers late locations, so each counter still
+counts at most one observation per frame. First/last mean eye positions and
+their predicted display times are
 recorded only from two finite returned eye positions with `POSITION_VALID`;
 they remain null when no such sample exists. These diagnostics neither adjust
 poses or UI anchors nor change rendering/input validity gates. A tracked flag
