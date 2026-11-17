@@ -10,12 +10,13 @@ endif
 	dh $@ --buildsystem=none
 
 XR_CARGO_TARGET_DIR ?= $(CURDIR)/target
+XR_CARGO_BINARY_DIR = $(abspath $(XR_CARGO_TARGET_DIR))/$(if $(XR_CARGO_TARGET),$(XR_CARGO_TARGET)/)release
 
 override_dh_auto_build:
 	CARGO_TARGET_DIR="$(XR_CARGO_TARGET_DIR)" cargo $(if $(XR_CARGO_CONFIG),--config $(XR_CARGO_CONFIG)) build --offline --locked --release $(if $(XR_CARGO_TARGET),--target $(XR_CARGO_TARGET))
-ifneq ($(strip $(XR_CARGO_TARGET)),)
+ifneq ($(XR_CARGO_BINARY_DIR),$(CURDIR)/target/release)
 	mkdir -p target/release
-	cp "$(XR_CARGO_TARGET_DIR)/$(XR_CARGO_TARGET)/release/xr-shell" "$(XR_CARGO_TARGET_DIR)/$(XR_CARGO_TARGET)/release/xr-shellctl" target/release/
+	cp "$(XR_CARGO_BINARY_DIR)/xr-shell" "$(XR_CARGO_BINARY_DIR)/xr-shellctl" target/release/
 endif
 
 override_dh_auto_test:
