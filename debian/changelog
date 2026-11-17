@@ -1,3 +1,10 @@
+xr-shell (0.3.4) unstable; urgency=medium
+
+  * Restore one-shot Home long-press recenter through fresh runtime controls.
+  * Keep recenter local to Shell X/Z/yaw while preserving the floor.
+
+ -- bits <bigbits@hackx.cc>  Tue, 17 Nov 2026 09:55:33 +0800
+
 xr-shell (0.3.3) unstable; urgency=medium
 
   * Submit XR layers before the single stereo batch CPU completion wait.

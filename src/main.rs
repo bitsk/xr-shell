@@ -257,6 +257,7 @@ struct Summary {
     passthrough: Option<serde_json::Value>,
     runtime_alpha_supported: bool,
     runtime_recenter_count: u64,
+    home_recenter_count: u64,
     validation_enabled: bool,
     validation_errors: u64,
     validation_warnings: u64,
@@ -496,7 +497,7 @@ fn frame_loop(
     session: &xr::Session<xr::Vulkan>,
     waiter: &mut xr::FrameWaiter,
     stream: &mut xr::FrameStream<xr::Vulkan>,
-    space: &xr::Space,
+    root_space: &xr::Space,
     renderer: &mut Renderer,
     quit: &AtomicBool,
     desktop: &mut Option<desktop::Desktop>,
@@ -517,6 +518,8 @@ fn frame_loop(
         );
     }
     let mut pending_recenter = None;
+    let mut recentered_space = None;
+    let mut home_recenter_pending = false;
     let mut events = xr::EventDataBuffer::new();
     let mut running = false;
     let mut started = None::<Instant>;
@@ -605,6 +608,7 @@ fn frame_loop(
         }
         times[1] = timeline::now();
         controls.poll();
+        home_recenter_pending |= controls.take_home_recenter();
         renderer.set_passthrough_visible(controls.passthrough(options.passthrough));
         let blend_mode = if renderer.runtime_alpha_active() {
             xr::EnvironmentBlendMode::ALPHA_BLEND
@@ -615,6 +619,7 @@ fn frame_loop(
         stream.begin()?;
         if pending_recenter.is_some_and(|time| state.predicted_display_time.as_nanos() >= time) {
             pending_recenter = None;
+            recentered_space = None;
             summary.runtime_recenter_count += 1;
             summary.ui_anchor = ui_anchor::UiAnchor::new(options.ui_anchor);
             renderer.set_ui_anchor(summary.ui_anchor.offset());
@@ -627,6 +632,34 @@ fn frame_loop(
             }
         }
 
+        if home_recenter_pending && state.should_render {
+            let (flags, views) =
+                session.locate_views(VIEW_TYPE, state.predicted_display_time, root_space)?;
+            if let Some(origin) = recenter::pose(flags, &views) {
+                let kind = if summary.reference_space.as_deref() == Some("STAGE") {
+                    xr::ReferenceSpaceType::STAGE
+                } else {
+                    xr::ReferenceSpaceType::LOCAL
+                };
+                recentered_space = Some(session.create_reference_space(kind, origin)?);
+                home_recenter_pending = false;
+                summary.home_recenter_count += 1;
+                summary.ui_anchor = ui_anchor::UiAnchor::new(options.ui_anchor);
+                renderer.set_ui_anchor(summary.ui_anchor.offset());
+                if let Some(d) = desktop.as_mut() {
+                    d.recenter_taskbar();
+                    d.set_ui_anchor(summary.ui_anchor.offset());
+                    if let Some(i) = input.as_mut() {
+                        i.cancel_for_recenter(d);
+                    }
+                }
+                eprintln!(
+                    "XR_HOME_RECENTER count={} scope=shell_xz_yaw floor=preserved",
+                    summary.home_recenter_count
+                );
+            }
+        }
+        let space = recentered_space.as_ref().unwrap_or(root_space);
         times[2] = timeline::now();
         let runtime_now_xr_ns = if instance.exts().khr_convert_timespec_time.is_some() {
             instance.now().ok().map(|t| t.as_nanos())

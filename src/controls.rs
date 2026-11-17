@@ -27,6 +27,7 @@ pub struct Controls {
     generation: Option<u64>,
     changed: bool,
     last_write: Instant,
+    home: [HomeHold; 2],
 }
 impl Controls {
     pub fn new() -> Self {
@@ -80,6 +81,7 @@ impl Controls {
             generation: None,
             changed: false,
             last_write: Instant::now(),
+            home: [HomeHold::default(); 2],
         }
     }
     fn read(path: &PathBuf, root: bool) -> Option<Value> {
@@ -100,6 +102,27 @@ impl Controls {
             self.changed = true;
             self.generation = generation;
         }
+    }
+    /// Runtime-owned system buttons are independent of optical ray validity.
+    /// Use the producer observation epoch so a stale held value cannot fire.
+    pub fn take_home_recenter(&mut self) -> bool {
+        let now = crate::timeline::now() as u64;
+        let mut fire = false;
+        for hand in 0..2 {
+            let sample = self.input.as_ref().and_then(|v| {
+                let observed = v["observed_monotonic_ns"].as_u64()?;
+                (self
+                    .root
+                    .as_ref()
+                    .is_some_and(|r| r["session_active"] == true)
+                    && now >= observed
+                    && now - observed < 250_000_000
+                    && v["controls_valid"][hand] == true)
+                    .then_some((observed, v["system_buttons"][hand] == true))
+            });
+            fire |= self.home[hand].sample(sample);
+        }
+        fire
     }
     pub fn take_source_change(&mut self) -> bool {
         std::mem::take(&mut self.changed)
@@ -147,5 +170,60 @@ impl Drop for Controls {
         if let Some(w) = self.worker.take() {
             let _ = w.join();
         }
+    }
+}
+
+#[derive(Clone, Copy, Default)]
+struct HomeHold {
+    armed: bool,
+    since: Option<u64>,
+    fired: bool,
+}
+impl HomeHold {
+    fn sample(&mut self, sample: Option<(u64, bool)>) -> bool {
+        let Some((time, down)) = sample else {
+            *self = Self::default();
+            return false;
+        };
+        if !down {
+            self.armed = true;
+            self.since = None;
+            self.fired = false;
+            return false;
+        }
+        if !self.armed || self.fired {
+            return false;
+        }
+        let start = *self.since.get_or_insert(time);
+        if time < start {
+            *self = Self::default();
+            return false;
+        }
+        if time - start < 1_000_000_000 {
+            return false;
+        }
+        self.fired = true;
+        true
+    }
+}
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn home_requires_fresh_release_and_fires_once_per_hold() {
+        let mut h = HomeHold::default();
+        assert!(!h.sample(Some((1, true))));
+        assert!(!h.sample(Some((2_000_000_000, true))));
+        assert!(!h.sample(Some((3_000_000_000, false))));
+        assert!(!h.sample(Some((4_000_000_000, true))));
+        assert!(!h.sample(Some((4_999_999_999, true))));
+        assert!(h.sample(Some((5_000_000_000, true))));
+        assert!(!h.sample(Some((8_000_000_000, true))));
+        assert!(!h.sample(None));
+        assert!(!h.sample(Some((10_000_000_000, true))));
+        assert!(!h.sample(Some((11_000_000_000, false))));
+        assert!(!h.sample(Some((12_000_000_000, true))));
+        assert!(!h.sample(Some((12_000_000_000, true))));
+        assert!(h.sample(Some((13_000_000_000, true))));
     }
 }
