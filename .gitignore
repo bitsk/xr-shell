@@ -9,3 +9,7 @@
 /obj-*/
 __pycache__/
 *.pyc
+
+# Binary package staging trees.
+/debian/xr-shell/
+/debian/librust-xr-shell-protocols-dev/

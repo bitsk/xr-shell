@@ -114,14 +114,26 @@ struct AtlasUpload {
     gutters: Vec<vk::ImageBlit>,
     clear: bool,
 }
-/// Diagnostic cost attribution only: `XR_SHELL_DRAW_SKIP=background,panels`
-/// omits those draws so GPU time can be compared between launches.
-fn draw_skip() -> (bool, bool) {
-    static SKIP: std::sync::OnceLock<(bool, bool)> = std::sync::OnceLock::new();
+/// Diagnostic cost attribution only: `XR_SHELL_DRAW_SKIP` takes a comma list of
+/// `background`, `panels`, `opaque` and `translucent`; the named draws are
+/// omitted so GPU time can be compared between launches.
+const SKIP_BACKGROUND: u8 = 1;
+const SKIP_OPAQUE: u8 = 2;
+const SKIP_TRANSLUCENT: u8 = 4;
+fn draw_skip() -> u8 {
+    static SKIP: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
     *SKIP.get_or_init(|| {
-        let value = std::env::var("XR_SHELL_DRAW_SKIP").unwrap_or_default();
-        let has = |name| value.split(',').any(|item| item == name);
-        (has("background"), has("panels"))
+        std::env::var("XR_SHELL_DRAW_SKIP")
+            .unwrap_or_default()
+            .split(',')
+            .map(|item| match item {
+                "background" => SKIP_BACKGROUND,
+                "panels" => SKIP_OPAQUE | SKIP_TRANSLUCENT,
+                "opaque" => SKIP_OPAQUE,
+                "translucent" => SKIP_TRANSLUCENT,
+                _ => 0,
+            })
+            .fold(0, |a, b| a | b)
     })
 }
 pub struct Renderer {
@@ -874,8 +886,8 @@ impl Renderer {
                     ]),
                 vk::SubpassContents::INLINE,
             );
-            let (skip_background, skip_panels) = draw_skip();
-            let skip_background = skip_background || self.passthrough_active;
+            let skip = draw_skip();
+            let skip_background = skip & SKIP_BACKGROUND != 0 || self.passthrough_active;
             if matches!(pass, DrawPass::Foreground | DrawPass::Quad) || skip_background {
                 // The shared pass uses DONT_CARE for the opaque panorama.
                 // Alpha layers must explicitly clear reused swapchain images;
@@ -996,11 +1008,17 @@ impl Renderer {
                 0,
                 bytes,
             );
-            if self.ui_anchor_ready && self.draw_count > 0 && !skip_panels {
+            if self.ui_anchor_ready && self.draw_count > 0 {
                 // Opaque window/glyph cores establish per-pixel depth before
                 // sorted translucent glass. Intersecting opaque panels no longer
                 // depend on their centre-distance order.
-                for pipeline in [self.opaque_pipeline, self.spatial_pipeline] {
+                for (pipeline, omitted) in [
+                    (self.opaque_pipeline, SKIP_OPAQUE),
+                    (self.spatial_pipeline, SKIP_TRANSLUCENT),
+                ] {
+                    if skip & omitted != 0 {
+                        continue;
+                    }
                     d.cmd_bind_pipeline(self.cmd, vk::PipelineBindPoint::GRAPHICS, pipeline);
                     if matches!(pass, DrawPass::All) {
                         d.cmd_draw(self.cmd, 192 + 36 * 6, self.draw_count, 0, 0);
