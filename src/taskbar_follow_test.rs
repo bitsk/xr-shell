@@ -99,6 +99,7 @@ fn hover_reuses_other_rasters_without_freezing_text_or_window_updates() {
     d.captures.insert(
         "regression".into(),
         Capture {
+            panel: None,
             button: 272,
             button_sent: false,
             click: None,
@@ -285,6 +286,7 @@ fn islands_share_motion_capture_and_scene_refresh_without_moving_world_panels() 
     d.captures.insert(
         "regression".into(),
         Capture {
+            panel: None,
             button: 272,
             button_sent: false,
             click: None,
@@ -582,4 +584,81 @@ fn component_scroll_requires_hovered_panel_threshold_and_cooldown() {
         .unwrap()
     );
     assert_eq!(count(&d), 2);
+}
+
+#[test]
+fn panel_handles_move_scale_and_cancel_without_client_input() {
+    let mut d = interaction_desktop();
+    d.windows.clear();
+    let mut scene = Scene::new([1000., 334.], [1., 0.334], [0., 1.5, -1.6], "world_locked");
+    scene.push(Widget::horizon_panel(
+        "keyboard",
+        [1000., 334.],
+        [1., 0.334],
+        0.,
+        -10.,
+        1.6,
+    ));
+    for (id, rect, action) in [
+        (
+            "move",
+            [340., 278., 320., 48.],
+            xr_shell_protocols::PANEL_MOVE_ACTION,
+        ),
+        (
+            "scale",
+            [832., 278., 144., 48.],
+            xr_shell_protocols::PANEL_SCALE_ACTION,
+        ),
+    ] {
+        scene.push(Widget::button(id, rect, id, action, "button.secondary").parent("keyboard"));
+    }
+    let mut p = peer(&d, 2, scene);
+    Desktop::freeze_spawn_frames(&mut p, d.horizon_head.unwrap());
+    let original = p.spawn_frames["keyboard"];
+    d.peers.insert(2, p);
+    let source = "debug_ray:left";
+    let origin = [0., 1.5, 0.];
+    let direction = |point| {
+        let delta = sub(point, origin);
+        scale(delta, 1. / dot(delta, delta).sqrt())
+    };
+    let handle =
+        |d: &Desktop, id: &str| d.node_frame(&d.peers[&2], &d.peers[&2].nodes[id]).unwrap();
+    let start = handle(&d, "move").position;
+    d.ray(origin, direction(start), "press", source).unwrap();
+    assert!(d.captures[source].panel.is_some());
+    let end = add(start, [0.2, 0.1, 0.]);
+    d.ray(origin, direction(end), "drag", source).unwrap();
+    assert!(d.peers[&2].spawn_frames["keyboard"].position[0] > 0.1);
+    d.ray(origin, direction(end), "release", source).unwrap();
+    assert!(!d.captures.contains_key(source));
+    let moved = d.peers[&2].spawn_frames["keyboard"];
+    assert_eq!(moved.size, original.size);
+    let start = handle(&d, "scale").position;
+    d.ray(origin, direction(start), "press", source).unwrap();
+    // A second pointer cannot mutate the same panel during the gesture.
+    let other = handle(&d, "move").position;
+    d.ray(origin, direction(other), "press", "debug_ray:right")
+        .unwrap();
+    assert!(!d.captures.contains_key("debug_ray:right"));
+    let end = add(start, scale(moved.right, 0.25));
+    d.ray(origin, direction(end), "drag", source).unwrap();
+    let scaled = d.peers[&2].spawn_frames["keyboard"];
+    assert!(scaled.size[0] > moved.size[0]);
+    assert!((scaled.size[0] / scaled.size[1] - moved.size[0] / moved.size[1]).abs() < 0.00001);
+    close(scaled.position, moved.position);
+    d.cancel_pointer(source, "tracking lost");
+    assert_eq!(d.peers[&2].spawn_frames["keyboard"].size, moved.size);
+    close(
+        d.peers[&2].spawn_frames["keyboard"].position,
+        moved.position,
+    );
+    assert_eq!(d.stats["input_events"].as_u64().unwrap_or(0), 0);
+    // Re-publishing a keyboard page preserves the Shell-owned frame.
+    Desktop::freeze_spawn_frames(d.peers.get_mut(&2).unwrap(), d.horizon_head.unwrap());
+    close(
+        d.peers[&2].spawn_frames["keyboard"].position,
+        moved.position,
+    );
 }

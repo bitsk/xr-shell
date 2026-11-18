@@ -152,7 +152,16 @@ struct Bimanual {
     anchor: [f32; 3],
 }
 #[derive(Clone)]
+struct PanelManipulation {
+    owner: u64,
+    panel: String,
+    frame: crate::spatial::Frame,
+    handle: crate::spatial::Frame,
+    scaling: bool,
+}
+#[derive(Clone)]
 struct Capture {
+    panel: Option<PanelManipulation>,
     button: u32,
     button_sent: bool,
     click: Option<SurfacePress>,
@@ -1580,6 +1589,13 @@ impl Desktop {
                 }
                 let _ = self.finish_grab(key, false);
             }
+            if let Some(panel) = &c.panel {
+                if let Some(p) = self.peers.get_mut(&panel.owner) {
+                    if p.spawn_frames.contains_key(&panel.panel) {
+                        p.spawn_frames.insert(panel.panel.clone(), panel.frame);
+                    }
+                }
+            }
             self.release_capture_surface(&c);
             if let Target::Node(id, node) = c.target {
                 if let Some(p) = self.peers.get(&id) {
@@ -1873,9 +1889,20 @@ impl Desktop {
                 }) {
                     return Ok(());
                 }
+                let panel = self.panel_manipulation(target);
+                if self.captures.values().any(|c| {
+                    panel.as_ref().is_some_and(|a| {
+                        c.panel
+                            .as_ref()
+                            .is_some_and(|b| a.owner == b.owner && a.panel == b.panel)
+                    })
+                }) {
+                    return Ok(());
+                }
                 self.captures.insert(
                     source.into(),
                     Capture {
+                        panel,
                         button,
                         button_sent: false,
                         click: None,
@@ -1932,7 +1959,14 @@ impl Desktop {
                         .get(&id)
                         .and_then(|p| p.nodes.get(&n))
                         .context("target gone")?;
-                    if node.kind == "SurfaceReference" {
+                    if [
+                        xr_shell_protocols::PANEL_MOVE_ACTION,
+                        xr_shell_protocols::PANEL_SCALE_ACTION,
+                    ]
+                    .contains(&node.action_id.as_str())
+                    {
+                        // Shell owns panel manipulation; never type or activate a client action.
+                    } else if node.kind == "SurfaceReference" {
                         let key = format!("{}:{}", node.window_server_generation, node.surface_id);
                         let w = self.windows.get(&key).context("referenced window gone")?;
                         let logical = Self::logical(w);

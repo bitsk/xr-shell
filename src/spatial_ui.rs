@@ -1178,6 +1178,74 @@ impl Desktop {
     ) -> Result<()> {
         self.ray_action(origin, direction, phase, source, 272, true)
     }
+    /// Resolve the owning panel through the scene ancestry, never by a keyboard ID.
+    pub(super) fn panel_manipulation(&self, target: &Target) -> Option<PanelManipulation> {
+        let Target::Node(owner, id) = target else {
+            return None;
+        };
+        let peer = self.peers.get(owner)?;
+        let node = peer.nodes.get(id)?;
+        let scaling = match node.action_id.as_str() {
+            xr_shell_protocols::PANEL_MOVE_ACTION => false,
+            xr_shell_protocols::PANEL_SCALE_ACTION => true,
+            _ => return None,
+        };
+        let handle = self.node_frame(peer, node)?;
+        let mut parent = node.parent_id.as_str();
+        for _ in 0..512 {
+            let n = peer.nodes.get(parent)?;
+            if n.spatial_panel {
+                if n.spatial_policy != "head_horizon_spawn" {
+                    return None;
+                }
+                return Some(PanelManipulation {
+                    owner: *owner,
+                    panel: n.node_id.clone(),
+                    frame: self.panel_frame(peer, n),
+                    handle,
+                    scaling,
+                });
+            }
+            parent = &n.parent_id;
+        }
+        None
+    }
+    fn update_panel_manipulation(&mut self, c: &Capture, origin: [f32; 3], direction: [f32; 3]) {
+        let Some(panel) = &c.panel else { return };
+        let mut frame = panel.frame;
+        if panel.scaling {
+            // Project on the original plane so changing geometry cannot feed back
+            // into the gesture. Uniform scaling keeps every key's aspect ratio.
+            let Some((xy, _)) = panel.handle.project(origin, direction) else {
+                return;
+            };
+            let delta = sub(panel.handle.point(xy, 0.), panel.handle.point(c.start, 0.));
+            let corner = add(
+                scale(frame.right, frame.size[0] * 0.5),
+                scale(frame.down, frame.size[1] * 0.5),
+            );
+            let factor = (1. + dot(delta, corner) / dot(corner, corner)).clamp(0.65, 1.8);
+            frame.size = frame.size.map(|v| v * factor);
+        } else {
+            let Some(grab) = &c.grab else { return };
+            frame.position = add(
+                frame.position,
+                sub(add(origin, scale(direction, grab.distance)), grab.point),
+            );
+            if let Some((eye, _)) = self.horizon_head {
+                frame = Frame::new(
+                    frame.position,
+                    frame.size,
+                    frame.logical,
+                    crate::spatial::user_facing(frame.position, eye),
+                );
+            }
+        }
+        if let Some(peer) = self.peers.get_mut(&panel.owner) {
+            peer.spawn_frames.insert(panel.panel.clone(), frame);
+            self.dirty = true;
+        }
+    }
     fn ray_action(
         &mut self,
         origin: [f32; 3],
@@ -1212,6 +1280,10 @@ impl Desktop {
         let origin = sub(origin, self.ui_offset);
         if let Some(c) = self.captures.get(source).cloned() {
             if phase != "press" && phase != "hover" {
+                if c.panel.is_some() {
+                    self.update_panel_manipulation(&c, origin, direction);
+                    return self.pointer_button(Some((c.target, c.start)), phase, source, c.button);
+                }
                 if let Target::Move(ref key) = c.target {
                     self.update_grab(source, key, origin, direction);
                     return self.pointer_button(Some((c.target, c.start)), phase, source, c.button);
@@ -1288,6 +1360,15 @@ impl Desktop {
         self.pointer_button(hit, phase, source, button)?;
         if phase == "press" {
             if let Some((distance, point)) = grab_point {
+                if let Some(c) = self.captures.get_mut(source) {
+                    if c.panel.is_some() {
+                        c.grab = Some(Grab {
+                            distance,
+                            point,
+                            local_anchor: [0.; 3],
+                        });
+                    }
+                }
                 let key = self.captures.get(source).and_then(|c| {
                     if let Target::Move(k) = &c.target {
                         Some(k.clone())

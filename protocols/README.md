@@ -126,3 +126,14 @@ cores establish depth before sorted translucent UI. Both eyes are recorded in
 one batch, with one completion wait before XR release. Per-frame resource rings,
 order-independent transparency and native composition-layer promotion remain
 separate work.
+
+Buttons inside a `head_horizon_spawn` panel may use the SDK constants
+`PANEL_MOVE_ACTION` and `PANEL_SCALE_ACTION`. Shell consumes these actions
+without emitting client InputEvents. Hold the primary trigger on the move handle
+to translate the panel at the captured ray distance, facing the current eye;
+hold it on the scale handle and drag outward/inward for uniform scaling about
+the panel center. A gesture permits 0.65 to 1.8 times its starting size. Logical
+key dimensions remain unchanged, and rendering and hit tests share the adjusted
+frame. Release commits, Cancel restores the starting frame, and a second handle
+capture on that panel is ignored. Scene updates retain the frame; removal or
+recenter resets it through the normal horizon spawn policy.

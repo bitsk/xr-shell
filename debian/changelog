@@ -1,3 +1,9 @@
+xr-shell (0.3.5) unstable; urgency=medium
+
+  * Handle spatial panel move and uniform scale gestures without client input.
+
+ -- bits <bigbits@hackx.cc>  Thu, 19 Nov 2026 01:06:38 +0800
+
 xr-shell (0.3.4+xr1) unstable; urgency=medium
 
   * Add separate opaque/translucent GPU diagnostic draw selection and align Kit dependencies.
