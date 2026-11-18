@@ -832,10 +832,13 @@ impl Canvas {
         let Some(name) = id.strip_prefix("ukui-xr-") else {
             return false;
         };
-        let battery = name
-            .strip_prefix("battery-")
+        let battery_name = name.strip_prefix("battery-");
+        let charging = battery_name.is_some_and(|n| n.ends_with("-charging"));
+        let fast = battery_name.is_some_and(|n| n.ends_with("-fast-charging"));
+        let plugged = battery_name.is_some_and(|n| n.ends_with("-plugged"));
+        let battery = battery_name.and_then(|n| n.split('-').next())
             .and_then(|n| n.parse::<u8>().ok());
-        if battery.is_none()
+        if battery_name.is_none()
             && ![
                 "launcher",
                 "network",
@@ -987,10 +990,33 @@ impl Canvas {
                     cairo_stroke(c);
                     if let Some(level) = battery {
                         self.rounded(
-                            [5., 11., 20. * (level.min(100) as f32 / 100.), 10.],
+                            [5., 11., (if charging || plugged { 10. } else { 20. }) * (level.min(100) as f32 / 100.), 10.],
                             ink,
                             1.,
                         );
+                    }
+                    if charging {
+                        cairo_move_to(c, 23., 10.);
+                        cairo_line_to(c, 18., 16.);
+                        cairo_line_to(c, 22., 16.);
+                        cairo_line_to(c, 18., 22.);
+                        cairo_stroke(c);
+                        if fast {
+                            cairo_move_to(c, 26., 11.);
+                            cairo_line_to(c, 23., 15.);
+                            cairo_stroke(c);
+                        }
+                    } else if plugged {
+                        cairo_move_to(c, 19., 11.);
+                        cairo_line_to(c, 19., 15.);
+                        cairo_move_to(c, 23., 11.);
+                        cairo_line_to(c, 23., 15.);
+                        cairo_move_to(c, 18., 15.);
+                        cairo_line_to(c, 24., 15.);
+                        cairo_line_to(c, 24., 18.);
+                        cairo_line_to(c, 21., 20.);
+                        cairo_line_to(c, 21., 23.);
+                        cairo_stroke(c);
                     }
                 }
             }

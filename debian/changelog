@@ -1,3 +1,9 @@
+xr-shell (0.3.6) unstable; urgency=medium
+
+  * Draw charging, fast charging and external power battery symbols.
+
+ -- bits <bigbits@hackx.cc>  Thu, 19 Nov 2026 01:15:48 +0800
+
 xr-shell (0.3.5) unstable; urgency=medium
 
   * Handle spatial panel move and uniform scale gestures without client input.
