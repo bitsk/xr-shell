@@ -1,3 +1,9 @@
+xr-shell (0.3.9) unstable; urgency=medium
+
+  * Retain desktop state while yielding the OpenXR session to an immersive app.
+
+ -- bits <bigbits@hackx.cc>  Sun, 22 Nov 2026 23:36:48 +0800
+
 xr-shell (0.3.8) unstable; urgency=medium
 
   * Use one plug symbol for external power without charging.

@@ -329,6 +329,61 @@ fn run(options: &Options, summary: &mut Summary) -> Result<()> {
     ctrlc::set_handler(move || {
         signal_quit.store(true, Ordering::Relaxed);
     })?;
+    let foreground = env::var_os("XR_SHELL_FOREGROUND_DIR")
+        .filter(|_| options.components)
+        .map(PathBuf::from);
+    let mut desktop = None;
+    let mut desktop_origin = None;
+    let started = Instant::now();
+    loop {
+        let yielded = render_session(
+            options,
+            summary,
+            &environment,
+            &quit,
+            &mut desktop,
+            foreground.as_deref(),
+            &mut desktop_origin,
+        )?;
+        if !yielded || quit.load(Ordering::Relaxed) {
+            break;
+        }
+        let directory = foreground
+            .as_ref()
+            .context("missing foreground directory")?;
+        let released = directory.join("released");
+        fs::write(&released, b"")?;
+        println!("XR_FOREGROUND_RELEASED=1");
+        while directory.join("yield").exists() && !quit.load(Ordering::Relaxed) {
+            if let Some(d) = desktop.as_mut() {
+                d.tick()?;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        fs::remove_file(released)?;
+        if quit.load(Ordering::Relaxed) {
+            break;
+        }
+        println!("XR_FOREGROUND_RESUMING=1");
+    }
+    if let Some(d) = &desktop {
+        summary.desktop = d.snapshot();
+    }
+    summary.elapsed_seconds = started.elapsed().as_secs_f64();
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn render_session(
+    options: &Options,
+    summary: &mut Summary,
+    environment: &Environment,
+    quit: &AtomicBool,
+    desktop: &mut Option<desktop::Desktop>,
+    foreground: Option<&Path>,
+    desktop_origin: &mut Option<xr::Posef>,
+) -> Result<bool> {
+    summary.cleanup = Cleanup::default();
     let entry = unsafe { xr::Entry::load(&())? };
     let available = entry.enumerate_extensions()?;
     ensure!(
@@ -424,26 +479,26 @@ fn run(options: &Options, summary: &mut Summary) -> Result<()> {
     };
     summary.initialization_stage = Some("renderer");
     eprintln!("XR_INIT_STAGE=renderer STATUS=begin");
-    let mut renderer = Renderer::new(gpu.clone(), &session, &config, &environment, options.scale)
+    let mut renderer = Renderer::new(gpu.clone(), &session, &config, environment, options.scale)
         .context("initialize Vulkan renderer and OpenXR eye swapchains")?;
     eprintln!("XR_INIT_STAGE=renderer STATUS=complete");
     renderer.set_ui_anchor(summary.ui_anchor.offset());
     summary.initialization_stage = Some("desktop");
-    let mut desktop = if options.components {
+    if options.components && desktop.is_none() {
         let path = options.socket.clone().unwrap_or_else(|| {
             PathBuf::from(env::var_os("XDG_RUNTIME_DIR").unwrap_or_else(|| "/tmp".into()))
                 .join("xr-desktop/shell.sock")
         });
-        let mut desktop = desktop::Desktop::new(&path, options.debug_input)
+        let mut new_desktop = desktop::Desktop::new(&path, options.debug_input)
             .context("create desktop component socket")?;
-        desktop.set_ui_anchor(summary.ui_anchor.offset());
-        Some(desktop)
-    } else {
-        None
-    };
+        new_desktop.set_ui_anchor(summary.ui_anchor.offset());
+        *desktop = Some(new_desktop);
+    }
+    if let Some(d) = desktop.as_mut() {
+        d.refresh_render_buffers();
+    }
     summary.initialization_stage = Some("complete");
     eprintln!("XR_INIT_STAGE=complete STATUS=complete");
-    let started = Instant::now();
     let result = frame_loop(
         options,
         summary,
@@ -453,15 +508,15 @@ fn run(options: &Options, summary: &mut Summary) -> Result<()> {
         &mut stream,
         &space,
         &mut renderer,
-        &quit,
-        &mut desktop,
+        quit,
+        desktop,
         &mut input,
+        foreground,
+        desktop_origin,
     );
-    if let Some(d) = &desktop {
-        summary.desktop = d.snapshot();
+    if let Some(d) = desktop.as_mut() {
+        d.set_xr_focus(false);
     }
-    drop(desktop);
-    summary.elapsed_seconds = started.elapsed().as_secs_f64();
     let idle = unsafe { gpu.device.device_wait_idle() }.context("wait for final GPU work");
     // Framebuffers/views and XR swapchains are destroyed before session/device.
     drop(input);
@@ -479,14 +534,14 @@ fn run(options: &Options, summary: &mut Summary) -> Result<()> {
         "XR_SHELL_CLEANUP=1 FRAMES={} EYES={:?} VALIDATION_ERRORS={}",
         summary.frames, summary.eye_submissions, summary.validation_errors
     );
-    result?;
+    let yielded = result?;
     idle?;
     ensure!(
         summary.validation_errors == 0,
         "Vulkan validation reported {} errors",
         summary.validation_errors
     );
-    Ok(())
+    Ok(yielded)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -502,7 +557,9 @@ fn frame_loop(
     quit: &AtomicBool,
     desktop: &mut Option<desktop::Desktop>,
     input: &mut Option<input::Input>,
-) -> Result<()> {
+    foreground: Option<&Path>,
+    desktop_origin: &mut Option<xr::Posef>,
+) -> Result<bool> {
     let mut controls = controls::Controls::new();
     renderer.runtime_alpha_supported = summary.runtime_alpha_supported;
     let mut hands = hand_tracking::Tracking::new(instance, session);
@@ -518,9 +575,18 @@ fn frame_loop(
         );
     }
     let mut pending_recenter = None;
-    let mut recentered_space = None;
+    let space_kind = if summary.reference_space.as_deref() == Some("STAGE") {
+        xr::ReferenceSpaceType::STAGE
+    } else {
+        xr::ReferenceSpaceType::LOCAL
+    };
+    let mut recentered_space = desktop_origin
+        .map(|pose| session.create_reference_space(space_kind, pose))
+        .transpose()?;
     let mut home_recenter_pending = false;
     let mut events = xr::EventDataBuffer::new();
+    let yield_request = foreground.map(|dir| dir.join("yield"));
+    let mut yielding = false;
     let mut running = false;
     let mut started = None::<Instant>;
     loop {
@@ -542,7 +608,7 @@ fn frame_loop(
                     println!("XR_SESSION_STATE={state:?}");
                     summary.session_states.push(format!("{state:?}"));
                     if let Some(d) = desktop {
-                        d.set_xr_focus(state == xr::SessionState::FOCUSED);
+                        d.set_xr_focus(!yielding && state == xr::SessionState::FOCUSED);
                     }
                     match state {
                         xr::SessionState::READY => {
@@ -554,9 +620,9 @@ fn frame_loop(
                         xr::SessionState::STOPPING => {
                             session.end()?;
                             summary.cleanup.session_ended = true;
-                            return Ok(());
+                            return Ok(yielding);
                         }
-                        xr::SessionState::EXITING => return Ok(()),
+                        xr::SessionState::EXITING => return Ok(yielding),
                         xr::SessionState::LOSS_PENDING => bail!("OpenXR session loss pending"),
                         _ => {}
                     }
@@ -568,9 +634,19 @@ fn frame_loop(
         }
         let timed_out = options.seconds != 0
             && started.is_some_and(|t| t.elapsed() >= Duration::from_secs(options.seconds));
-        if (quit.load(Ordering::Relaxed) || timed_out) && !summary.cleanup.exit_requested {
+        let stopping = quit.load(Ordering::Relaxed) || timed_out;
+        if !summary.cleanup.exit_requested {
+            yielding = !stopping
+                && yield_request
+                    .as_ref()
+                    .is_some_and(|request| request.is_file());
+        }
+        if (stopping || yielding) && !summary.cleanup.exit_requested {
             if !running {
-                return Ok(());
+                return Ok(yielding);
+            }
+            if let Some(d) = desktop.as_mut() {
+                d.set_xr_focus(false);
             }
             session.request_exit()?;
             summary.cleanup.exit_requested = true;
@@ -620,6 +696,7 @@ fn frame_loop(
         if pending_recenter.is_some_and(|time| state.predicted_display_time.as_nanos() >= time) {
             pending_recenter = None;
             recentered_space = None;
+            *desktop_origin = None;
             summary.runtime_recenter_count += 1;
             summary.ui_anchor = ui_anchor::UiAnchor::new(options.ui_anchor);
             renderer.set_ui_anchor(summary.ui_anchor.offset());
@@ -636,12 +713,8 @@ fn frame_loop(
             let (flags, views) =
                 session.locate_views(VIEW_TYPE, state.predicted_display_time, root_space)?;
             if let Some(origin) = recenter::pose(flags, &views) {
-                let kind = if summary.reference_space.as_deref() == Some("STAGE") {
-                    xr::ReferenceSpaceType::STAGE
-                } else {
-                    xr::ReferenceSpaceType::LOCAL
-                };
-                recentered_space = Some(session.create_reference_space(kind, origin)?);
+                recentered_space = Some(session.create_reference_space(space_kind, origin)?);
+                *desktop_origin = Some(origin);
                 home_recenter_pending = false;
                 summary.home_recenter_count += 1;
                 summary.ui_anchor = ui_anchor::UiAnchor::new(options.ui_anchor);
@@ -672,7 +745,7 @@ fn frame_loop(
         renderer.update_controllers(&[input::HandState::default(); 2]);
         renderer.clear_hands();
         renderer.update_ray_feedback([None; 2]);
-        if !state.should_render {
+        if yielding || !state.should_render {
             stream.end(state.predicted_display_time, blend_mode, &[])?;
             summary.timeline.skip(
                 summary.waited_frames,

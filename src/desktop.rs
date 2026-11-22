@@ -1517,6 +1517,11 @@ impl Desktop {
         }
         Ok(())
     }
+    // CPU-side window pixels survive the OpenXR handoff. The new renderer has
+    // an empty atlas and must upload the current desktop before its first frame.
+    pub fn refresh_render_buffers(&mut self) {
+        self.dirty = true;
+    }
     pub fn set_xr_focus(&mut self, focused: bool) {
         if self.focused && !focused {
             self.cancel("XR focus lost");
