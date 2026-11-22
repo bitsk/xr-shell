@@ -826,35 +826,110 @@ fn icon_path(name: &str) -> Option<std::path::PathBuf> {
     found
 }
 impl Canvas {
+    fn battery_symbol(&self, rect: [f32; 4], name: &str, ink: [f32; 4]) -> bool {
+        let (level, badge) = name.split_once('-').unwrap_or((name, ""));
+        let level = if level == "unknown" {
+            None
+        } else {
+            let Ok(level @ 0..=100) = level.parse::<u8>() else {
+                return false;
+            };
+            Some(level)
+        };
+        if !matches!(
+            badge,
+            "" | "charging" | "fast-charging" | "plugged" | "plugged-discharging"
+        ) {
+            return false;
+        }
+        unsafe {
+            let c = self.cr;
+            cairo_save(c);
+            cairo_translate(c, rect[0] as _, rect[1] as _);
+            cairo_scale(c, rect[2] as f64 / 44., rect[3] as f64 / 32.);
+            cairo_set_source_rgba(c, ink[0] as _, ink[1] as _, ink[2] as _, ink[3] as _);
+            cairo_set_line_width(c, 2.);
+            cairo_set_line_cap(c, 1);
+            cairo_new_path(c);
+
+            // Keep the level fill proportional in every power state.
+            let x = if badge.is_empty() { 9. } else { 2. };
+            self.rounded_path([x, 8., 22., 16.], 3.);
+            cairo_stroke(c);
+            cairo_move_to(c, (x + 24.) as _, 13.);
+            cairo_line_to(c, (x + 24.) as _, 19.);
+            cairo_stroke(c);
+            if let Some(level) = level.filter(|&level| level > 0) {
+                self.rounded([x + 3., 11., 16. * f32::from(level) / 100., 10.], ink, 1.);
+            }
+
+            match badge {
+                "charging" | "fast-charging" => {
+                    let centers: &[f64] = if badge == "fast-charging" {
+                        &[33., 40.5]
+                    } else {
+                        &[36.5]
+                    };
+                    for &center in centers {
+                        cairo_move_to(c, center + 2., 8.);
+                        cairo_line_to(c, center - 2.5, 16.);
+                        cairo_line_to(c, center + 2., 16.);
+                        cairo_line_to(c, center - 2., 24.);
+                        cairo_stroke(c);
+                    }
+                }
+                "plugged" | "plugged-discharging" => {
+                    cairo_move_to(c, 34., 8.);
+                    cairo_line_to(c, 34., 12.);
+                    cairo_move_to(c, 40., 8.);
+                    cairo_line_to(c, 40., 12.);
+                    cairo_move_to(c, 32., 12.);
+                    cairo_line_to(c, 42., 12.);
+                    cairo_move_to(c, 33., 12.);
+                    cairo_line_to(c, 33., 16.);
+                    cairo_curve_to(c, 33., 21., 41., 21., 41., 16.);
+                    cairo_line_to(c, 41., 12.);
+                    cairo_move_to(c, 37., 20.);
+                    cairo_line_to(c, 37., 24.);
+                    if badge == "plugged-discharging" {
+                        cairo_line_to(c, 37., 27.);
+                        cairo_move_to(c, 33., 23.);
+                        cairo_line_to(c, 37., 27.);
+                        cairo_line_to(c, 41., 23.);
+                    }
+                    cairo_stroke(c);
+                }
+                _ => {}
+            }
+            cairo_restore(c);
+        }
+        true
+    }
+
     /// Shared optical-size vectors for small spatial chrome and status controls.
     /// These remain independent of application artwork and font fallback glyphs.
     pub fn symbolic(&self, rect: [f32; 4], id: &str, ink: [f32; 4]) -> bool {
         let Some(name) = id.strip_prefix("ukui-xr-") else {
             return false;
         };
-        let battery_name = name.strip_prefix("battery-");
-        let charging = battery_name.is_some_and(|n| n.ends_with("-charging"));
-        let fast = battery_name.is_some_and(|n| n.ends_with("-fast-charging"));
-        let plugged = battery_name.is_some_and(|n| n.ends_with("-plugged"));
-        let battery = battery_name.and_then(|n| n.split('-').next())
-            .and_then(|n| n.parse::<u8>().ok());
-        if battery_name.is_none()
-            && ![
-                "launcher",
-                "network",
-                "network-offline",
-                "wired",
-                "audio",
-                "audio-muted",
-                "status-settings",
-                "weather-unavailable",
-                "close",
-                "minimize",
-                "curve",
-                "more",
-                "battery-unknown",
-            ]
-            .contains(&name)
+        if let Some(battery) = name.strip_prefix("battery-") {
+            return self.battery_symbol(rect, battery, ink);
+        }
+        if ![
+            "launcher",
+            "network",
+            "network-offline",
+            "wired",
+            "audio",
+            "audio-muted",
+            "status-settings",
+            "weather-unavailable",
+            "close",
+            "minimize",
+            "curve",
+            "more",
+        ]
+        .contains(&name)
         {
             return false;
         }
@@ -982,43 +1057,7 @@ impl Canvas {
                     cairo_close_path(c);
                     cairo_stroke(c);
                 }
-                _ => {
-                    self.rounded_path([2., 8., 26., 16.], 3.);
-                    cairo_stroke(c);
-                    cairo_move_to(c, 30., 13.);
-                    cairo_line_to(c, 30., 19.);
-                    cairo_stroke(c);
-                    if let Some(level) = battery {
-                        self.rounded(
-                            [5., 11., (if charging || plugged { 10. } else { 20. }) * (level.min(100) as f32 / 100.), 10.],
-                            ink,
-                            1.,
-                        );
-                    }
-                    if charging {
-                        cairo_move_to(c, 23., 10.);
-                        cairo_line_to(c, 18., 16.);
-                        cairo_line_to(c, 22., 16.);
-                        cairo_line_to(c, 18., 22.);
-                        cairo_stroke(c);
-                        if fast {
-                            cairo_move_to(c, 26., 11.);
-                            cairo_line_to(c, 23., 15.);
-                            cairo_stroke(c);
-                        }
-                    } else if plugged {
-                        cairo_move_to(c, 19., 11.);
-                        cairo_line_to(c, 19., 15.);
-                        cairo_move_to(c, 23., 11.);
-                        cairo_line_to(c, 23., 15.);
-                        cairo_move_to(c, 18., 15.);
-                        cairo_line_to(c, 24., 15.);
-                        cairo_line_to(c, 24., 18.);
-                        cairo_line_to(c, 21., 20.);
-                        cairo_line_to(c, 21., 23.);
-                        cairo_stroke(c);
-                    }
-                }
+                _ => unreachable!(),
             }
             cairo_restore(c);
         }

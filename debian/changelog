@@ -1,3 +1,9 @@
+xr-shell (0.3.7) unstable; urgency=medium
+
+  * Draw separate single-bolt, double-bolt and plug battery symbols.
+
+ -- bits <bigbits@hackx.cc>  Sun, 22 Nov 2026 15:12:38 +0800
+
 xr-shell (0.3.6) unstable; urgency=medium
 
   * Draw charging, fast charging and external power battery symbols.
