@@ -352,11 +352,23 @@ fn run(options: &Options, summary: &mut Summary) -> Result<()> {
             .as_ref()
             .context("missing foreground directory")?;
         let released = directory.join("released");
+        let recenter = directory.join("recenter");
+        let yield_request = directory.join("yield");
+        // The desktop's XR frame loop has stopped. Keep the same Home hold
+        // detector active and address its events to this foreground app.
+        let mut controls = controls::Controls::new();
+        let mut recenter_requests = 0_u64;
         fs::write(&released, b"")?;
         println!("XR_FOREGROUND_RELEASED=1");
-        while directory.join("yield").exists() && !quit.load(Ordering::Relaxed) {
+        while yield_request.exists() && !quit.load(Ordering::Relaxed) {
             if let Some(d) = desktop.as_mut() {
                 d.tick()?;
+            }
+            controls.poll();
+            if controls.take_home_recenter() {
+                recenter_requests += 1;
+                atomic_json(&recenter, &json!(recenter_requests))?;
+                println!("XR_HOME_RECENTER count={recenter_requests} scope=foreground_application");
             }
             std::thread::sleep(Duration::from_millis(20));
         }
