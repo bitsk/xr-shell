@@ -836,10 +836,7 @@ impl Canvas {
             };
             Some(level)
         };
-        if !matches!(
-            badge,
-            "" | "charging" | "fast-charging" | "plugged" | "plugged-discharging"
-        ) {
+        if !matches!(badge, "" | "charging" | "fast-charging" | "plugged") {
             return false;
         }
         unsafe {
@@ -878,7 +875,7 @@ impl Canvas {
                         cairo_stroke(c);
                     }
                 }
-                "plugged" | "plugged-discharging" => {
+                "plugged" => {
                     cairo_move_to(c, 34., 8.);
                     cairo_line_to(c, 34., 12.);
                     cairo_move_to(c, 40., 8.);
@@ -891,12 +888,6 @@ impl Canvas {
                     cairo_line_to(c, 41., 12.);
                     cairo_move_to(c, 37., 20.);
                     cairo_line_to(c, 37., 24.);
-                    if badge == "plugged-discharging" {
-                        cairo_line_to(c, 37., 27.);
-                        cairo_move_to(c, 33., 23.);
-                        cairo_line_to(c, 37., 27.);
-                        cairo_line_to(c, 41., 23.);
-                    }
                     cairo_stroke(c);
                 }
                 _ => {}

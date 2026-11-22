@@ -1,3 +1,9 @@
+xr-shell (0.3.8) unstable; urgency=medium
+
+  * Use one plug symbol for external power without charging.
+
+ -- bits <bigbits@hackx.cc>  Sun, 22 Nov 2026 15:16:24 +0800
+
 xr-shell (0.3.7) unstable; urgency=medium
 
   * Draw separate single-bolt, double-bolt and plug battery symbols.
