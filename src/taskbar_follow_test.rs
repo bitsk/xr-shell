@@ -233,6 +233,19 @@ fn islands_share_motion_capture_and_scene_refresh_without_moving_world_panels() 
     let center = frame(&d, 1, "center");
     let left = frame(&d, 1, "left-bg");
     let right = frame(&d, 2, "right-bg");
+    let eye = [0.3, 1.7, 0.2];
+    for island in [left, center, right] {
+        let to_eye = sub(eye, island.position);
+        assert!((to_eye[1] - 0.62).abs() < 0.00001);
+        assert!((to_eye[0].hypot(to_eye[2]) - 2.2).abs() < 0.00001);
+        let cross = crate::spatial::cross(to_eye, island.normal());
+        assert!(dot(cross, cross) < 0.00000001);
+        let top = island.point([island.logical[0] / 2., 0.], 0.);
+        let bottom = island.point([island.logical[0] / 2., island.logical[1]], 0.);
+        assert!(dot(sub(bottom, top), to_eye).abs() < 0.00001);
+        assert!(bottom[1] < top[1]);
+        assert!(dot(sub(bottom, top), [to_eye[0], 0., to_eye[2]]) > 0.);
+    }
     assert!(
         sub(center.position, taskbar::CENTER_POSITION)
             .iter()
@@ -282,6 +295,12 @@ fn islands_share_motion_capture_and_scene_refresh_without_moving_world_panels() 
         .unwrap();
     assert!((xy[0] - 26.).abs() < 0.001 && (xy[1] - 26.).abs() < 0.001);
     assert!(dot(button.normal(), right.normal_at([52., 36.])) > 0.9999);
+    let to_button = sub(button.position, eye);
+    let direction = scale(to_button, dot(to_button, to_button).sqrt().recip());
+    assert_eq!(
+        d.pointer_target("regression", eye, direction).as_deref(),
+        Some("node:2:status")
+    );
     d.captures.insert(
         "regression".into(),
         Capture {

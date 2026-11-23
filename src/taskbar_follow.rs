@@ -35,19 +35,10 @@ impl TaskbarFollow {
             self.position_m,
             self.rotate(sub(frame.position, taskbar::CENTER_POSITION)),
         );
-        let eye = sub(
-            self.position_m,
-            self.rotate([
-                0.,
-                taskbar::CENTER_POSITION[1] - 1.6,
-                taskbar::CENTER_POSITION[2],
-            ]),
-        );
+        let eye = sub(self.position_m, self.rotate(taskbar::EYE_TO_CENTER));
         let mut rotation = crate::spatial::user_facing(frame.position, eye);
         // All three centres share one horizontal radius and one reading pitch.
-        rotation[0] = (1.6 - taskbar::CENTER_POSITION[1])
-            .atan2(taskbar::RADIUS_M)
-            .to_degrees();
+        rotation[0] = taskbar::ROTATION[0];
         let mut facing = Frame::new(frame.position, frame.size, frame.logical, rotation);
         facing.curve = taskbar::RADIUS_M;
         facing
@@ -68,14 +59,7 @@ impl TaskbarFollow {
         let yaw = (2. * (q[0] * q[2] + q[3] * q[1])).atan2(1. - 2. * (q[0] * q[0] + q[1] * q[1]));
         if !self.initialized {
             self.yaw_radians = yaw;
-            self.position_m = add(
-                position,
-                self.rotate([
-                    0.,
-                    taskbar::CENTER_POSITION[1] - 1.6,
-                    taskbar::CENTER_POSITION[2],
-                ]),
-            );
+            self.position_m = add(position, self.rotate(taskbar::EYE_TO_CENTER));
             self.initialized = true;
             return true;
         }
@@ -97,12 +81,7 @@ impl TaskbarFollow {
             }
             changed |= step.abs() > 0.00001;
         }
-        let rotated = self.rotate(taskbar::CENTER_POSITION);
-        let target = [
-            position[0] + rotated[0],
-            position[1] + rotated[1] - 1.6,
-            position[2] + rotated[2],
-        ];
+        let target = add(position, self.rotate(taskbar::EYE_TO_CENTER));
         let alpha = (dt * 8.).clamp(0., 1.);
         for (current, target) in self.position_m.iter_mut().zip(target) {
             let step = (target - *current) * alpha;

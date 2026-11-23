@@ -211,11 +211,12 @@ or inner glow. Shadows are neutral, limited to a 12 px spread, and fade out
 inside the face silhouette instead of tinting the translucent interior.
 Icon and battery trays do not cast individual shadows.
 
-The three taskbar centres follow a horizontal 1.72 m radius at the same height,
-with a common reading pitch. The centre is 620 px wide, the sides 340 px, and
+The three taskbar centres follow a horizontal 2.2 m radius at the same height,
+0.62 m below the reference eye. Each face tilts up by about 16 degrees.
+The centre is 620 px wide, the sides 340 px, and
 the arc-length gaps are 24 px. Each capsule and its child geometry use the same
-1.72 m curve for rendering and ray projection. This is a horizontal radius:
-with the taskbar 0.74 m below the eye, centre viewing distance is about 1.87 m.
+2.2 m curve for rendering and ray projection. The centre viewing distance
+is about 2.29 m.
 App trays use 0.14 alpha (0.32 hovered), retain the existing 10 mm GPU hover
 lift and carry live 14x4 px running bars without a surrounding glow.
 
