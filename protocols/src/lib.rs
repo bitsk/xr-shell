@@ -13,10 +13,9 @@ use std::{
     path::Path,
 };
 
-/// Shell-owned actions on buttons inside a horizon-spawned spatial panel.
-/// These gestures change the whole panel and never emit client InputEvents.
-pub const PANEL_MOVE_ACTION: &str = "shell:panel-move";
-pub const PANEL_SCALE_ACTION: &str = "shell:panel-scale";
+/// A horizon-spawned panel Group can opt into Shell window controls.
+/// The action suffix is the panel name used by ComponentCommand (hide).
+pub const PANEL_WINDOW_CONTROLS: &str = "shell:window-controls:";
 
 pub const MAX_METADATA: usize = 65536;
 pub const VERSION: &str = "xr-desktop/1.0";

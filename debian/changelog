@@ -1,3 +1,9 @@
+xr-shell (0.3.11) unstable; urgency=medium
+
+  * Share window controls and curved geometry with opted-in spatial panels.
+
+ -- bits <bigbits@hackx.cc>  Mon, 23 Nov 2026 19:20:19 +0800
+
 xr-shell (0.3.10) unstable; urgency=medium
 
   * Deliver Home long-press recenter to the foreground XR application.

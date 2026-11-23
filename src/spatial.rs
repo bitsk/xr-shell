@@ -141,6 +141,18 @@ impl Frame {
         }
         out
     }
+    /// Cut a piece out of the same cylinder, with depth along its local normal.
+    pub fn curved_rect(&self, rect: [f32; 4], depth: f32) -> Self {
+        if self.curve == 0. {
+            return self.rect(rect, depth);
+        }
+        let mut child = self.rect(rect, 0.);
+        child.position = add(child.position, scale(child.normal(), depth));
+        child.curve = self.curve - depth;
+        child.size[0] *= child.curve / self.curve;
+        child
+    }
+
     pub fn project(&self, origin: [f32; 3], direction: [f32; 3]) -> Option<([f32; 2], f32)> {
         let rel = sub(origin, self.position);
         let n = self.normal();

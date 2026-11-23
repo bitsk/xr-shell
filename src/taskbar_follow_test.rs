@@ -99,7 +99,6 @@ fn hover_reuses_other_rasters_without_freezing_text_or_window_updates() {
     d.captures.insert(
         "regression".into(),
         Capture {
-            panel: None,
             button: 272,
             button_sent: false,
             click: None,
@@ -286,7 +285,6 @@ fn islands_share_motion_capture_and_scene_refresh_without_moving_world_panels() 
     d.captures.insert(
         "regression".into(),
         Capture {
-            panel: None,
             button: 272,
             button_sent: false,
             click: None,
@@ -587,78 +585,110 @@ fn component_scroll_requires_hovered_panel_threshold_and_cooldown() {
 }
 
 #[test]
-fn panel_handles_move_scale_and_cancel_without_client_input() {
+fn keyboard_uses_window_controls_and_curved_ray_geometry() {
     let mut d = interaction_desktop();
     d.windows.clear();
-    let mut scene = Scene::new([1000., 334.], [1., 0.334], [0., 1.5, -1.6], "world_locked");
-    scene.push(Widget::horizon_panel(
-        "keyboard",
-        [1000., 334.],
-        [1., 0.334],
-        0.,
-        -10.,
-        1.6,
-    ));
-    for (id, rect, action) in [
-        (
-            "move",
-            [340., 278., 320., 48.],
-            xr_shell_protocols::PANEL_MOVE_ACTION,
-        ),
-        (
-            "scale",
-            [832., 278., 144., 48.],
-            xr_shell_protocols::PANEL_SCALE_ACTION,
-        ),
-    ] {
-        scene.push(Widget::button(id, rect, id, action, "button.secondary").parent("keyboard"));
+    let mut scene = Scene::new([1000., 280.], [1., 0.28], [0., 1.5, -1.6], "world_locked");
+    let mut keyboard = Widget::horizon_panel("keyboard", [1000., 280.], [1., 0.28], 0., -10., 1.6);
+    keyboard.action_id = format!("{}keyboard", xr_shell_protocols::PANEL_WINDOW_CONTROLS);
+    scene.push(keyboard);
+    scene.push(
+        Widget::card("background", [0., 0., 1000., 280.], "panel.background").parent("keyboard"),
+    );
+    for (id, x) in [("key-a", 50.), ("key-b", 850.)] {
+        scene.push(
+            Widget::button(id, [x, 50., 100., 50.], id, "key:30", "keyboard.key")
+                .parent("background"),
+        );
     }
     let mut p = peer(&d, 2, scene);
-    Desktop::freeze_spawn_frames(&mut p, d.horizon_head.unwrap());
-    let original = p.spawn_frames["keyboard"];
+    let client = d.listener.accept().unwrap().unwrap();
+    let head = d.horizon_head.unwrap();
+    Desktop::freeze_spawn_frames(&mut p, head);
     d.peers.insert(2, p);
-    let source = "debug_ray:left";
-    let origin = [0., 1.5, 0.];
+    let k = "component:2:keyboard";
+    let panel = |d: &Desktop| d.manipulation_frame(k).unwrap();
+    let key = |d: &Desktop, id: &str| d.node_frame(&d.peers[&2], &d.peers[&2].nodes[id]).unwrap();
+    let handle = |d: &Desktop, id: &str| d.companion_frame(k, id).unwrap().position;
+    let origin = head.0;
     let direction = |point| {
         let delta = sub(point, origin);
         scale(delta, 1. / dot(delta, delta).sqrt())
     };
-    let handle =
-        |d: &Desktop, id: &str| d.node_frame(&d.peers[&2], &d.peers[&2].nodes[id]).unwrap();
-    let start = handle(&d, "move").position;
-    d.ray(origin, direction(start), "press", source).unwrap();
-    assert!(d.captures[source].panel.is_some());
-    let end = add(start, [0.2, 0.1, 0.]);
-    d.ray(origin, direction(end), "drag", source).unwrap();
-    assert!(d.peers[&2].spawn_frames["keyboard"].position[0] > 0.1);
-    d.ray(origin, direction(end), "release", source).unwrap();
-    assert!(!d.captures.contains_key(source));
-    let moved = d.peers[&2].spawn_frames["keyboard"];
+    let left = "debug_ray:left";
+    let right = "debug_ray:right";
+    let original = panel(&d);
+    let start = handle(&d, "grab");
+    let end = add(start, [0.20, 0.06, 0.]);
+    d.ray(origin, direction(start), "press", left).unwrap();
+    d.ray(origin, direction(end), "drag", left).unwrap();
+    d.ray(origin, direction(end), "release", left).unwrap();
+    let moved = panel(&d);
+    assert!(moved.position[0] > 0.1);
     assert_eq!(moved.size, original.size);
-    let start = handle(&d, "scale").position;
-    d.ray(origin, direction(start), "press", source).unwrap();
-    // A second pointer cannot mutate the same panel during the gesture.
-    let other = handle(&d, "move").position;
-    d.ray(origin, direction(other), "press", "debug_ray:right")
+
+    // Both resize corners share the window's capture path.
+    let start = handle(&d, "resize-right");
+    let end = add(start, scale(moved.right, 0.20));
+    d.ray(origin, direction(start), "press", left).unwrap();
+    d.ray(origin, direction(end), "drag", left).unwrap();
+    let larger = panel(&d);
+    assert!(larger.size[0] > moved.size[0] * 1.1);
+    assert!((larger.size[0] / larger.size[1] - moved.size[0] / moved.size[1]).abs() < 0.00001);
+    d.cancel_pointer(left, "tracking lost");
+    assert_eq!(panel(&d).size, moved.size);
+    close(panel(&d).position, moved.position);
+    let start = handle(&d, "resize-left");
+    let end = add(start, scale(moved.right, 0.15));
+    d.ray(origin, direction(start), "press", left).unwrap();
+    d.ray(origin, direction(end), "release", left).unwrap();
+    assert!(panel(&d).size[0] < moved.size[0]);
+
+    // Grips can begin over actual keys, without generating a key press.
+    let a = key(&d, "key-a").position;
+    let b = key(&d, "key-b").position;
+    d.ray_squeeze(origin, direction(a), "press", left).unwrap();
+    d.ray_squeeze(origin, direction(b), "press", right).unwrap();
+    assert!(d.bimanual.contains_key(k));
+    let size = panel(&d).size;
+    let b = add(b, scale(moved.right, 0.16));
+    d.ray_squeeze(origin, direction(b), "drag", right).unwrap();
+    assert!(panel(&d).size[0] > size[0]);
+    d.ray_squeeze(origin, direction(b), "release", right)
         .unwrap();
-    assert!(!d.captures.contains_key("debug_ray:right"));
-    let end = add(start, scale(moved.right, 0.25));
-    d.ray(origin, direction(end), "drag", source).unwrap();
-    let scaled = d.peers[&2].spawn_frames["keyboard"];
-    assert!(scaled.size[0] > moved.size[0]);
-    assert!((scaled.size[0] / scaled.size[1] - moved.size[0] / moved.size[1]).abs() < 0.00001);
-    close(scaled.position, moved.position);
-    d.cancel_pointer(source, "tracking lost");
-    assert_eq!(d.peers[&2].spawn_frames["keyboard"].size, moved.size);
-    close(
-        d.peers[&2].spawn_frames["keyboard"].position,
-        moved.position,
-    );
-    assert_eq!(d.stats["input_events"].as_u64().unwrap_or(0), 0);
-    // Re-publishing a keyboard page preserves the Shell-owned frame.
-    Desktop::freeze_spawn_frames(d.peers.get_mut(&2).unwrap(), d.horizon_head.unwrap());
-    close(
-        d.peers[&2].spawn_frames["keyboard"].position,
-        moved.position,
-    );
+    d.ray_squeeze(origin, direction(a), "release", left)
+        .unwrap();
+    assert!(d.captures.is_empty());
+    assert!(inputs(&d).is_empty());
+
+    let orb = handle(&d, "orb");
+    d.ray(origin, direction(orb), "hover", left).unwrap();
+    let curve = handle(&d, "curve");
+    for _ in 0..2 {
+        let previously_curved = panel(&d).curve > 0.;
+        d.ray(origin, direction(curve), "press", left).unwrap();
+        d.ray(origin, direction(curve), "release", left).unwrap();
+        assert_ne!(panel(&d).curve > 0., previously_curved);
+        let a = key(&d, "key-a");
+        assert_eq!(a.curve > 0., !previously_curved);
+        d.ray(origin, direction(a.position), "press", left).unwrap();
+        assert!(matches!(&d.captures[left].target, Target::Node(2, id) if id == "key-a"));
+        d.ray(origin, direction(a.position), "release", left)
+            .unwrap();
+    }
+    let frame = panel(&d);
+    Desktop::freeze_spawn_frames(d.peers.get_mut(&2).unwrap(), head);
+    close(panel(&d).position, frame.position);
+    assert_eq!(panel(&d).size, frame.size);
+
+    let close_button = handle(&d, "close");
+    d.ray(origin, direction(close_button), "press", left)
+        .unwrap();
+    d.ray(origin, direction(close_button), "release", left)
+        .unwrap();
+    let command = std::iter::from_fn(|| client.recv(0).unwrap())
+        .find(|p| p.message["type"] == "ComponentCommand")
+        .unwrap();
+    assert_eq!(command.message["payload"]["panel"], "keyboard");
+    assert_eq!(command.message["payload"]["intent"], "hide");
 }

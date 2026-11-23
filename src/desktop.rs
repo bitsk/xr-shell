@@ -138,6 +138,19 @@ enum Target {
     Minimize(String),
     Curve(String),
 }
+impl Target {
+    fn companion_key(&self) -> Option<&str> {
+        match self {
+            Self::Close(key)
+            | Self::Move(key)
+            | Self::Resize(key, _)
+            | Self::Orb(key)
+            | Self::Minimize(key)
+            | Self::Curve(key) => Some(key),
+            _ => None,
+        }
+    }
+}
 #[derive(Clone)]
 struct Grab {
     distance: f32,
@@ -152,16 +165,7 @@ struct Bimanual {
     anchor: [f32; 3],
 }
 #[derive(Clone)]
-struct PanelManipulation {
-    owner: u64,
-    panel: String,
-    frame: crate::spatial::Frame,
-    handle: crate::spatial::Frame,
-    scaling: bool,
-}
-#[derive(Clone)]
 struct Capture {
-    panel: Option<PanelManipulation>,
     button: u32,
     button_sent: bool,
     click: Option<SurfacePress>,
@@ -589,7 +593,12 @@ impl Desktop {
         self.pending_requests
             .retain(|(origin, _), _| *origin != p.id);
         self.cancel_if(
-            |t| matches!(t,Target::Node(id,_) if *id==p.id),
+            |t| {
+                matches!(t,Target::Node(id,_) if *id==p.id)
+                    || t.companion_key()
+                        .and_then(Self::panel_key)
+                        .is_some_and(|(id, _)| id == p.id)
+            },
             "peer disconnected",
         );
         let removed: Vec<_> = self
@@ -916,6 +925,12 @@ impl Desktop {
                     .iter()
                     .filter_map(|(source, c)| {
                         let invalid = (|| {
+                            if let Some((id, panel)) =
+                                c.target.companion_key().and_then(Self::panel_key)
+                            {
+                                return id == p.id
+                                    && nodes.get(panel).and_then(Self::panel_command).is_none();
+                            }
                             let Target::Node(id, n) = &c.target else {
                                 return false;
                             };
@@ -954,10 +969,23 @@ impl Desktop {
                 for source in cancelled {
                     self.pending_pointer = None;
                     if let Some(c) = self.captures.remove(&source) {
+                        if let Target::Move(key) = &c.target {
+                            self.bimanual.remove(key);
+                        }
                         self.release_capture_surface(&c);
                         p.send(&self.session,"Cancel","0",json!({"capture_id":c.id,"interaction_id":c.interaction,"reason":"target removed"}))?;
                         self.count("cancellations");
                     }
+                }
+                if self
+                    .expanded_orb
+                    .as_deref()
+                    .and_then(Self::panel_key)
+                    .is_some_and(|(id, panel)| {
+                        id == p.id && nodes.get(panel).and_then(Self::panel_command).is_none()
+                    })
+                {
+                    self.expanded_orb = None;
                 }
                 p.nodes = nodes;
                 p.spawn_frames.retain(|id, _| {
@@ -1562,11 +1590,7 @@ impl Desktop {
             self.cancel_source(&source, reason);
         }
         for (k, (position, size, rotation)) in originals {
-            if let Some(w) = self.windows.get_mut(&k) {
-                w.position = position;
-                w.size = size;
-                w.rotation = rotation;
-            }
+            self.set_manipulation_geometry(&k, position, size, rotation);
         }
         self.hovers.clear();
         self.companion_hovers.clear();
@@ -1577,29 +1601,9 @@ impl Desktop {
             if c.surface.is_some() {
                 self.pending_pointer = None;
             }
-            if let Target::Resize(key, _) = &c.target {
-                if let Some(w) = self.windows.get_mut(key) {
-                    w.size = c.size;
-                    w.position = c.position;
-                    if let Some((eye, _)) = self.horizon_head {
-                        w.rotation = crate::spatial::user_facing(w.position, eye);
-                    }
-                }
-            }
-            if let Target::Move(key) = &c.target {
-                if let Some(w) = self.windows.get_mut(key) {
-                    w.position = c.position;
-                    w.size = c.size;
-                    w.rotation = c.resize_rotation;
-                }
+            if let Target::Move(key) | Target::Resize(key, _) = &c.target {
+                self.set_manipulation_geometry(key, c.position, c.size, c.resize_rotation);
                 let _ = self.finish_grab(key, false);
-            }
-            if let Some(panel) = &c.panel {
-                if let Some(p) = self.peers.get_mut(&panel.owner) {
-                    if p.spawn_frames.contains_key(&panel.panel) {
-                        p.spawn_frames.insert(panel.panel.clone(), panel.frame);
-                    }
-                }
             }
             self.release_capture_surface(&c);
             if let Target::Node(id, node) = c.target {
@@ -1867,9 +1871,9 @@ impl Desktop {
             );
             if let Some((target, xy)) = &hit {
                 self.event += 1;
-                let pos = match target {
-                    Target::Move(k) | Target::Resize(k, _) => self.windows[k].position,
-                    _ => [0.; 3],
+                let initial_frame = match target {
+                    Target::Move(k) | Target::Resize(k, _) => self.manipulation_frame(k),
+                    _ => None,
                 };
                 let surface = match target {
                     Target::Window(k) => Some(k.clone()),
@@ -1894,28 +1898,23 @@ impl Desktop {
                 }) {
                     return Ok(());
                 }
-                let panel = self.panel_manipulation(target);
-                if self.captures.values().any(|c| {
-                    panel.as_ref().is_some_and(|a| {
-                        c.panel
-                            .as_ref()
-                            .is_some_and(|b| a.owner == b.owner && a.panel == b.panel)
-                    })
-                }) {
-                    return Ok(());
-                }
                 self.captures.insert(
                     source.into(),
                     Capture {
-                        panel,
                         button,
                         button_sent: false,
                         click: None,
                         grab: None,
-                        resize_rotation: match target {
-                            Target::Resize(k, _) | Target::Move(k) => self.windows[k].rotation,
-                            _ => [0.; 3],
-                        },
+                        resize_rotation: initial_frame.map_or([0.; 3], |f| {
+                            // Managed panels are always roll-free, like the window grab.
+                            target
+                                .companion_key()
+                                .and_then(|k| self.windows.get(k))
+                                .map_or_else(
+                                    || crate::spatial::user_facing([0.; 3], f.normal()),
+                                    |w| w.rotation,
+                                )
+                        }),
                         target: target.clone(),
                         resize_frame: match target {
                             Target::Resize(k, left) => self.companion_frame(
@@ -1924,25 +1923,18 @@ impl Desktop {
                             ),
                             _ => None,
                         },
-                        size: match target {
-                            Target::Resize(k, _) | Target::Move(k) => self.windows[k].size,
-                            _ => [0.; 2],
-                        },
-                        logical: match target {
-                            Target::Resize(k, _) | Target::Move(k) => {
-                                Self::logical(&self.windows[k])
-                            }
-                            _ => [0.; 2],
-                        },
+                        size: initial_frame.map_or([0.; 2], |f| f.size),
+                        logical: initial_frame.map_or([0.; 2], |f| f.logical),
                         surface,
                         id: self.event.to_string(),
                         interaction: self.event.to_string(),
                         start: *xy,
-                        position: pos,
+                        position: initial_frame.map_or([0.; 3], |f| f.position),
                     },
                 );
             }
         }
+        let projected = hit.is_some();
         let target = if let Some(c) = self.captures.get(source) {
             let xy = hit.as_ref().map(|(_, xy)| *xy).unwrap_or([-1., -1.]);
             Some((c.target.clone(), xy))
@@ -1964,14 +1956,7 @@ impl Desktop {
                         .get(&id)
                         .and_then(|p| p.nodes.get(&n))
                         .context("target gone")?;
-                    if [
-                        xr_shell_protocols::PANEL_MOVE_ACTION,
-                        xr_shell_protocols::PANEL_SCALE_ACTION,
-                    ]
-                    .contains(&node.action_id.as_str())
-                    {
-                        // Shell owns panel manipulation; never type or activate a client action.
-                    } else if node.kind == "SurfaceReference" {
+                    if node.kind == "SurfaceReference" {
                         let key = format!("{}:{}", node.window_server_generation, node.surface_id);
                         let w = self.windows.get(&key).context("referenced window gone")?;
                         let logical = Self::logical(w);
@@ -2019,73 +2004,25 @@ impl Desktop {
                 }
                 Target::Curve(k) => {
                     if phase == "release" {
-                        let w = self.windows.get_mut(&k).context("window disappeared")?;
-                        w.curved = !w.curved;
-                        self.changed();
+                        self.toggle_curve(&k);
                     }
                 }
                 Target::Close(k) => {
-                    if phase == "release" {
-                        let w = &self.windows[&k];
+                    if phase == "release" && !self.close_panel(&k)? {
+                        let Some(w) = self.windows.get(&k) else {
+                            return Ok(());
+                        };
                         self.window_intent(json!({"intent":"close","surface_id":w.state["surface_id"],"window_server_generation":w.state["window_server_generation"]}))?;
                     }
                 }
                 Target::Move(_) => { /* Updated from the 3D ray by spatial_ui. */ }
                 Target::Resize(k, left) => {
-                    if phase == "drag" || phase == "release" {
-                        if let Some(c) = self.captures.get(source).cloned() {
-                            let width = (c.logical[0]
-                                + (xy[0] - c.start[0]) * if left { -1. } else { 1. })
-                            .clamp(160., 2048.)
-                            .round();
-                            let height = (c.logical[1] + xy[1] - c.start[1])
-                                .clamp(120., 1536.)
-                                .round();
-                            let size = [
-                                c.size[0] * width / c.logical[0],
-                                c.size[1] * height / c.logical[1],
-                            ];
-                            let w = self.windows.get_mut(&k).context("window disappeared")?;
-                            w.size = size;
-                            let half_arc = 15f32.to_radians();
-                            let arc_x = if w.curved {
-                                half_arc.sin() / half_arc
-                            } else {
-                                1.
-                            };
-                            let arc_z = if w.curved {
-                                (1. - half_arc.cos()) / (2. * half_arc)
-                            } else {
-                                0.
-                            };
-                            let f = crate::spatial::Frame::new(
-                                c.position,
-                                c.size,
-                                c.logical,
-                                c.resize_rotation,
-                            );
-                            let offset = crate::spatial::add(
-                                crate::spatial::scale(
-                                    f.right,
-                                    (c.size[0] - size[0]) * if left { 0.5 } else { -0.5 } * arc_x,
-                                ),
-                                crate::spatial::add(
-                                    crate::spatial::scale(f.down, (size[1] - c.size[1]) * 0.5),
-                                    crate::spatial::scale(
-                                        f.normal(),
-                                        (c.size[0] - size[0]) * arc_z,
-                                    ),
-                                ),
-                            );
-                            w.position = crate::spatial::add(c.position, offset);
-                            if let Some((eye, _)) = self.horizon_head {
-                                w.rotation = crate::spatial::user_facing(w.position, eye);
-                            }
-                            self.dirty = true;
-                            if phase == "release" {
-                                self.window_intent(json!({"intent":"resize","surface_id":self.windows[&k].state["surface_id"],"window_server_generation":self.windows[&k].state["window_server_generation"],"width":width as u32,"height":height as u32}))?;
-                                self.changed();
-                            }
+                    if let Some(c) = self.captures.get(source).cloned() {
+                        if projected && (phase == "drag" || phase == "release") {
+                            self.resize_companion(&k, left, &c, xy);
+                        }
+                        if phase == "release" {
+                            self.commit_window_resize(&k, c.logical, c.size)?;
                         }
                     }
                 }

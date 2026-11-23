@@ -2,6 +2,8 @@
 use super::*;
 use crate::spatial::{Frame, add, dot, scale, sub};
 use xr_spatial_kit::taskbar;
+
+const WINDOW_ARC: f32 = std::f32::consts::PI / 6.;
 #[derive(Clone)]
 enum Source {
     Node(u64, String),
@@ -76,6 +78,105 @@ impl Desktop {
             parent = &n.parent_id;
         }
         &p.root.policy
+    }
+    pub(super) fn panel_command(node: &Node) -> Option<&str> {
+        if !node.visible
+            || !node.enabled
+            || node.parent_id != "root"
+            || !node.spatial_panel
+            || node.spatial_policy != "head_horizon_spawn"
+        {
+            return None;
+        }
+        node.action_id
+            .strip_prefix(xr_shell_protocols::PANEL_WINDOW_CONTROLS)
+            .filter(|panel| !panel.is_empty())
+    }
+    pub(super) fn panel_key(key: &str) -> Option<(u64, &str)> {
+        let (owner, panel) = key.strip_prefix("component:")?.split_once(':')?;
+        Some((owner.parse().ok()?, panel))
+    }
+    fn managed_panel(&self, key: &str) -> Option<(&Peer, &Node)> {
+        let (id, panel) = Self::panel_key(key)?;
+        let peer = self.peers.get(&id)?;
+        let node = peer.nodes.get(panel)?;
+        Self::panel_command(node)?;
+        peer.spawn_frames.get(panel)?;
+        Some((peer, node))
+    }
+    pub(super) fn manipulation_frame(&self, key: &str) -> Option<Frame> {
+        if let Some((p, n)) = self.managed_panel(key) {
+            Some(self.panel_frame(p, n))
+        } else {
+            self.window_frame(key, 0)
+        }
+    }
+    pub(super) fn set_manipulation_geometry(
+        &mut self,
+        key: &str,
+        position: [f32; 3],
+        size: [f32; 2],
+        rotation: [f32; 3],
+    ) {
+        if let Some(w) = self.windows.get_mut(key) {
+            w.position = position;
+            w.size = size;
+            w.rotation = rotation;
+        } else if let Some((owner, panel)) = Self::panel_key(key) {
+            if let Some(old) = self
+                .peers
+                .get_mut(&owner)
+                .and_then(|p| p.spawn_frames.get_mut(panel))
+            {
+                let mut frame = Frame::new(position, size, old.logical, rotation);
+                if old.curve > 0. {
+                    frame.curve = size[0] / WINDOW_ARC;
+                }
+                *old = frame;
+            }
+        }
+        self.dirty = true;
+    }
+    pub(super) fn toggle_curve(&mut self, key: &str) {
+        if let Some(w) = self.windows.get_mut(key) {
+            w.curved = !w.curved;
+        } else if let Some((owner, panel)) = Self::panel_key(key) {
+            if let Some(frame) = self
+                .peers
+                .get_mut(&owner)
+                .and_then(|p| p.spawn_frames.get_mut(panel))
+            {
+                frame.curve = if frame.curve > 0. {
+                    0.
+                } else {
+                    frame.size[0] / WINDOW_ARC
+                };
+            }
+        }
+        self.changed();
+    }
+    pub(super) fn close_panel(&self, key: &str) -> Result<bool> {
+        let Some((p, n)) = self.managed_panel(key) else {
+            return Ok(false);
+        };
+        p.send_event(
+            &self.session,
+            "ComponentCommand",
+            json!({"role":p.role,"panel":Self::panel_command(n),"intent":"hide"}),
+        )?;
+        Ok(true)
+    }
+    fn companion_keys(&self) -> impl Iterator<Item = String> + '_ {
+        self.windows
+            .iter()
+            .filter(|(_, w)| self.visible_window(w) && w.has_window_controls())
+            .map(|(k, _)| k.clone())
+            .chain(self.peers.values().flat_map(|p| {
+                p.spawn_frames.keys().filter_map(|id| {
+                    Self::panel_command(p.nodes.get(id)?)?;
+                    Some(format!("component:{}:{id}", p.id))
+                })
+            }))
     }
     fn panel_frame(&self, p: &Peer, n: &Node) -> Frame {
         let frame = Frame::new(n.position_m, n.size_m, n.logical_size, n.rotation_degrees);
@@ -171,6 +272,7 @@ impl Desktop {
             .unwrap_or(0.);
         let mut parent = node.parent_id.as_str();
         let mut frame = self.root_frame(p);
+        let mut managed = false;
         for _ in 0..512 {
             if parent == "root" {
                 break;
@@ -186,6 +288,7 @@ impl Desktop {
                     return None;
                 }
                 frame = self.panel_frame(p, n);
+                managed = Self::panel_command(n).is_some();
                 break;
             }
             rect[0] += n.rect[0];
@@ -199,6 +302,9 @@ impl Desktop {
                         .unwrap_or(0.);
             }
             parent = &n.parent_id;
+        }
+        if managed {
+            return Some(frame.curved_rect(rect, depth));
         }
         let mut child = frame.rect(rect, depth);
         // Keep taskbar glyphs, trays and hit geometry on the same curved ribbon.
@@ -225,11 +331,7 @@ impl Desktop {
             return None;
         }
         let mut frame = Frame::new(w.position, w.size, logical, w.rotation);
-        frame.curve = if w.curved {
-            w.size[0] / 30f32.to_radians()
-        } else {
-            0.
-        };
+        frame.curve = if w.curved { w.size[0] / WINDOW_ARC } else { 0. };
         if level < 16 && w.state["role"].as_str().is_some_and(|r| r != "toplevel") {
             if let Some(parent) = w.state["parent_surface_id"].as_str() {
                 let pk = format!("{}:{parent}", w.state["window_server_generation"].as_str()?);
@@ -250,23 +352,29 @@ impl Desktop {
             && !w.pixels.is_empty()
     }
     pub(super) fn companion_frame(&self, k: &str, kind: &str) -> Option<Frame> {
-        let w = self.windows.get(k)?;
-        if !self.visible_window(w) || !w.has_window_controls() {
+        let panel = self.managed_panel(k).is_some();
+        if !panel
+            && !self
+                .windows
+                .get(k)
+                .is_some_and(|w| self.visible_window(w) && w.has_window_controls())
+        {
             return None;
         }
-        let frame = self.window_frame(k, 0)?;
+        let frame = self.manipulation_frame(k)?;
         let unit = frame.size[0] / frame.logical[0];
         let height = 24.;
         let bar_width = (frame.logical[0] * 0.24).clamp(144., 220.);
         // Centre the complete companion group instead of the grab capsule alone.
-        let bar_x = (frame.logical[0] - bar_width - 168.) / 2. + 168.;
+        let controls_width = if panel { 126. } else { 168. };
+        let bar_x = (frame.logical[0] - bar_width + controls_width) / 2.;
         let y = frame.logical[1] + 32.;
         let rect = match kind {
             "grab" => [bar_x, y - height / 2., bar_width, height],
             "orb" => [bar_x - 42., y - 16., 32., 32.],
             "curve" => [bar_x - 84., y - 16., 32., 32.],
-            "minimize" => [bar_x - 126., y - 16., 32., 32.],
-            "close" => [bar_x - 168., y - 16., 32., 32.],
+            "minimize" if !panel => [bar_x - 126., y - 16., 32., 32.],
+            "close" => [bar_x - controls_width, y - 16., 32., 32.],
             "resize-left" => [-30., frame.logical[1] - 12., 24., 24.],
             "resize-right" => [frame.logical[0] + 6., frame.logical[1] - 12., 24., 24.],
             _ => return None,
@@ -386,57 +494,37 @@ impl Desktop {
                 border: 0.5,
                 material: 2.,
             });
+        }
+        for k in self.companion_keys() {
+            let expanded =
+                self.focus.as_deref() == Some(&k) || self.expanded_orb.as_deref() == Some(&k);
             for (kind, source) in [
                 ("grab", Source::Grab(k.clone())),
                 ("orb", Source::Orb(k.clone())),
+                ("resize-left", Source::Resize(k.clone(), true)),
+                ("resize-right", Source::Resize(k.clone(), false)),
+                ("close", Source::Close(k.clone())),
+                ("minimize", Source::Minimize(k.clone())),
+                ("curve", Source::Curve(k.clone())),
             ] {
-                if let Some(frame) = self.companion_frame(k, kind) {
+                if !expanded && ["close", "minimize", "curve"].contains(&kind) {
+                    continue;
+                }
+                if let Some(frame) = self.companion_frame(&k, kind) {
+                    let resize = matches!(source, Source::Resize(_, _));
                     out.push(Draw {
                         id: format!("{kind}:{k}"),
                         frame,
                         source,
-                        radius: if kind == "grab" {
-                            frame.logical[1] / 2.
-                        } else {
-                            16.
+                        radius: match kind {
+                            "grab" => frame.logical[1] / 2.,
+                            _ if resize => 0.,
+                            _ => 16.,
                         },
-                        rim: 0.75,
-                        border: 0.22,
-                        material: 1.,
+                        rim: if resize { 0. } else { 0.75 },
+                        border: if resize { 0. } else { 0.22 },
+                        material: if resize { 0. } else { 1. },
                     });
-                }
-            }
-            for left in [true, false] {
-                let kind = if left { "resize-left" } else { "resize-right" };
-                if let Some(frame) = self.companion_frame(k, kind) {
-                    out.push(Draw {
-                        id: format!("{kind}:{k}"),
-                        frame,
-                        source: Source::Resize(k.clone(), left),
-                        radius: 0.,
-                        rim: 0.,
-                        border: 0.,
-                        material: 0.,
-                    });
-                }
-            }
-            if self.focus.as_deref() == Some(k) || self.expanded_orb.as_deref() == Some(k) {
-                for (kind, source) in [
-                    ("close", Source::Close(k.clone())),
-                    ("minimize", Source::Minimize(k.clone())),
-                    ("curve", Source::Curve(k.clone())),
-                ] {
-                    if let Some(frame) = self.companion_frame(k, kind) {
-                        out.push(Draw {
-                            id: format!("{kind}:{k}"),
-                            frame,
-                            source,
-                            radius: 16.,
-                            rim: 0.75,
-                            border: 0.22,
-                            material: 1.,
-                        });
-                    }
                 }
             }
         }
@@ -680,7 +768,11 @@ impl Desktop {
                     | Source::Minimize(k)
                     | Source::Curve(k)
                     | Source::Resize(k, _) => {
-                        let (group, anchor, layer) = self.window_group(k);
+                        let (group, anchor, layer) = if let Some((p, n)) = self.managed_panel(k) {
+                            (k.clone(), self.panel_frame(p, n).position, 0.)
+                        } else {
+                            self.window_group(k)
+                        };
                         (anchor, group, layer + 0.008 + self.companion_lifts.get(d.id.strip_prefix("shadow:").unwrap_or(&d.id)).copied().unwrap_or(0.))
                     }
                     Source::Shadow(_) => unreachable!(),
@@ -755,17 +847,11 @@ impl Desktop {
             // all UI draw geometry (and its theme/hover state) here repeated
             // the whole scene traversal before the actual render preparation.
             let mut controls = Vec::new();
-            for (key, window) in &self.windows {
-                if !self.visible_window(window)
-                    || !window.has_window_controls()
-                    || self.window_frame(key, 0).is_none()
-                {
-                    continue;
-                }
+            for key in self.companion_keys() {
                 for kind in ["grab", "orb", "close", "minimize", "curve"] {
                     if !["grab", "orb"].contains(&kind)
-                        && self.focus.as_ref() != Some(key)
-                        && self.expanded_orb.as_ref() != Some(key)
+                        && self.focus.as_ref() != Some(&key)
+                        && self.expanded_orb.as_ref() != Some(&key)
                     {
                         continue;
                     }
@@ -776,7 +862,7 @@ impl Desktop {
                         | (Target::Orb(k), "orb")
                         | (Target::Close(k), "close")
                         | (Target::Minimize(k), "minimize")
-                        | (Target::Curve(k), "curve") => k == key,
+                        | (Target::Curve(k), "curve") => k == &key,
                         _ => false,
                     });
                     controls.push((id, hovered, pressed));
@@ -1178,74 +1264,6 @@ impl Desktop {
     ) -> Result<()> {
         self.ray_action(origin, direction, phase, source, 272, true)
     }
-    /// Resolve the owning panel through the scene ancestry, never by a keyboard ID.
-    pub(super) fn panel_manipulation(&self, target: &Target) -> Option<PanelManipulation> {
-        let Target::Node(owner, id) = target else {
-            return None;
-        };
-        let peer = self.peers.get(owner)?;
-        let node = peer.nodes.get(id)?;
-        let scaling = match node.action_id.as_str() {
-            xr_shell_protocols::PANEL_MOVE_ACTION => false,
-            xr_shell_protocols::PANEL_SCALE_ACTION => true,
-            _ => return None,
-        };
-        let handle = self.node_frame(peer, node)?;
-        let mut parent = node.parent_id.as_str();
-        for _ in 0..512 {
-            let n = peer.nodes.get(parent)?;
-            if n.spatial_panel {
-                if n.spatial_policy != "head_horizon_spawn" {
-                    return None;
-                }
-                return Some(PanelManipulation {
-                    owner: *owner,
-                    panel: n.node_id.clone(),
-                    frame: self.panel_frame(peer, n),
-                    handle,
-                    scaling,
-                });
-            }
-            parent = &n.parent_id;
-        }
-        None
-    }
-    fn update_panel_manipulation(&mut self, c: &Capture, origin: [f32; 3], direction: [f32; 3]) {
-        let Some(panel) = &c.panel else { return };
-        let mut frame = panel.frame;
-        if panel.scaling {
-            // Project on the original plane so changing geometry cannot feed back
-            // into the gesture. Uniform scaling keeps every key's aspect ratio.
-            let Some((xy, _)) = panel.handle.project(origin, direction) else {
-                return;
-            };
-            let delta = sub(panel.handle.point(xy, 0.), panel.handle.point(c.start, 0.));
-            let corner = add(
-                scale(frame.right, frame.size[0] * 0.5),
-                scale(frame.down, frame.size[1] * 0.5),
-            );
-            let factor = (1. + dot(delta, corner) / dot(corner, corner)).clamp(0.65, 1.8);
-            frame.size = frame.size.map(|v| v * factor);
-        } else {
-            let Some(grab) = &c.grab else { return };
-            frame.position = add(
-                frame.position,
-                sub(add(origin, scale(direction, grab.distance)), grab.point),
-            );
-            if let Some((eye, _)) = self.horizon_head {
-                frame = Frame::new(
-                    frame.position,
-                    frame.size,
-                    frame.logical,
-                    crate::spatial::user_facing(frame.position, eye),
-                );
-            }
-        }
-        if let Some(peer) = self.peers.get_mut(&panel.owner) {
-            peer.spawn_frames.insert(panel.panel.clone(), frame);
-            self.dirty = true;
-        }
-    }
     fn ray_action(
         &mut self,
         origin: [f32; 3],
@@ -1280,26 +1298,46 @@ impl Desktop {
         let origin = sub(origin, self.ui_offset);
         if let Some(c) = self.captures.get(source).cloned() {
             if phase != "press" && phase != "hover" {
-                if c.panel.is_some() {
-                    self.update_panel_manipulation(&c, origin, direction);
-                    return self.pointer_button(Some((c.target, c.start)), phase, source, c.button);
-                }
                 if let Target::Move(ref key) = c.target {
                     self.update_grab(source, key, origin, direction);
                     return self.pointer_button(Some((c.target, c.start)), phase, source, c.button);
                 }
                 if let Some(frame) = self.capture_frame(&c) {
                     if let Some((xy, distance)) = frame.project(origin, direction) {
-                        let xy = self.hit_local(frame, xy, distance, 0., true).unwrap_or(xy);
+                        let xy = if matches!(c.target, Target::Resize(..)) {
+                            xy
+                        } else {
+                            self.hit_local(frame, xy, distance, 0., true).unwrap_or(xy)
+                        };
                         return self.pointer_button(Some((c.target, xy)), phase, source, c.button);
                     }
                 }
                 // Even if the ray no longer intersects, release the actual
                 // capture owner; never redirect a release to a different node.
-                return self.pointer_button(Some((c.target, [-1., -1.])), phase, source, c.button);
+                return self.pointer_button(None, phase, source, c.button);
             }
         }
         let pick = self.nearest_ray_pick(origin, direction);
+        let grabbable = (phase == "press")
+            .then(|| {
+                let hit = pick.as_ref()?;
+                if let Some((id, node)) = &hit.node {
+                    let p = self.peers.get(id)?;
+                    let (_, key) = self.node_base(p, p.nodes.get(node)?);
+                    if self.managed_panel(&key).is_some() {
+                        return Some(key);
+                    }
+                }
+                let target = hit.target.as_ref()?;
+                if let Target::Move(k) | Target::Orb(k) = target {
+                    if self.managed_panel(k).is_some() {
+                        return Some(k.clone());
+                    }
+                }
+                self.grabbable_window(target)
+            })
+            .flatten();
+        let pick_xy = pick.as_ref().map(|p| p.xy);
         let grab_point = pick
             .as_ref()
             .map(|p| (p.distance, add(origin, scale(direction, p.distance))));
@@ -1307,17 +1345,15 @@ impl Desktop {
             .map(|p| (p.target.map(|t| (t, p.xy)), p.companion))
             .unwrap_or((None, None));
         if phase == "press" {
-            let key = hit.as_ref().and_then(|(t, _)| self.target_surface(t));
-            let join_grab = key.as_ref().is_some_and(|k| {
+            let join_grab = grabbable.as_ref().is_some_and(|k| {
                 self.captures
                     .values()
                     .any(|c| matches!(&c.target, Target::Move(other) if other == k))
             });
             if squeeze || (button == 272 && join_grab) {
-                hit = hit.and_then(|(target, xy)| {
-                    self.grabbable_window(&target)
-                        .map(|k| (Target::Move(k), xy))
-                });
+                hit = grabbable
+                    .zip(pick_xy)
+                    .map(|(key, xy)| (Target::Move(key), xy));
             } else if button != 272 {
                 hit = hit.filter(|(t, _)| self.target_surface(t).is_some());
             }
@@ -1360,15 +1396,6 @@ impl Desktop {
         self.pointer_button(hit, phase, source, button)?;
         if phase == "press" {
             if let Some((distance, point)) = grab_point {
-                if let Some(c) = self.captures.get_mut(source) {
-                    if c.panel.is_some() {
-                        c.grab = Some(Grab {
-                            distance,
-                            point,
-                            local_anchor: [0.; 3],
-                        });
-                    }
-                }
                 let key = self.captures.get(source).and_then(|c| {
                     if let Target::Move(k) = &c.target {
                         Some(k.clone())
@@ -1377,7 +1404,7 @@ impl Desktop {
                     }
                 });
                 if let Some(key) = key {
-                    if let Some(f) = self.window_frame(&key, 0) {
+                    if let Some(f) = self.manipulation_frame(&key) {
                         let delta = sub(point, f.position);
                         let local_anchor = [
                             dot(delta, f.right),
@@ -1406,8 +1433,8 @@ impl Desktop {
                                     key.clone(),
                                     Bimanual {
                                         span,
-                                        size: self.windows[&key].size,
-                                        logical: Self::logical(&self.windows[&key]),
+                                        size: f.size,
+                                        logical: f.logical,
                                         anchor: scale(
                                             add(grabs[0].local_anchor, grabs[1].local_anchor),
                                             0.5,
@@ -1423,25 +1450,87 @@ impl Desktop {
         Ok(())
     }
 
+    fn uniform_scale_bounds(size: [f32; 2], logical: [f32; 2]) -> (f32, f32) {
+        let min = (0.3 / size[0])
+            .max(0.2 / size[1])
+            .max(160. / logical[0])
+            .max(120. / logical[1]);
+        let max = (3. / size[0])
+            .min(2.5 / size[1])
+            .min(2048. / logical[0])
+            .min(1536. / logical[1]);
+        (min.min(max), max)
+    }
+    pub(super) fn resize_companion(&mut self, key: &str, left: bool, c: &Capture, xy: [f32; 2]) {
+        let Some(current) = self.manipulation_frame(key) else {
+            return;
+        };
+        let delta = [
+            (xy[0] - c.start[0]) * if left { -1. } else { 1. },
+            xy[1] - c.start[1],
+        ];
+        let size = if Self::panel_key(key).is_some() {
+            // Virtual keys keep their proportions and their logical layout.
+            let (min, max) = Self::uniform_scale_bounds(c.size, c.logical);
+            let weight = c.size.map(|v| v * v);
+            let factor = (1.
+                + (delta[0] / c.logical[0] * weight[0] + delta[1] / c.logical[1] * weight[1])
+                    / (weight[0] + weight[1]))
+                .clamp(min, max);
+            c.size.map(|v| v * factor)
+        } else {
+            [
+                c.size[0] * (c.logical[0] + delta[0]).clamp(160., 2048.).round() / c.logical[0],
+                c.size[1] * (c.logical[1] + delta[1]).clamp(120., 1536.).round() / c.logical[1],
+            ]
+        };
+        // Keep the opposite top corner anchored, with the same chord correction as a window.
+        let half = WINDOW_ARC / 2.;
+        let (arc_x, arc_z) = if current.curve > 0. {
+            (half.sin() / half, (1. - half.cos()) / (2. * half))
+        } else {
+            (1., 0.)
+        };
+        let f = Frame::new(c.position, c.size, c.logical, c.resize_rotation);
+        let dx = size[0] - c.size[0];
+        let offset = add(
+            scale(f.right, dx * if left { -0.5 } else { 0.5 } * arc_x),
+            add(
+                scale(f.down, (size[1] - c.size[1]) * 0.5),
+                scale(f.normal(), -dx * arc_z),
+            ),
+        );
+        let position = add(c.position, offset);
+        let rotation = self.horizon_head.map_or(c.resize_rotation, |(eye, _)| {
+            crate::spatial::user_facing(position, eye)
+        });
+        self.set_manipulation_geometry(key, position, size, rotation);
+    }
+    pub(super) fn commit_window_resize(
+        &mut self,
+        key: &str,
+        logical: [f32; 2],
+        size: [f32; 2],
+    ) -> Result<()> {
+        if let Some(w) = self.windows.get(key) {
+            let pixels: [u32; 2] =
+                std::array::from_fn(|i| (logical[i] * w.size[i] / size[i]).round() as u32);
+            self.window_intent(
+                json!({"intent":"resize", "surface_id":w.state["surface_id"],
+                "window_server_generation":w.state["window_server_generation"],
+                "width":pixels[0], "height":pixels[1]}),
+            )?;
+            self.changed();
+        }
+        Ok(())
+    }
     pub(super) fn finish_grab(&mut self, key: &str, commit: bool) -> Result<()> {
         if let Some(b) = self.bimanual.remove(key) {
             if commit {
-                if let Some(w) = self.windows.get(key) {
-                    let logical: [u32; 2] = std::array::from_fn(|i| {
-                        (b.logical[i] * w.size[i] / b.size[i]).round() as u32
-                    });
-                    self.window_intent(
-                        json!({"intent":"resize", "surface_id":w.state["surface_id"],
-                        "window_server_generation":w.state["window_server_generation"],
-                        "width":logical[0], "height":logical[1]}),
-                    )?;
-                    self.changed();
-                }
-            } else if let Some(w) = self.windows.get_mut(key) {
-                w.size = b.size;
+                self.commit_window_resize(key, b.logical, b.size)?;
             }
         }
-        let Some(f) = self.window_frame(key, 0) else {
+        let Some(f) = self.manipulation_frame(key) else {
             return Ok(());
         };
         for c in self
@@ -1480,7 +1569,10 @@ impl Desktop {
         g.point = add(origin, scale(direction, g.distance));
         let mut point = g.point;
         let mut anchor = g.local_anchor;
-        let mut size = self.windows[key].size;
+        let Some(frame) = self.manipulation_frame(key) else {
+            return;
+        };
+        let mut size = frame.size;
         if let Some(b) = self.bimanual.get(key) {
             let grabs: Vec<_> = self
                 .captures
@@ -1490,23 +1582,14 @@ impl Desktop {
                 .collect();
             if grabs.len() == 2 {
                 let d = sub(grabs[0].point, grabs[1].point);
-                let ratio = (dot(d, d).sqrt() / b.span).clamp(
-                    (0.3 / b.size[0])
-                        .max(0.2 / b.size[1])
-                        .max(160. / b.logical[0])
-                        .max(120. / b.logical[1]),
-                    (3. / b.size[0])
-                        .min(2.5 / b.size[1])
-                        .min(2048. / b.logical[0])
-                        .min(1536. / b.logical[1]),
-                );
+                let (min, max) = Self::uniform_scale_bounds(b.size, b.logical);
+                let ratio = (dot(d, d).sqrt() / b.span).clamp(min, max);
                 point = scale(add(grabs[0].point, grabs[1].point), 0.5);
                 anchor = scale(b.anchor, ratio);
                 size = b.size.map(|v| v * ratio);
             }
         }
-        let w = self.windows.get_mut(key).unwrap();
-        let mut position = w.position;
+        let mut position = frame.position;
         for _ in 0..3 {
             let rotation = crate::spatial::user_facing(position, eye);
             let f = Frame::new(position, size, [1.; 2], rotation);
@@ -1523,9 +1606,12 @@ impl Desktop {
         if distance < 0.0001 {
             return;
         }
-        w.position = add(eye, scale(delta, distance.clamp(0.6, 4.) / distance));
-        w.rotation = crate::spatial::user_facing(w.position, eye);
-        w.size = size;
-        self.dirty = true;
+        let position = add(eye, scale(delta, distance.clamp(0.6, 4.) / distance));
+        self.set_manipulation_geometry(
+            key,
+            position,
+            size,
+            crate::spatial::user_facing(position, eye),
+        );
     }
 }
