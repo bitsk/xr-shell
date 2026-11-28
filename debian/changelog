@@ -1,5 +1,6 @@
 xr-shell (0.3.12) unstable; urgency=medium
 
+  * Interpolate rotated panorama rays across the background triangle.
   * Reuse static panel uniforms and separate frame wait timings.
 
  -- bits <bigbits@hackx.cc>  Sat, 28 Nov 2026 20:57:51 +0800
