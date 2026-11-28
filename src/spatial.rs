@@ -12,7 +12,7 @@ pub struct RayFeedback {
     pub captured: bool,
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Frame {
     pub position: [f32; 3],
     pub right: [f32; 3],

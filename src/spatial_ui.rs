@@ -33,7 +33,7 @@ struct Draw {
     border: f32,
     material: f32,
 }
-#[derive(Clone)]
+#[derive(Clone, PartialEq)]
 pub struct Geometry {
     pub id: String,
     pub frame: Frame,
@@ -624,14 +624,9 @@ impl Desktop {
                 let (width, height) = raster_size(&draw);
                 panels.push(Panel {
                     id: draw.id,
-                    frame: draw.frame,
                     width,
                     height,
                     rgba: pixels,
-                    radius: draw.radius,
-                    rim: draw.rim,
-                    border: draw.border,
-                    material: draw.material,
                 });
                 hits += 1;
                 continue;
@@ -717,14 +712,9 @@ impl Desktop {
             entries.push_back((key, pixels.clone()));
             panels.push(Panel {
                 id: draw.id,
-                frame: draw.frame,
                 width: canvas.width,
                 height: canvas.height,
                 rgba: pixels,
-                radius: draw.radius,
-                rim: draw.rim,
-                border: draw.border,
-                material: draw.material,
             });
         }
         let elapsed = started.elapsed();
@@ -783,7 +773,7 @@ impl Desktop {
                 let (tint, controls) = match original {
                     Source::Node(id,key) => {
                         let n = &self.peers[id].nodes[key];
-                        let hovered = self.hovers.values().any(|v| v == &(*id,key.clone()));
+                        let hovered = self.hovers.values().any(|(owner, node)| owner == id && node == key);
                         let pressed = self.captures.values().any(|c| matches!(&c.target,Target::Node(owner,node) if owner==id && node==key));
                         let tint = theme.colour(&n.style_id);
                         (tint, [if hovered {1.} else {0.}, if pressed {1.} else {0.}, ((n.value-n.min)/(n.max-n.min).max(0.0001)).clamp(0.,1.), 0.])
@@ -816,6 +806,7 @@ impl Desktop {
     }
     pub fn animate(&mut self, dt: f32) -> bool {
         let mut changed = false;
+        let smoothing = 1. - (-dt / 0.075).exp();
         for p in self.peers.values() {
             for n in p
                 .nodes
@@ -833,7 +824,7 @@ impl Desktop {
                 } else {
                     0.
                 };
-                let step = (target - *value) * (1. - (-dt / 0.075).exp());
+                let step = (target - *value) * smoothing;
                 if step.abs() > 0.000001 {
                     *value += step;
                     changed = true;
@@ -891,7 +882,7 @@ impl Desktop {
                 0.
             };
             let value = self.companion_lifts.entry(id).or_insert(0.);
-            let next = *value + (target - *value) * (1. - (-dt / 0.075).exp());
+            let next = *value + (target - *value) * smoothing;
             let next = if (target - next).abs() < 0.000001 {
                 target
             } else {

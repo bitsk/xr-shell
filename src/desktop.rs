@@ -185,14 +185,9 @@ struct Capture {
 #[derive(Clone)]
 pub struct Panel {
     pub id: String,
-    pub frame: crate::spatial::Frame,
     pub width: u32,
     pub height: u32,
     pub rgba: Arc<[u8]>,
-    pub radius: f32,
-    pub rim: f32,
-    pub border: f32,
-    pub material: f32,
 }
 pub struct Desktop {
     listener: SeqPacket,

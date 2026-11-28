@@ -31,6 +31,7 @@ pub struct DrawSpan {
 pub struct Frame {
     pub number: u64,
     pub wait_number: u64,
+    pub frame_wait_mono_ns: [i64; 5],
     pub thread_cpu_ns: [i64; 2],
     pub cpu_core: [i32; 2],
     pub action_sync_span: Option<[i64; 2]>,
@@ -140,6 +141,7 @@ impl Timeline {
             "xr_clock":"runtime XrTime; paired now only with XR_KHR_convert_timespec_time",
             "schema":4,"boot_id":self.boot_id,"shell_version":env!("CARGO_PKG_VERSION"),"skipped":self.skipped,"retained_limit":4096,"process_id":std::process::id(),
             "view_location_scope":"input and render locations share predicted_display_xr_ns; head_pose/head_flags are rendered views; call spans do not expose the runtime's underlying sensor sample time or final compositor warp",
+            "frame_wait_stage_boundaries":["controls_and_blend_mode","xrWaitFrame","xrBeginFrame","reference_space_updates"],
             "pre_input_stage_boundaries":["head_controls","locate_hand_joints","hand_mesh_update"],
             "render_stage_boundaries":["reuse_fence_and_begin","gpu_query_begin","record_atlas_upload","record_left_eye","record_right_eye","record_extra_layers","end_command_buffer","queue_submit"],
             "retire_stage_boundaries":["post_end_frame_fence_wait","query_readback_and_retire"],

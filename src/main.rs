@@ -526,6 +526,8 @@ fn render_session(
         foreground,
         desktop_origin,
     );
+    summary.focus_quad = renderer.quad_status();
+    summary.passthrough = renderer.passthrough_status();
     if let Some(d) = desktop.as_mut() {
         d.set_xr_focus(false);
     }
@@ -703,8 +705,11 @@ fn frame_loop(
         } else {
             xr::EnvironmentBlendMode::OPAQUE
         };
+        let wait_start = timeline::now();
         let state = waiter.wait()?;
+        let wait_done = timeline::now();
         stream.begin()?;
+        let begin_done = timeline::now();
         if pending_recenter.is_some_and(|time| state.predicted_display_time.as_nanos() >= time) {
             pending_recenter = None;
             recentered_space = None;
@@ -875,7 +880,7 @@ fn frame_loop(
                 renderer.update_panels(&panels)?;
             }
             input_times[2] = timeline::now();
-            renderer.update_panel_poses(&d.panel_poses(), head_position)?;
+            renderer.update_panel_poses(d.panel_poses(), head_position)?;
             input_times[3] = timeline::now();
             // Optical hands use measured grip/aim and the existing 6DoF routes.
             // Do not draw a physical controller body at an optical palm pose.
@@ -911,7 +916,6 @@ fn frame_loop(
             options.focus_quad,
             summary.layer_limits,
         );
-        summary.focus_quad = renderer.quad_status();
         let atlas_update = renderer.pending_atlas_stats();
         let capture = capture_request(options.capture_dir.as_deref())?;
         times[4] = timeline::now();
@@ -979,7 +983,6 @@ fn frame_loop(
         summary
             .render_view_state
             .observe(flags, &views, state.predicted_display_time);
-        summary.focus_quad = renderer.quad_status();
         let result = renderer.enqueue_stereo(&indices, &views, capture.is_some());
         times[6] = timeline::now();
         let releases: Vec<_> = renderer
@@ -1094,8 +1097,7 @@ fn frame_loop(
         // Errors above leave pending buffers owned by Renderer until its idle
         // cleanup in run(), rather than dropping them while the GPU uses them.
         let pixels = renderer.retire_stereo()?;
-        summary.passthrough = renderer.passthrough_status();
-        controls.report(summary.passthrough.clone());
+        controls.report(|| renderer.passthrough_status());
         times[8] = timeline::now();
         summary.timeline.push(timeline::Frame {
             number: summary.frames + 1,
@@ -1105,6 +1107,7 @@ fn frame_loop(
             post_frame_mono_ns: [times[8]; 2],
             post_frame_complete: false,
             wait_number: summary.waited_frames,
+            frame_wait_mono_ns: [times[1], wait_start, wait_done, begin_done, times[2]],
             thread_cpu_ns: [cpu_start, timeline::thread_cpu()],
             cpu_core: [core_start, unsafe { libc::sched_getcpu() }],
             action_sync_span: input.as_ref().and_then(|i| i.sync_span),
@@ -1186,7 +1189,7 @@ fn frame_loop(
             )?;
             atomic_json(
                 &options.summary_dir().join("timeline.json"),
-                &json!({"summary":summary.timeline.summary(),"samples":summary.timeline.frames,"focus_quad":summary.focus_quad,"native_quad_frames":summary.native_quad_frames}),
+                &json!({"summary":summary.timeline.summary(),"samples":summary.timeline.frames,"focus_quad":renderer.quad_status(),"native_quad_frames":summary.native_quad_frames}),
             )?;
             summary.captures.push(tag.clone());
             println!("XR_CAPTURE={tag} FRAME={} VIEWS=2", summary.frames);

@@ -13,8 +13,7 @@ use std::{
 };
 #[derive(Default)]
 struct Shared {
-    root: Option<Value>,
-    input: Option<Value>,
+    snapshot: Option<(Option<Value>, Option<Value>)>,
     report: Option<Value>,
 }
 pub struct Controls {
@@ -53,8 +52,7 @@ impl Controls {
                             })
                         });
                     let report = if let Ok(mut state) = work.lock() {
-                        state.root = root;
-                        state.input = input;
+                        state.snapshot = Some((root, input));
                         state.report.take()
                     } else {
                         None
@@ -93,9 +91,11 @@ impl Controls {
         (v["schema"] == 1).then_some(v)
     }
     pub fn poll(&mut self) {
-        if let Ok(s) = self.shared.try_lock() {
-            self.root = s.root.clone();
-            self.input = s.input.clone();
+        if let Ok(mut s) = self.shared.try_lock() {
+            if let Some((root, input)) = s.snapshot.take() {
+                self.root = root;
+                self.input = input;
+            }
         }
         let generation = self.input.as_ref().and_then(|v| v["generation"].as_u64());
         if generation != self.generation {
@@ -153,11 +153,12 @@ impl Controls {
             v["session_active"] == true && v["preferences"]["passthrough_enabled"] == true
         })
     }
-    pub fn report(&mut self, passthrough: Option<Value>) {
+    pub fn report(&mut self, passthrough: impl FnOnce() -> Option<Value>) {
         if self.last_write.elapsed() < Duration::from_millis(250) {
             return;
         }
         self.last_write = Instant::now();
+        let passthrough = passthrough();
         let v = json!({"schema":1,"observed_monotonic_ns":crate::timeline::now(),"input_source":self.source(),"passthrough_requested":passthrough.as_ref().and_then(|v|v["requested"].as_bool()).unwrap_or(false),"passthrough":passthrough});
         if let Ok(mut s) = self.shared.try_lock() {
             s.report = Some(v);

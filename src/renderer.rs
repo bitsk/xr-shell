@@ -193,6 +193,7 @@ pub struct Renderer {
     atlas_entries: std::collections::BTreeMap<String, AtlasEntry>,
     ui_uniform: Option<Buffer>,
     panel_uniforms: Vec<f32>,
+    uniform_offset: Option<[f32; 3]>,
     ui_offset: [f32; 3],
     ui_anchor_ready: bool,
 }
@@ -268,6 +269,7 @@ impl Renderer {
             atlas_entries: std::collections::BTreeMap::new(),
             ui_uniform: None,
             panel_uniforms: Vec::new(),
+            uniform_offset: None,
             ui_offset: [0.; 3],
             ui_anchor_ready: true,
         };
@@ -1839,23 +1841,10 @@ impl Renderer {
                 &[],
             );
         }
-        let poses: Vec<_> = panels
-            .iter()
-            .map(|p| crate::desktop::spatial_ui::Geometry {
-                id: p.id.clone(),
-                frame: p.frame,
-                radius: p.radius,
-                rim: p.rim,
-                border: p.border,
-                material: p.material,
-                anchor: p.frame.position,
-                group: p.id.clone(),
-                layer: 0.,
-                tint: [0.; 4],
-                controls: [0.; 4],
-            })
-            .collect();
-        self.update_panel_poses(&poses, [0., 1.6, 0.])
+        if full {
+            self.uniform_offset = None;
+        }
+        Ok(())
     }
     pub fn set_ui_anchor(&mut self, offset: Option<[f32; 3]>) {
         self.ui_anchor_ready = offset.is_some();
@@ -1864,11 +1853,10 @@ impl Renderer {
 
     pub fn update_panel_poses(
         &mut self,
-        poses: &[crate::desktop::spatial_ui::Geometry],
+        mut poses: Vec<crate::desktop::spatial_ui::Geometry>,
         origin: [f32; 3],
     ) -> Result<()> {
-        let mut order: Vec<_> = poses.iter().collect();
-        order.sort_by(|a, b| {
+        poses.sort_by(|a, b| {
             let distance = |p: &crate::desktop::spatial_ui::Geometry| {
                 crate::spatial::add(p.anchor, self.ui_offset)
                     .iter()
@@ -1884,10 +1872,17 @@ impl Renderer {
                     .then(a.group.cmp(&b.group))
             }
         });
-        self.geometry = order.iter().map(|p| (*p).clone()).collect();
-        self.draw_count = order.len() as u32;
-        let mut values = Vec::with_capacity(order.len() * 32);
-        for p in order {
+        // Head movement may change transparent draw order even in a static scene.
+        // Compare after sorting. A repacked atlas invalidates the stored UVs.
+        if self.uniform_offset == Some(self.ui_offset) && poses == self.geometry {
+            return Ok(());
+        }
+        self.geometry = poses;
+        self.draw_count = self.geometry.len() as u32;
+        let values = &mut self.panel_uniforms;
+        values.clear();
+        values.reserve(self.geometry.len() * 32);
+        for p in &self.geometry {
             let mut f = p.frame;
             f.position = crate::spatial::add(f.position, self.ui_offset);
             let uv = self
@@ -1928,13 +1923,14 @@ impl Renderer {
             values.extend_from_slice(&p.tint);
             values.extend_from_slice(&p.controls);
         }
-        self.panel_uniforms = values;
         self.ui_uniform.as_ref().unwrap().write(unsafe {
             std::slice::from_raw_parts(
                 self.panel_uniforms.as_ptr() as *const u8,
                 self.panel_uniforms.len() * 4,
             )
-        })
+        })?;
+        self.uniform_offset = Some(self.ui_offset);
+        Ok(())
     }
     fn create_spatial_pipeline(&mut self) -> Result<()> {
         unsafe {
